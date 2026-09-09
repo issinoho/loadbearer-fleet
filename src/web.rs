@@ -1103,6 +1103,44 @@ mod tests {
         );
     }
 
+    /// The snapshot is the largest thing this serves and it is mostly repeated
+    /// JSON keys, so it compresses about five to one. That matters over a WAN
+    /// link to a branch office, and it is the sort of thing that would quietly
+    /// stop working on a dependency bump without anyone noticing — which is
+    /// exactly what happened to prompt this test.
+    #[tokio::test]
+    async fn the_snapshot_is_compressed_when_the_client_asks() {
+        let state = state_for(&Config::default());
+
+        let compressed = router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/snapshot")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            compressed
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .map(|v| v.to_str().expect("ascii")),
+            Some("gzip")
+        );
+        let squeezed = axum::body::to_bytes(compressed.into_body(), 1 << 22)
+            .await
+            .expect("body")
+            .len();
+
+        let plain = get(&state, "/api/snapshot", None).await.body.len();
+        assert!(
+            squeezed * 2 < plain,
+            "{squeezed} compressed against {plain} plain is not worth the CPU"
+        );
+    }
+
     #[tokio::test]
     async fn every_response_carries_the_security_headers() {
         let state = state_for(&Config::default());
