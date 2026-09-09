@@ -28,8 +28,6 @@ use crate::config::Config;
 /// The service name, and the name the unit file gets.
 pub const SERVICE_NAME: &str = "loadbearer-fleet";
 pub const DISPLAY_NAME: &str = "loadbearer fleet dashboard";
-pub const DESCRIPTION: &str =
-    "Indexes collected loadbearer results and serves the fleet dashboard.";
 
 /// A systemd unit, printed rather than installed: on Linux the file belongs to
 /// the packaging, and an operator reviewing it before it lands in
@@ -146,7 +144,12 @@ mod windows_impl {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use windows_service::{define_windows_service, service_control_handler, service_dispatcher};
 
-    use super::{DESCRIPTION, DISPLAY_NAME, SERVICE_NAME};
+    use super::{DISPLAY_NAME, SERVICE_NAME};
+
+    /// Only the Windows service database has a field for this; a systemd unit
+    /// carries the short description alone.
+    const DESCRIPTION: &str =
+        "Indexes collected loadbearer results and serves the fleet dashboard.";
     use crate::config::Config;
 
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;

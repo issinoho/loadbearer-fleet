@@ -348,8 +348,14 @@ function realSnapshot() {
   const argIdx = process.argv.indexOf('--snapshot');
   if (argIdx > -1) return JSON.parse(readFileSync(process.argv[argIdx + 1], 'utf8'));
 
-  const exe = process.platform === 'win32'
-    ? 'target/debug/loadbearer-fleet.exe' : 'target/debug/loadbearer-fleet';
+  // CARGO_TARGET_DIR is honoured, so this still works for anyone who moves
+  // their build output somewhere else. CI sets nothing and gets ./target.
+  const target = process.env.CARGO_TARGET_DIR || 'target';
+  const exe = join(
+    target,
+    'debug',
+    process.platform === 'win32' ? 'loadbearer-fleet.exe' : 'loadbearer-fleet',
+  );
   if (!existsSync(exe)) {
     console.error(`
 ${exe} is not built. Run: cargo build`);

@@ -175,6 +175,22 @@ painted outside its own box, bars capped at 24px, markers carrying their surface
 ring, hit targets big enough to hit, and axis labels that fit their band. It
 needs Node; the server does not, so it is deliberately outside `cargo test`.
 
+## Checks
+
+What CI runs, and what to run before pushing:
+
+```
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo build --locked && node scripts/check-ui.mjs
+```
+
+Clippy and the tests run on both ubuntu-latest and windows-latest, and both
+matter for more than the tests: the Windows service integration is behind
+`cfg(windows)` and the fallbacks that replace it are behind
+`cfg(not(windows))`, so either build only ever compiles one of the two.
+
 ## Sign-in
 
 ```

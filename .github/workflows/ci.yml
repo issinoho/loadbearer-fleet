@@ -1,0 +1,68 @@
+name: CI
+
+# Format, lint and test on every push to main and every pull request. Mirrors
+# loadbearer's own CI so the two repos fail the same way, with one addition:
+# the dashboard's charts are checked as well as the Rust.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here writes anything back.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Add clippy and rustfmt
+        run: rustup component add clippy rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        # One canonical formatting check is enough; skip it on the second OS.
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+
+      # Both platforms matter here and not just for the tests: the Windows
+      # service integration is behind `cfg(windows)` and the fallbacks that
+      # replace it are behind `cfg(not(windows))`, so each build only ever
+      # compiles one of the two. Whichever OS you skip is the one that breaks.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  # The charts are hand-rolled SVG with no framework to catch a mistake, so
+  # they get rendered against a minimal DOM and the geometry asserted: no NaN
+  # reaching an attribute (which drops a mark silently rather than erroring),
+  # nothing painted outside its own box, bars within spec, hit targets big
+  # enough to hit. It needs Node, which the server itself does not, so it is a
+  # separate job rather than a step in the matrix above.
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The check builds its snapshot by running the binary over the
+      # anonymised fixtures, so that it cannot drift from the real API.
+      - name: Build
+        run: cargo build --locked
+
+      - name: Check the dashboard
+        run: node scripts/check-ui.mjs
