@@ -633,7 +633,9 @@ const QUEUES = {
 // Exported, with the view functions, so `scripts/check-ui.mjs` can render every
 // view against a real snapshot outside a browser. That check is the only thing
 // standing between a typo in here and a blank panel in production.
-export const state = { snap: null, view: 'overview', key: null, filter: {}, showInfo: false };
+export const state = {
+  snap: null, me: null, view: 'overview', key: null, filter: {}, showInfo: false,
+};
 
 function parseHash() {
   const raw = location.hash.replace(/^#\/?/, '');
@@ -658,11 +660,78 @@ function writeHash({ view = state.view, key = state.key, filter = state.filter }
   location.hash = `#/${path}${q ? `?${q}` : ''}`;
 }
 
-async function fetchSnapshot() {
-  const q = new URLSearchParams(state.filter).toString();
-  const res = await fetch(`/api/snapshot${q ? `?${q}` : ''}`);
+/*
+ * A 401 means the session has gone - expired, or the server restarted. Sending
+ * the browser to sign in again is the only useful response; the alternative is
+ * an error banner the reader can do nothing about.
+ */
+function signInAgain() {
+  const next = location.pathname + location.search + location.hash;
+  location.assign(`/auth/login?next=${encodeURIComponent(next)}`);
+}
+
+async function fetchJson(url, options) {
+  const res = await fetch(url, options);
+  if (res.status === 401) {
+    signInAgain();
+    // Never resolves: the navigation is already under way, and resolving would
+    // let a caller render against nothing.
+    return new Promise(() => {});
+  }
   if (!res.ok) throw new Error(await res.text());
   return res.json();
+}
+
+async function fetchSnapshot() {
+  const q = new URLSearchParams(state.filter).toString();
+  return fetchJson(`/api/snapshot${q ? `?${q}` : ''}`);
+}
+
+/*
+ * Who is signed in, and what they may do. The UI uses this to label the
+ * session and to hide what the caller cannot use - the server enforces the
+ * same rules regardless, so this is courtesy rather than security.
+ */
+async function fetchMe() {
+  try {
+    return await fetchJson('/api/me');
+  } catch {
+    return null;
+  }
+}
+
+function applyIdentity() {
+  const me = state.me;
+  const who = $('#who');
+  const signout = $('#signout');
+  const rescan = $('#rescan');
+  if (!me) {
+    who.hidden = true;
+    signout.hidden = true;
+    return;
+  }
+  who.hidden = false;
+  who.replaceChildren(
+    el('span', { text: me.authenticated ? me.name : 'Local access' }),
+    el('b', { text: me.role }),
+  );
+  who.title = me.email || (me.authenticated ? me.subject : 'No sign-in configured');
+  signout.hidden = !me.sign_in_enabled;
+  rescan.hidden = !me.may_rescan;
+}
+
+/** Say so when a viewer is only seeing part of the estate. */
+function scopeNotice() {
+  const scopes = state.me?.scopes || [];
+  if (!scopes.length) return null;
+  const described = scopes
+    .map((s) => Object.entries(s).map(([k, v]) => `${k}=${v}`).join(' and '))
+    .join(', or ');
+  return el('div', { class: 'banner' }, [el('span', {
+    text: `You are seeing the machines tagged ${described}. Counts, findings and everything `
+      + 'below are for those machines only; cohort medians are still drawn from the whole fleet, '
+      + 'so a comparison here means the same as it does anywhere else.',
+  })]);
 }
 
 /* -------------------------------------------------------------- filter row */
@@ -739,11 +808,8 @@ function wireFilters() {
     btn.disabled = true;
     btn.textContent = 'Scanning…';
     try {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const body = await res.json().catch(() => null);
-      if (!res.ok) throw new Error(body || 'rescan failed');
+      const r = await fetchJson('/api/rescan', { method: 'POST' });
       await route();
-      const r = body;
       $('#footer-note').textContent =
         `Rescanned: ${r.seen} file(s), ${r.ingested} new, ${r.unchanged} already indexed`
         + (r.rejected.length ? `, ${r.rejected.length} unreadable` : '');
@@ -1052,12 +1118,14 @@ export function renderMachines(main) {
 }
 
 export async function renderMachine(main, key) {
-  const res = await fetch(`/api/machine/${encodeURIComponent(key)}`);
-  if (!res.ok) {
-    main.append(el('div', { class: 'banner' }, [el('span', { text: await res.text() })]));
+  let payload;
+  try {
+    payload = await fetchJson(`/api/machine/${encodeURIComponent(key)}`);
+  } catch (err) {
+    main.append(el('div', { class: 'banner' }, [el('span', { text: err.message })]));
     return;
   }
-  const { machine: m, flags, cohort, history, subtests } = await res.json();
+  const { machine: m, flags, cohort, history, subtests } = payload;
 
   const facts = [
     ['CPU', m.cpu_model],
@@ -1229,6 +1297,9 @@ function render() {
   // Filters scope a fleet, not one machine.
   $('#filters').hidden = state.view === 'machine';
 
+  const notice = scopeNotice();
+  if (notice) main.append(notice);
+
   if (state.view === 'machine') { renderMachine(main, state.key); return; }
   if (state.view === 'cohorts') renderCohorts(main);
   else if (state.view === 'machines') renderMachines(main);
@@ -1243,6 +1314,10 @@ async function route() {
   const main = $('#main');
   main.classList.add('loading');
   try {
+    if (!state.me) {
+      state.me = await fetchMe();
+      applyIdentity();
+    }
     state.snap = await fetchSnapshot();
     $('#generated').textContent = `indexed ${state.snap.summary.runs} run(s) · read ${when(state.snap.generated_at)}`;
     $('#f-count').textContent = `${state.snap.summary.machines} machine(s) in view`;

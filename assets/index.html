@@ -30,7 +30,13 @@
 
   <div class="topbar-actions">
     <span class="meta" id="generated"></span>
+    <span class="chip" id="who" hidden></span>
     <button type="button" class="btn" id="rescan">Rescan folder</button>
+    <!-- A POST, so a link someone is tricked into following cannot sign them
+         out. No JavaScript needed, and it satisfies form-action 'self'. -->
+    <form method="post" action="/auth/logout" id="signout" hidden>
+      <button type="submit" class="btn">Sign out</button>
+    </form>
     <button type="button" class="btn btn-square" id="theme" aria-label="Switch between light and dark">
       <span aria-hidden="true">&#9681;</span>
     </button>

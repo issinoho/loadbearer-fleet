@@ -11,6 +11,8 @@
 //! and its Rust API explicitly isn't. See `schema.rs`.
 
 mod analytics;
+mod auth;
+mod config;
 mod index;
 mod schema;
 mod web;
@@ -23,6 +25,7 @@ use clap::{Parser, Subcommand};
 use time::OffsetDateTime;
 
 use analytics::{FlagKind, Severity, Thresholds};
+use config::Config;
 
 #[derive(Parser, Debug)]
 #[command(name = "loadbearer-fleet", version, about)]
@@ -30,14 +33,14 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Where the index lives. Derived data — safe to delete.
-    #[arg(
-        long,
-        global = true,
-        default_value = "fleet-index.db",
-        value_name = "FILE"
-    )]
-    index: PathBuf,
+    /// Where the index lives. Derived data — safe to delete. Overrides the
+    /// config file.
+    #[arg(long, global = true, value_name = "FILE")]
+    index: Option<PathBuf>,
+
+    /// Configuration file. Written by `init-config`.
+    #[arg(long, global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
 
     #[arg(long, global = true, value_name = "LEVEL", default_value = "info")]
     log_level: String,
@@ -67,16 +70,18 @@ enum Command {
     },
     /// Serve the web dashboard.
     Serve {
-        /// The collection folder. Scanned on startup, and again whenever
-        /// someone hits Rescan. Omit it to serve an existing index read-only.
+        /// The collection folder. Scanned on startup, and again whenever an
+        /// admin hits Rescan. Overrides the config file; omit both to serve an
+        /// existing index read-only.
         #[arg(value_name = "DIR")]
         dir: Option<PathBuf>,
 
-        /// Address to listen on. Loopback unless --allow-remote.
-        #[arg(long, default_value = "127.0.0.1:8787", value_name = "ADDR")]
-        bind: SocketAddr,
+        /// Address to listen on. Overrides the config file.
+        #[arg(long, value_name = "ADDR")]
+        bind: Option<SocketAddr>,
 
-        /// Listen on a network interface even though there is no sign-in yet.
+        /// Listen on a network interface anyway, without sign-in or without
+        /// TLS. The refusal message explains what you are agreeing to.
         #[arg(long)]
         allow_remote: bool,
 
@@ -84,10 +89,21 @@ enum Command {
         #[arg(long)]
         no_scan: bool,
     },
+    /// Print a starter configuration file, placeholders included.
+    InitConfig,
+    /// Contact the identity provider and report what the settings resolve to,
+    /// so a wrong tenant fails at deploy time rather than at first sign-in.
+    CheckAuth,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // `init-config` writes to stdout and must stay pipeable, so it runs before
+    // any logging is set up.
+    if matches!(cli.command, Command::InitConfig) {
+        print!("{}", Config::starter());
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -96,9 +112,20 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    // CLI over file over default, so a service can be configured in a file and
+    // still be poked at by hand.
+    let mut config = match &cli.config {
+        Some(path) => Config::load(path)?,
+        None => Config::default(),
+    };
+    if let Some(index) = &cli.index {
+        config.server.index = index.clone();
+    }
+
     match &cli.command {
+        Command::InitConfig => unreachable!("handled above"),
         Command::Scan { dir } => {
-            let mut idx = index::Index::open(&cli.index)?;
+            let mut idx = index::Index::open(&config.server.index)?;
             let report = idx.scan(dir)?;
             println!(
                 "scanned {}: {} file(s), {} new, {} already indexed",
@@ -120,7 +147,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Status => {
-            let idx = index::Index::open(&cli.index)?;
+            let idx = index::Index::open(&config.server.index)?;
             println!(
                 "{} run(s), {} machine(s)",
                 idx.run_count()?,
@@ -132,7 +159,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Report { json, all } => {
-            let idx = index::Index::open(&cli.index)?;
+            let idx = index::Index::open(&config.server.index)?;
             let th = Thresholds::default();
             let snap = analytics::snapshot(idx.conn(), &th, OffsetDateTime::now_utc())?;
             if *json {
@@ -142,17 +169,38 @@ fn main() -> Result<()> {
             print_report(&snap, *all);
             Ok(())
         }
+        Command::CheckAuth => {
+            let authenticator = auth::Authenticator::new(&config);
+            if !authenticator.enabled() {
+                println!(
+                    "auth.mode is \"none\": there is nothing to check, and the dashboard will                      treat everyone who reaches the port as an administrator."
+                );
+                return Ok(());
+            }
+            let report = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(authenticator.check())?;
+            println!("{report}");
+            Ok(())
+        }
         Command::Serve {
             dir,
             bind,
             allow_remote,
             no_scan,
         } => {
-            let mut idx = index::Index::open(&cli.index)?;
-            if let Some(dir) = dir
+            if let Some(dir) = dir {
+                config.server.collection_dir = Some(dir.clone());
+            }
+            if let Some(bind) = bind {
+                config.server.bind = *bind;
+            }
+            let mut idx = index::Index::open(&config.server.index)?;
+            if let Some(dir) = config.server.collection_dir.clone()
                 && !*no_scan
             {
-                let report = idx.scan(dir)?;
+                let report = idx.scan(&dir)?;
                 tracing::info!(
                     seen = report.seen,
                     ingested = report.ingested,
@@ -164,13 +212,13 @@ fn main() -> Result<()> {
                     tracing::warn!(%path, %why, "skipped");
                 }
             }
-            let state = web::AppState::new(idx, dir.clone(), Thresholds::default())?;
+            let state = web::AppState::new(idx, &config, Thresholds::default())?;
             // One runtime for the server only, so every other subcommand stays
             // a plain synchronous program.
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(web::serve(state, *bind, *allow_remote))
+                .block_on(web::serve(state, &config, *allow_remote))
         }
     }
 }

@@ -5,9 +5,10 @@ results: point it at the folder your deployment tool drops `.json` result files
 into, and it indexes them and reports across the estate — executive summary,
 grouping, drilldown, and the outliers and red flags worth acting on.
 
-**Status: early.** Ingest, cohort analytics, the red-flag engine and the web
-dashboard all work. **There is no authentication yet**, so it refuses to listen
-anywhere but loopback unless you insist. See [Roadmap](#roadmap).
+**Status: early but usable.** Ingest, cohort analytics, the red-flag engine, the
+web dashboard and single sign-on all work. Out of the box it runs
+unauthenticated on loopback; point it at your identity provider and it does OIDC
+with roles and per-site scoping. See [Roadmap](#roadmap).
 
 ## How it fits together
 
@@ -46,6 +47,9 @@ loadbearer-fleet report                            # summary, cohorts and red fl
 loadbearer-fleet report --all                      # include informational flags
 loadbearer-fleet report --json                     # the whole snapshot, as the UI sees it
 loadbearer-fleet serve \\fileserver\loadbearer     # the dashboard, on http://127.0.0.1:8787
+loadbearer-fleet init-config > fleet.toml          # a starter config, placeholders included
+loadbearer-fleet serve --config fleet.toml         # with single sign-on
+loadbearer-fleet check-auth --config fleet.toml    # check the identity provider settings
 ```
 
 Rescanning is cheap and idempotent: every run is keyed by the SHA-256 of the
@@ -81,8 +85,8 @@ resets when they're reimaged" is something an estate owner should know.
       stale results, weak identity
 - [x] Web UI: executive summary, cohort explorer, machine table, machine drilldown
       with history — see [The dashboard](#the-dashboard)
-- [ ] Entra ID / OIDC SSO, roles from group claims, tag-scoped authorization.
-      Until this lands the server listens on loopback only
+- [x] Entra ID / OIDC SSO with PKCE, roles from group claims, tag-scoped
+      authorization — see [Sign-in](#sign-in)
 - [ ] Service packaging, config file, metrics
 
 ## Analysis
@@ -147,14 +151,6 @@ components, its findings in full, and every subtest of its latest run.
 returns exactly what the dashboard draws, so any view can be scripted or
 diffed; `GET /api/machine/{key}` is the drilldown payload.
 
-### It listens on loopback only
-
-There is no sign-in yet, and the index holds the hostname and firmware serial of
-every machine in the estate. A non-loopback bind therefore takes an explicit
-`--allow-remote` and logs a warning; without it the server refuses and says why.
-Until [authentication](#roadmap) lands, the intended deployment is loopback plus
-an SSH tunnel.
-
 ### No build step, no CDN, one binary
 
 The HTML, CSS and JavaScript are compiled into the executable, and the charts
@@ -178,6 +174,71 @@ minimal DOM and asserts the geometry: no NaN reaching an SVG attribute, nothing
 painted outside its own box, bars capped at 24px, markers carrying their surface
 ring, hit targets big enough to hit, and axis labels that fit their band. It
 needs Node; the server does not, so it is deliberately outside `cargo test`.
+
+## Sign-in
+
+```
+loadbearer-fleet init-config > fleet.toml     # then fill in the placeholders
+loadbearer-fleet check-auth --config fleet.toml
+loadbearer-fleet serve --config fleet.toml
+```
+
+OpenID Connect authorization code flow with PKCE. Register the app as a public
+client — the flow needs no client secret, and a secret in a config file on a
+management server is a secret in every backup of that server — with the redirect
+URI `<public_url>/auth/callback`.
+
+Roles come from group claims. On Entra, emit the `groups` claim from the app
+registration's **Token configuration** (it is a token setting, not a scope), and
+map group **object IDs** to roles:
+
+```toml
+[[auth.grants]]
+group = "<object-id-of-your-fleet-admins-group>"
+role = "admin"     # read the dashboard, and trigger a rescan
+
+[[auth.grants]]
+group = "<object-id-of-the-glasgow-desktop-team>"
+role = "viewer"    # read only
+tags = { site = "glasgow" }   # and only the machines tagged this way
+```
+
+The most privileged matching grant wins; scopes are the union of the matching
+grants at that role, so somebody in two site groups sees both sites. Someone who
+authenticates but matches no grant is refused rather than shown an empty
+dashboard — authenticating is not the same as being authorized.
+
+**Tag scoping is enforced in the data layer.** A viewer's scope is pushed into
+the same filter every request is projected through, and it is read from the
+session, never from the query string — so a scoped viewer who edits the URL to
+another site gets an empty result, never that site. A machine outside your scope
+returns 404 rather than 403: whether it exists isn't something you're entitled to
+learn. The Rescan button is hidden from viewers as a courtesy; the server refuses
+the request whether it was hidden or not.
+
+Two things the config refuses at load time rather than at first sign-in: any
+value still holding a starter placeholder, named individually; and a multi-tenant
+issuer (`/common/`, `/organizations/`, `/consumers/`), which cannot work because
+those endpoints advertise a templated `{tenantid}` issuer that never matches the
+URL it was fetched from. Use your own tenant's issuer.
+
+Sessions are opaque random tokens in an `HttpOnly`, `SameSite=Lax` cookie, held
+server-side and keyed by the token's SHA-256 so a memory dump doesn't hand
+anyone a live session. They live in memory, so a restart signs everyone out;
+there are no refresh tokens stored anywhere.
+
+### It will not put the estate on the wire in the clear
+
+The index holds the hostname and firmware serial of every machine you own, so a
+non-loopback bind is refused unless **both** sign-in is configured and
+`public_url` is https. `--allow-remote` overrides it and logs a warning. The two
+refusals say different things because they are different mistakes: without
+sign-in, anyone who can reach the port gets the whole estate; without TLS, the
+session cookie crosses the network in the clear and whoever copies it is signed
+in as that user.
+
+The dashboard does not terminate TLS. Put a reverse proxy in front of it and set
+`public_url` to the proxy's address.
 
 ## Licence
 

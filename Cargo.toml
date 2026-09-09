@@ -25,7 +25,15 @@ anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "1.1.5"
+rand = "0.10.2"
+openidconnect = { version = "4.0.1", features = ["reqwest"] }
+base64 = "0.23.1"
 
 [profile.release]
 lto = true
 codegen-units = 1
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", features = ["util"] }

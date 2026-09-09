@@ -1042,6 +1042,13 @@ pub struct Filter {
     pub search: Option<String>,
     /// Only machines carrying a flag with this code.
     pub flag: Option<String>,
+    /// **Authorization**, not a preference: tag sets, any one of which a
+    /// machine may match, or empty for the whole fleet. Set from the caller's
+    /// session and never from the query string, which is what makes it
+    /// something a caller cannot widen by editing a URL. ANDed with everything
+    /// above, so a viewer scoped to one site who filters to another sees
+    /// nothing rather than the other site.
+    pub scopes: Vec<BTreeMap<String, String>>,
 }
 
 impl Filter {
@@ -1063,6 +1070,14 @@ impl Filter {
             if m.tags.get(k).map(String::as_str) != Some(v.as_str()) {
                 return false;
             }
+        }
+        if !self.scopes.is_empty()
+            && !self
+                .scopes
+                .iter()
+                .any(|scope| scope.iter().all(|(k, v)| m.tags.get(k) == Some(v)))
+        {
+            return false;
         }
         if let Some(q) = &self.search {
             let q = q.to_lowercase();
@@ -1821,6 +1836,151 @@ mod tests {
         );
         assert_eq!(stale.summary.machines, 1);
         assert_eq!(stale.machines[0].hostname.as_deref(), Some("OLD-1"));
+    }
+
+    /// The property tag-scoped authorization rests on. The viewer's own filter
+    /// and their scope are ANDed, so asking for a site you are not scoped to
+    /// returns nothing — never that site.
+    #[test]
+    fn an_authorization_scope_cannot_be_widened_by_a_filter() {
+        let mut e = Estate::new();
+        for i in 0..2 {
+            e.add_with(
+                &format!("GLA-{i}"),
+                1000.0,
+                "2026-09-01T10:00:00Z",
+                tagged("glasgow"),
+            );
+        }
+        for i in 0..2 {
+            e.add_with(
+                &format!("EDI-{i}"),
+                1000.0,
+                "2026-09-01T10:00:00Z",
+                tagged("edinburgh"),
+            );
+        }
+        let all = e.snap();
+        let th = Thresholds::default();
+        let glasgow_only = vec![BTreeMap::from([(
+            "site".to_string(),
+            "glasgow".to_string(),
+        )])];
+
+        let scoped = all.filtered(
+            &Filter {
+                scopes: glasgow_only.clone(),
+                ..Default::default()
+            },
+            &th,
+        );
+        assert_eq!(scoped.summary.machines, 2);
+        assert!(scoped.machines.iter().all(|m| m.tags["site"] == "glasgow"));
+
+        // The interesting case: a scoped viewer asking for the other site.
+        let mut tags = BTreeMap::new();
+        tags.insert("site".to_string(), "edinburgh".to_string());
+        let overreach = all.filtered(
+            &Filter {
+                scopes: glasgow_only,
+                tags,
+                ..Default::default()
+            },
+            &th,
+        );
+        assert_eq!(
+            overreach.summary.machines, 0,
+            "asking outside your scope returns nothing, not the other site"
+        );
+        assert!(
+            overreach.flags.is_empty(),
+            "and none of its findings either"
+        );
+    }
+
+    #[test]
+    fn two_scopes_are_a_union_and_a_two_tag_scope_needs_both() {
+        let mut e = Estate::new();
+        e.add_with("GLA-1", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["tags"] = json!({"site": "glasgow", "ring": "canary"});
+        });
+        e.add_with("GLA-2", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["tags"] = json!({"site": "glasgow", "ring": "broad"});
+        });
+        e.add_with("EDI-1", 1000.0, "2026-09-01T10:00:00Z", tagged("edinburgh"));
+        let all = e.snap();
+        let th = Thresholds::default();
+
+        let both_sites = all.filtered(
+            &Filter {
+                scopes: vec![
+                    BTreeMap::from([("site".to_string(), "glasgow".to_string())]),
+                    BTreeMap::from([("site".to_string(), "edinburgh".to_string())]),
+                ],
+                ..Default::default()
+            },
+            &th,
+        );
+        assert_eq!(both_sites.summary.machines, 3);
+
+        let narrow = all.filtered(
+            &Filter {
+                scopes: vec![BTreeMap::from([
+                    ("site".to_string(), "glasgow".to_string()),
+                    ("ring".to_string(), "canary".to_string()),
+                ])],
+                ..Default::default()
+            },
+            &th,
+        );
+        assert_eq!(
+            narrow.summary.machines, 1,
+            "every tag in a scope must match"
+        );
+        assert_eq!(narrow.machines[0].hostname.as_deref(), Some("GLA-1"));
+    }
+
+    /// A consequence worth being explicit about: a scope is a positive match,
+    /// so a machine whose result carried no tags is invisible to a scoped
+    /// viewer. If the deployment tool doesn't set tags, scoped viewers see an
+    /// empty fleet — the safe direction to fail, but it needs saying out loud.
+    #[test]
+    fn an_untagged_machine_is_invisible_to_a_scoped_viewer() {
+        let mut e = Estate::new();
+        e.add_with("TAGGED", 1000.0, "2026-09-01T10:00:00Z", tagged("glasgow"));
+        e.add_with("UNTAGGED", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["tags"] = json!({});
+        });
+        let all = e.snap();
+        assert_eq!(all.summary.machines, 2, "both are in the fleet");
+
+        let scoped = all.filtered(
+            &Filter {
+                scopes: vec![BTreeMap::from([(
+                    "site".to_string(),
+                    "glasgow".to_string(),
+                )])],
+                ..Default::default()
+            },
+            &Thresholds::default(),
+        );
+        assert_eq!(scoped.summary.machines, 1);
+        assert_eq!(scoped.machines[0].hostname.as_deref(), Some("TAGGED"));
+    }
+
+    /// An unscoped caller — an admin, or a viewer granted the whole fleet — is
+    /// not restricted by an empty scope list.
+    #[test]
+    fn an_empty_scope_list_means_the_whole_fleet() {
+        let mut e = Estate::new();
+        e.add_with("GLA-1", 1000.0, "2026-09-01T10:00:00Z", tagged("glasgow"));
+        e.add_with("UNTAGGED", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["tags"] = json!({});
+        });
+        let view = e
+            .snap()
+            .filtered(&Filter::default(), &Thresholds::default());
+        assert_eq!(view.summary.machines, 2);
     }
 
     /// The drilldown's own query: every run of one machine, and the subtests of
