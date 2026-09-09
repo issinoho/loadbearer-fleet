@@ -35,6 +35,10 @@ pub struct Config {
     pub server: Server,
     #[serde(default)]
     pub auth: Auth,
+    #[serde(default)]
+    pub metrics: Metrics,
+    #[serde(default)]
+    pub log: Log,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -50,6 +54,72 @@ pub struct Server {
     pub collection_dir: Option<PathBuf>,
     /// Where the derived index lives. Safe to delete.
     pub index: PathBuf,
+    /// How often to rescan the folder by itself. Zero switches it off and
+    /// leaves rescanning to the button.
+    ///
+    /// This is what makes it a service rather than a command: a dashboard that
+    /// only refreshes when somebody happens to click is a dashboard that is out
+    /// of date exactly when nobody is looking at it.
+    #[serde(default = "scan_interval_minutes")]
+    pub scan_interval_minutes: u64,
+}
+
+fn scan_interval_minutes() -> u64 {
+    15
+}
+
+/// Prometheus metrics, off unless asked for.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metrics {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Required as `Authorization: Bearer <token>` when set. Fleet-wide counts
+    /// are not hostnames, but "how many machines this organisation has and how
+    /// many are failing" is still something to put behind a credential once the
+    /// port is reachable from anywhere but this host.
+    #[serde(default)]
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable, for a console and for a person.
+    #[default]
+    Text,
+    /// One JSON object per line, for a log collector.
+    Json,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Log {
+    #[serde(default)]
+    pub format: LogFormat,
+    #[serde(default = "log_level")]
+    pub level: String,
+    /// Where to write the log. Rotated daily, with the date appended.
+    ///
+    /// Required to run as a service, and the installer refuses without it: a
+    /// service has no console, so with no log file there is no way at all to
+    /// find out why it did not start.
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+}
+
+fn log_level() -> String {
+    "info".to_string()
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            format: LogFormat::default(),
+            level: log_level(),
+            file: None,
+        }
+    }
 }
 
 impl Default for Server {
@@ -59,6 +129,7 @@ impl Default for Server {
             public_url: "http://127.0.0.1:8787".to_string(),
             collection_dir: None,
             index: PathBuf::from("fleet-index.db"),
+            scan_interval_minutes: scan_interval_minutes(),
         }
     }
 }
@@ -203,12 +274,31 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config from {}", path.display()))?;
-        let config: Config = toml::from_str(&text)
+        let mut config: Config = toml::from_str(&text)
             .with_context(|| format!("parsing config from {}", path.display()))?;
+        config.resolve_paths_against(path.parent().unwrap_or(Path::new(".")));
         config
             .validate()
             .with_context(|| format!("in {}", path.display()))?;
         Ok(config)
+    }
+
+    /// Make relative paths mean "beside the config file".
+    ///
+    /// Windows starts a service in `%SystemRoot%\System32`, and systemd in
+    /// `/`, so a relative `index = "fleet-index.db"` would otherwise put the
+    /// database somewhere nobody expects and nobody backs up — and it would
+    /// land somewhere *different* depending on how the process was started.
+    /// Resolving against the config file makes the answer the same either way.
+    fn resolve_paths_against(&mut self, base: &Path) {
+        self.server.index = beside(base, &self.server.index);
+        // A UNC share is already absolute, so the usual case is untouched.
+        self.server.collection_dir = self
+            .server
+            .collection_dir
+            .as_deref()
+            .map(|p| beside(base, p));
+        self.log.file = self.log.file.as_deref().map(|p| beside(base, p));
     }
 
     /// Is the dashboard reachable over a channel that hides a session cookie?
@@ -363,6 +453,26 @@ groups_claim = "groups"
 # How long a session lasts before signing in again.
 session_hours = 8
 
+[log]
+# "text" for a console, "json" for a log collector.
+format = "text"
+level = "info"
+
+# Where to write the log, rotated daily with the date appended. Required to run
+# as a service: a service has no console, so without this there is no way to
+# find out why it did not start.
+file = 'PUT-THE-PATH-FOR-THE-LOG-FILE-HERE'
+
+[metrics]
+# Serves Prometheus metrics on /metrics. Fleet-wide counts only - no machine,
+# hostname or cohort ever appears in a label, because a metrics store is
+# usually less protected than this service is.
+enabled = false
+
+# Required as "Authorization: Bearer <token>" when set. Leave empty only if the
+# port is reachable from this host alone.
+token = ""
+
 # Who gets in, and over how much of the estate. Use the group's object ID, not
 # its display name: names are renameable and not unique, and the token carries
 # object IDs anyway.
@@ -387,6 +497,14 @@ role = "viewer"   # read the dashboard
 # tags = { site = "glasgow" }
 "##;
         example.to_string()
+    }
+}
+
+fn beside(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() || base.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
     }
 }
 

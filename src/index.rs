@@ -154,12 +154,36 @@ impl Index {
     /// corrupt or truncated upload on a share of ten thousand must not stop the
     /// other 9 999 being indexed.
     pub fn scan(&mut self, root: &Path) -> Result<ScanReport> {
+        // A share that is down must not look like a folder that is empty.
+        // That is the failure which hides every other one, because "no
+        // machines need attention" reads as good news, so the root is checked
+        // before anything is counted.
+        let meta = std::fs::metadata(root).with_context(|| {
+            format!(
+                "reading the collection folder {} — if this is a share, check it is reachable \
+                 and that this account can read it",
+                root.display()
+            )
+        })?;
+        if !meta.is_dir() {
+            anyhow::bail!("{} is not a directory", root.display());
+        }
+
         let mut report = ScanReport::default();
-        for entry in walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        for entry in walkdir::WalkDir::new(root).follow_links(false) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    // Usually a subtree this account cannot read. Reporting it
+                    // keeps a partial scan from passing for a complete one.
+                    let path = e
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| root.display().to_string());
+                    report.rejected.push((path, format!("{e}")));
+                    continue;
+                }
+            };
             let path = entry.path();
             if !entry.file_type().is_file() {
                 continue;
@@ -428,6 +452,26 @@ mod tests {
             "one bad upload must not cost the good ones"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The silent failure this guards against: an unreachable share reporting
+    /// an empty folder, which the dashboard would render as a healthy estate
+    /// with nothing to worry about.
+    #[test]
+    fn a_scan_of_an_unreachable_folder_fails_rather_than_reporting_it_empty() {
+        let mut idx = Index::open_in_memory().unwrap();
+        let missing = std::env::temp_dir().join(format!("lbf-not-here-{}", std::process::id()));
+        let err = idx
+            .scan(&missing)
+            .expect_err("a folder that cannot be read is not an empty folder")
+            .to_string();
+        assert!(err.contains("collection folder"), "{err}");
+
+        // And a file where a folder was expected is just as wrong.
+        let file = std::env::temp_dir().join(format!("lbf-file-{}.json", std::process::id()));
+        std::fs::write(&file, b"{}").unwrap();
+        assert!(idx.scan(&file).is_err());
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

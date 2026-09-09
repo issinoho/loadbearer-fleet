@@ -27,6 +27,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -42,8 +43,9 @@ use tower_http::trace::TraceLayer;
 
 use crate::analytics::{self, Cohort, Detail, Filter, Flag, MachineView, Snapshot, Thresholds};
 use crate::auth::{self, Authenticator, Caller};
-use crate::config::{AuthMode, Config};
-use crate::index::Index;
+use crate::config::{AuthMode, Config, Metrics as MetricsConfig};
+use crate::index::{Index, ScanReport};
+use crate::metrics::{self, Runtime, ScanStamp};
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
@@ -59,6 +61,9 @@ pub struct AppState {
     /// the index is read-only from here and `rescan` has nothing to walk.
     root: Option<PathBuf>,
     authenticator: Authenticator,
+    metrics_config: MetricsConfig,
+    /// Counters that outlive any one snapshot, for the metrics endpoint.
+    runtime: Mutex<Runtime>,
 }
 
 impl AppState {
@@ -70,6 +75,8 @@ impl AppState {
             thresholds,
             root: config.server.collection_dir.clone(),
             authenticator: Authenticator::new(config),
+            metrics_config: config.metrics.clone(),
+            runtime: Mutex::new(Runtime::new()),
         }))
     }
 
@@ -86,6 +93,47 @@ impl AppState {
         let snap = analytics::snapshot(idx.conn(), &self.thresholds, OffsetDateTime::now_utc())?;
         *self.cache.write().expect("cache lock") = Arc::new(snap);
         Ok(())
+    }
+
+    /// Read the folder and rebuild the analysis. Blocking, and called from both
+    /// the button and the timer so there is one implementation of "refresh".
+    pub(crate) fn rescan(&self) -> Result<ScanReport> {
+        let Some(root) = self.root.clone() else {
+            anyhow::bail!(
+                "this instance was started without a collection folder, so there is nothing \
+                 to rescan"
+            );
+        };
+        let mut runtime = self.runtime.lock().expect("runtime lock");
+        runtime.scans_total += 1;
+        drop(runtime);
+
+        let report = {
+            let mut idx = self.index.lock().expect("index lock");
+            match idx.scan(&root) {
+                Ok(report) => report,
+                Err(e) => {
+                    // A scan that could not run at all — an unreachable share,
+                    // typically — as opposed to a file that would not parse,
+                    // which `scan` reports and skips.
+                    self.runtime
+                        .lock()
+                        .expect("runtime lock")
+                        .scan_failures_total += 1;
+                    return Err(e);
+                }
+            }
+        };
+        self.recompute()?;
+
+        let mut runtime = self.runtime.lock().expect("runtime lock");
+        runtime.last_scan = Some(ScanStamp {
+            at: OffsetDateTime::now_utc(),
+            seen: report.seen,
+            ingested: report.ingested,
+            rejected: report.rejected.len(),
+        });
+        Ok(report)
     }
 }
 
@@ -264,16 +312,17 @@ async fn post_rescan(
             "rescanning the collection folder needs the admin role",
         ));
     }
-    let Some(root) = state.root.clone() else {
+    if state.root.is_none() {
         return Err(AppError::bad_request(
             "this instance was started without a collection folder, so there is nothing to rescan",
         ));
-    };
-    let report = {
-        let mut idx = state.index.lock().expect("index lock");
-        idx.scan(&root)?
-    };
-    state.recompute()?;
+    }
+    // Walking a share and rewriting SQLite is blocking work; doing it on a
+    // runtime thread would stall every other request for the duration.
+    let scanning = Arc::clone(&state);
+    let report = tokio::task::spawn_blocking(move || scanning.rescan())
+        .await
+        .map_err(|e| AppError::from(anyhow::anyhow!("the scan task failed: {e}")))??;
     let now_visible = visible(&state, &caller, FilterParams::default());
     Ok(Json(RescanResponse {
         seen: report.seen,
@@ -303,6 +352,56 @@ fn asset(body: &'static str, content_type: &'static str) -> Response {
 /// to sign in rather than handed a page whose first request can only fail.
 async fn index_html(_caller: Caller) -> Response {
     asset(INDEX_HTML, "text/html; charset=utf-8")
+}
+
+/// Compare a presented credential without leaking, through timing, how much of
+/// it was right.
+///
+/// Digesting both sides first means the comparison runs over 32 bytes of hash
+/// whatever the inputs were, so neither the length nor any prefix of the real
+/// token is recoverable from how long the answer took.
+fn token_matches(presented: &str, configured: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(presented.as_bytes()) == Sha256::digest(configured.as_bytes())
+}
+
+async fn get_metrics(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, AppError> {
+    if !state.metrics_config.enabled {
+        // Not 403: a disabled endpoint should not advertise that it exists and
+        // could be opened.
+        return Err(AppError::not_found(
+            "metrics are not enabled; set [metrics] enabled = true",
+        ));
+    }
+    if !state.metrics_config.token.is_empty() {
+        let presented = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !token_matches(presented, &state.metrics_config.token) {
+            return Err(AppError {
+                status: StatusCode::UNAUTHORIZED,
+                source: anyhow::anyhow!("metrics need the configured bearer token"),
+            });
+        }
+    }
+    // Fleet-wide and unscoped: this is an operator's view of the service, and a
+    // scrape must not depend on whose session happened to trigger it.
+    let snapshot = state.snapshot();
+    let runtime = state.runtime.lock().expect("runtime lock").clone();
+    let body = metrics::render(&snapshot, &runtime, OffsetDateTime::now_utc());
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response())
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -339,6 +438,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/snapshot", get(get_snapshot))
         .route("/api/machine/{key}", get(get_machine))
         .route("/api/rescan", post(post_rescan))
+        .route("/metrics", get(get_metrics))
         // Unauthenticated on purpose: a service manager or load balancer has to
         // be able to ask whether the process is alive, and the answer says
         // nothing about the estate.
@@ -356,8 +456,127 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Scan once at startup, and keep going if the folder cannot be read.
+///
+/// Deliberately not fatal. The index already holds the last sweep, and
+/// refusing to show it because a share is briefly unreachable is worse than
+/// showing it: the staleness flags say how old it is, the metrics say no scan
+/// has succeeded, and the timer will pick the share up when it comes back. A
+/// service that instead refused to start would restart-loop until somebody
+/// noticed, showing nobody anything in the meantime.
+pub fn report_startup_scan(state: &Arc<AppState>) {
+    match state.rescan() {
+        Ok(report) => {
+            tracing::info!(
+                seen = report.seen,
+                ingested = report.ingested,
+                unchanged = report.unchanged,
+                rejected = report.rejected.len(),
+                "startup scan"
+            );
+            for (path, why) in &report.rejected {
+                tracing::warn!(%path, %why, "skipped");
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = format!("{e:#}"),
+                "the startup scan failed; serving whatever the index already holds"
+            );
+            eprintln!(
+                "warning: the collection folder could not be read ({e:#}).\n\
+                 Serving the existing index; the next scheduled scan will try again."
+            );
+        }
+    }
+}
+
+/// Everything that should end the process, in one future.
+///
+/// A service manager stops a process by signal, not by keyboard: systemd sends
+/// SIGTERM and waits, and Windows' service controller sends a stop request that
+/// `service::run` turns into `stop`. Handling only Ctrl+C would mean being
+/// killed after a timeout on every restart, with the index left mid-write.
+async fn shutdown_signal(stop: Option<tokio::sync::watch::Receiver<bool>>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl+C"
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+                "SIGTERM"
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM");
+                std::future::pending().await
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<&str>();
+
+    let requested = async {
+        match stop {
+            Some(mut rx) => {
+                // Already set is still a stop: don't wait for a second change.
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        return "the stop channel closed";
+                    }
+                }
+                "a service stop request"
+            }
+            None => std::future::pending().await,
+        }
+    };
+
+    let reason = tokio::select! {
+        r = ctrl_c => r,
+        r = terminate => r,
+        r = requested => r,
+    };
+    tracing::info!(reason, "shutting down");
+}
+
+/// Rescan on a timer, so the dashboard is current when nobody is looking at it.
+fn spawn_periodic_scan(state: Arc<AppState>, every: Duration) {
+    tokio::spawn(async move {
+        // The startup scan has already run, so wait a full interval first.
+        let mut ticker = tokio::time::interval(every);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let scanning = Arc::clone(&state);
+            match tokio::task::spawn_blocking(move || scanning.rescan()).await {
+                Ok(Ok(report)) => tracing::info!(
+                    seen = report.seen,
+                    ingested = report.ingested,
+                    unchanged = report.unchanged,
+                    rejected = report.rejected.len(),
+                    "scheduled scan"
+                ),
+                // Neither of these should end the timer: a share that is
+                // unreachable this minute is usually reachable the next, and a
+                // dashboard that stops refreshing after one network blip is
+                // worse than one that logs and carries on.
+                Ok(Err(e)) => tracing::error!(error = format!("{e:#}"), "scheduled scan failed"),
+                Err(e) => tracing::error!(error = %e, "the scan task panicked"),
+            }
+        }
+    });
+}
+
 /// Serve until interrupted.
-pub async fn serve(state: Arc<AppState>, config: &Config, allow_remote: bool) -> Result<()> {
+pub async fn serve(
+    state: Arc<AppState>,
+    config: &Config,
+    allow_remote: bool,
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
     let bind: SocketAddr = config.server.bind;
     let loopback = match bind.ip() {
         IpAddr::V4(v4) => v4.is_loopback(),
@@ -396,6 +615,16 @@ pub async fn serve(state: Arc<AppState>, config: &Config, allow_remote: bool) ->
         );
     }
 
+    // Fleet-wide counts are not hostnames, but "how many machines this
+    // organisation has and how many are failing" is still not for anyone who
+    // can reach the port.
+    if config.metrics.enabled && config.metrics.token.is_empty() && !loopback && !allow_remote {
+        anyhow::bail!(
+            "refusing to listen on {bind} with [metrics] enabled and no token: set \
+             metrics.token, or bind to 127.0.0.1, or pass --allow-remote"
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
@@ -410,11 +639,19 @@ pub async fn serve(state: Arc<AppState>, config: &Config, allow_remote: bool) ->
         }
     );
 
+    if config.server.scan_interval_minutes > 0 && state.root.is_some() {
+        let every = Duration::from_secs(config.server.scan_interval_minutes * 60);
+        tracing::info!(
+            minutes = config.server.scan_interval_minutes,
+            "scanning on a timer"
+        );
+        spawn_periodic_scan(Arc::clone(&state), every);
+    } else if state.root.is_some() {
+        tracing::info!("scan_interval_minutes is 0: the folder is only read on request");
+    }
+
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-        })
+        .with_graceful_shutdown(shutdown_signal(stop))
         .await?;
     Ok(())
 }
@@ -710,6 +947,159 @@ mod tests {
         assert!(
             !get(&state, "/app.js", None).await.body.contains("SN-"),
             "and none of them says anything about the fleet"
+        );
+    }
+
+    fn metrics_config(enabled: bool, token: &str) -> Config {
+        Config {
+            metrics: MetricsConfig {
+                enabled,
+                token: token.to_string(),
+            },
+            ..Config::default()
+        }
+    }
+
+    async fn get_with_bearer(state: &Arc<AppState>, uri: &str, token: &str) -> StatusCode {
+        router(Arc::clone(state))
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn metrics_are_absent_until_switched_on() {
+        let state = state_for(&metrics_config(false, ""));
+        assert_eq!(
+            get(&state, "/metrics", None).await.status,
+            StatusCode::NOT_FOUND,
+            "a disabled endpoint should not advertise that it exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_report_the_fleet_when_switched_on() {
+        let state = state_for(&metrics_config(true, ""));
+        let reply = get(&state, "/metrics", None).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(
+            reply.body.contains("loadbearer_fleet_machines 4"),
+            "{}",
+            reply.body
+        );
+        assert!(
+            reply
+                .body
+                .contains("# TYPE loadbearer_fleet_machines gauge")
+        );
+        // Nothing per-machine: a metrics store is usually less protected than
+        // this service is.
+        assert!(!reply.body.contains("SN-"), "a serial reached the metrics");
+    }
+
+    /// A scrape has no session and cannot get one, so the token is the whole
+    /// control.
+    #[tokio::test]
+    async fn a_metrics_token_is_required_when_one_is_configured() {
+        let state = state_for(&metrics_config(true, "s3cret-token"));
+        assert_eq!(
+            get(&state, "/metrics", None).await.status,
+            StatusCode::UNAUTHORIZED,
+            "no header at all"
+        );
+        assert_eq!(
+            get_with_bearer(&state, "/metrics", "not-the-token").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_with_bearer(&state, "/metrics", "s3cret-token").await,
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn a_token_comparison_does_not_depend_on_how_much_was_right() {
+        assert!(token_matches("abc", "abc"));
+        assert!(!token_matches("abc", "abd"));
+        assert!(!token_matches("", "abc"));
+        assert!(!token_matches("abc", ""));
+        // A prefix must not pass, which is what a sloppy length-first
+        // comparison can get wrong.
+        assert!(!token_matches("ab", "abc"));
+        assert!(!token_matches("abcd", "abc"));
+    }
+
+    /// The metric an operator pages on has to appear once a scan has happened,
+    /// and stay absent before that: a zero timestamp would read as 1970 and
+    /// fire an alert for the wrong reason.
+    #[tokio::test]
+    async fn a_scan_records_what_the_metrics_report() {
+        let state = state_for(&metrics_config(true, ""));
+        let before = get(&state, "/metrics", None).await.body;
+        assert!(!before.contains("scan_last_success_timestamp_seconds"));
+        assert!(before.contains("loadbearer_fleet_scans_total 0"));
+
+        assert_eq!(
+            request(&state, Method::POST, "/api/rescan", None)
+                .await
+                .status,
+            StatusCode::OK
+        );
+
+        let after = get(&state, "/metrics", None).await.body;
+        assert!(after.contains("loadbearer_fleet_scans_total 1"), "{after}");
+        assert!(
+            after.contains("scan_last_success_timestamp_seconds"),
+            "{after}"
+        );
+        assert!(
+            after.contains("loadbearer_fleet_scan_files_seen 4"),
+            "{after}"
+        );
+        assert!(
+            after.contains("loadbearer_fleet_scan_failures_total 0"),
+            "{after}"
+        );
+    }
+
+    /// A share that cannot be read must show up as a failure rather than as an
+    /// estate that suddenly has nothing wrong with it.
+    #[tokio::test]
+    async fn an_unreachable_folder_counts_as_a_failure_and_changes_nothing() {
+        let mut config = metrics_config(true, "");
+        config.server.collection_dir = Some(PathBuf::from("no-such-folder-anywhere"));
+        let mut index = Index::open_in_memory().expect("index");
+        index
+            .ingest_file(&fixtures().join("win-modern.json"))
+            .expect("fixture");
+        let state = AppState::new(index, &config, Thresholds::default()).expect("state");
+
+        assert_eq!(
+            request(&state, Method::POST, "/api/rescan", None)
+                .await
+                .status,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let metrics = get(&state, "/metrics", None).await.body;
+        assert!(
+            metrics.contains("loadbearer_fleet_scan_failures_total 1"),
+            "{metrics}"
+        );
+        assert!(
+            !metrics.contains("scan_last_success_timestamp_seconds"),
+            "a failed scan must not look like a successful one"
+        );
+        assert!(
+            metrics.contains("loadbearer_fleet_machines 1"),
+            "and the fleet it already knew about is untouched"
         );
     }
 

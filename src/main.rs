@@ -14,18 +14,20 @@ mod analytics;
 mod auth;
 mod config;
 mod index;
+mod metrics;
 mod schema;
+mod service;
 mod web;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use time::OffsetDateTime;
 
 use analytics::{FlagKind, Severity, Thresholds};
-use config::Config;
+use config::{Config, LogFormat};
 
 #[derive(Parser, Debug)]
 #[command(name = "loadbearer-fleet", version, about)]
@@ -42,8 +44,9 @@ struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    #[arg(long, global = true, value_name = "LEVEL", default_value = "info")]
-    log_level: String,
+    /// Overrides the config file. `RUST_LOG` overrides both.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log_level: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -94,6 +97,105 @@ enum Command {
     /// Contact the identity provider and report what the settings resolve to,
     /// so a wrong tenant fails at deploy time rather than at first sign-in.
     CheckAuth,
+    /// Run as a service.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceAction {
+    /// The entry point the Windows service controller calls. Not meant to be
+    /// run by hand — use `serve` for that.
+    Run {
+        #[arg(long)]
+        allow_remote: bool,
+    },
+    /// Register the Windows service. Needs an elevated prompt.
+    Install {
+        /// The account to run as. Omitted means LocalSystem, which reaches a
+        /// network share as the machine account.
+        #[arg(long, value_name = r"DOMAIN\USER")]
+        account: Option<String>,
+        /// Password for --account. Prompted for by the service controller if
+        /// omitted for an account that needs one.
+        #[arg(long, value_name = "PASSWORD")]
+        password: Option<String>,
+        #[arg(long)]
+        allow_remote: bool,
+    },
+    /// Remove the Windows service. Leaves the index and the config alone.
+    Uninstall,
+    /// Print a systemd unit for this configuration.
+    Unit {
+        /// The user to run as.
+        #[arg(long, default_value = "loadbearer-fleet", value_name = "USER")]
+        user: String,
+    },
+}
+
+/// Set up logging.
+///
+/// Precedence is `RUST_LOG`, then `--log-level`, then the config file: the
+/// environment wins because it is what someone reaches for while debugging a
+/// service they cannot easily reconfigure.
+fn init_logging(log: &config::Log, cli_level: Option<&str>) -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+
+    let level = cli_level.unwrap_or(&log.level);
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
+    // Every branch ends in the same place; they differ only in the writer and
+    // the formatter, and those are different types, so the arms cannot be
+    // collapsed.
+    match (&log.file, log.format) {
+        (None, LogFormat::Text) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .init();
+        }
+        (None, LogFormat::Json) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .json()
+                .init();
+        }
+        (Some(path), format) => {
+            let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+            if let Some(dir) = dir {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("creating the log directory {}", dir.display()))?;
+            }
+            let name = path
+                .file_name()
+                .context("log.file has no file name")?
+                .to_string_lossy()
+                .to_string();
+            // Rotated daily with the date appended, because a service log that
+            // is never rotated is a disk that eventually fills.
+            let writer = tracing_appender::rolling::daily(
+                dir.unwrap_or_else(|| std::path::Path::new(".")),
+                name,
+            );
+            match format {
+                LogFormat::Text => tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_target(false)
+                    // No escape codes in a file somebody will open in Notepad.
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .init(),
+                LogFormat::Json => tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .json()
+                    .with_writer(writer)
+                    .init(),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -104,16 +206,10 @@ fn main() -> Result<()> {
         print!("{}", Config::starter());
         return Ok(());
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| cli.log_level.clone().into()),
-        )
-        .with_target(false)
-        .init();
-
     // CLI over file over default, so a service can be configured in a file and
-    // still be poked at by hand.
+    // still be poked at by hand. The config is loaded before logging is set up
+    // because it says where the log goes; a failure here is returned and
+    // printed rather than logged.
     let mut config = match &cli.config {
         Some(path) => Config::load(path)?,
         None => Config::default(),
@@ -121,6 +217,7 @@ fn main() -> Result<()> {
     if let Some(index) = &cli.index {
         config.server.index = index.clone();
     }
+    init_logging(&config.log, cli.log_level.as_deref())?;
 
     match &cli.command {
         Command::InitConfig => unreachable!("handled above"),
@@ -173,7 +270,8 @@ fn main() -> Result<()> {
             let authenticator = auth::Authenticator::new(&config);
             if !authenticator.enabled() {
                 println!(
-                    "auth.mode is \"none\": there is nothing to check, and the dashboard will                      treat everyone who reaches the port as an administrator."
+                    "auth.mode is \"none\": there is nothing to check, and the dashboard will \
+                     treat everyone who reaches the port as an administrator."
                 );
                 return Ok(());
             }
@@ -184,6 +282,31 @@ fn main() -> Result<()> {
             println!("{report}");
             Ok(())
         }
+        Command::Service { action } => match action {
+            ServiceAction::Run { allow_remote } => service::run(config, *allow_remote),
+            ServiceAction::Install {
+                account,
+                password,
+                allow_remote,
+            } => {
+                let path = service::preflight(cli.config.as_deref(), &config)?;
+                let exe = std::env::current_exe().context("finding this executable")?;
+                service::install(
+                    &exe,
+                    path,
+                    *allow_remote,
+                    account.as_deref(),
+                    password.as_deref(),
+                )
+            }
+            ServiceAction::Uninstall => service::uninstall(),
+            ServiceAction::Unit { user } => {
+                let path = service::preflight(cli.config.as_deref(), &config)?;
+                let exe = std::env::current_exe().context("finding this executable")?;
+                print!("{}", service::systemd_unit(&exe, path, &config, user));
+                Ok(())
+            }
+        },
         Command::Serve {
             dir,
             bind,
@@ -196,29 +319,22 @@ fn main() -> Result<()> {
             if let Some(bind) = bind {
                 config.server.bind = *bind;
             }
-            let mut idx = index::Index::open(&config.server.index)?;
-            if let Some(dir) = config.server.collection_dir.clone()
-                && !*no_scan
-            {
-                let report = idx.scan(&dir)?;
-                tracing::info!(
-                    seen = report.seen,
-                    ingested = report.ingested,
-                    unchanged = report.unchanged,
-                    rejected = report.rejected.len(),
-                    "startup scan"
-                );
-                for (path, why) in &report.rejected {
-                    tracing::warn!(%path, %why, "skipped");
-                }
-            }
+            let idx = index::Index::open(&config.server.index)?;
             let state = web::AppState::new(idx, &config, Thresholds::default())?;
+            if config.server.collection_dir.is_some() && !*no_scan {
+                // Through the same path the timer and the button use, so the
+                // startup scan is counted and stamped like any other. It used
+                // not to be, which left `scan_last_success_timestamp_seconds`
+                // missing until the first tick — an alert firing on a service
+                // that had just started successfully.
+                web::report_startup_scan(&state);
+            }
             // One runtime for the server only, so every other subcommand stays
             // a plain synchronous program.
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(web::serve(state, &config, *allow_remote))
+                .block_on(web::serve(state, &config, *allow_remote, None))
         }
     }
 }

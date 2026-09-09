@@ -87,7 +87,7 @@ resets when they're reimaged" is something an estate owner should know.
       with history — see [The dashboard](#the-dashboard)
 - [x] Entra ID / OIDC SSO with PKCE, roles from group claims, tag-scoped
       authorization — see [Sign-in](#sign-in)
-- [ ] Service packaging, config file, metrics
+- [x] Service packaging, config file, metrics — see [Running it as a service](#running-it-as-a-service)
 
 ## Analysis
 
@@ -239,6 +239,65 @@ in as that user.
 
 The dashboard does not terminate TLS. Put a reverse proxy in front of it and set
 `public_url` to the proxy's address.
+
+## Running it as a service
+
+```
+loadbearer-fleet init-config > C:\ProgramData\loadbearer-fleet\fleet.toml
+# fill it in, then:
+loadbearer-fleet --config C:\ProgramData\loadbearer-fleet\fleet.toml service install
+sc start loadbearer-fleet
+```
+
+On Linux, `service unit --config /etc/loadbearer-fleet/fleet.toml` prints a
+systemd unit — hardened, because this process reads a share and writes one
+database and never needs a new privilege, an executable mapping or a raw socket.
+Review it, drop it in `/etc/systemd/system`, `systemctl enable --now`.
+
+It stops when it is told to. systemd's SIGTERM, Ctrl+C and the Windows service
+controller's stop request all land in the same shutdown path, so a restart is
+never a kill after a timeout with the index half-written. On Windows it reports
+`StartPending` while the first scan runs, so scanning a large share isn't
+mistaken for a hung service, and it reinstates itself after a crash (5s, 30s,
+5min).
+
+**It rescans on a timer** — `scan_interval_minutes`, 15 by default. This is what
+makes it a service rather than a command: a dashboard that only refreshes when
+somebody clicks is out of date exactly when nobody is looking at it. A scan that
+fails logs and carries on; one network blip shouldn't stop a dashboard
+refreshing for good.
+
+Two traps the installer refuses to walk into. **Relative paths**: Windows starts
+a service in `System32` and systemd in `/`, so paths in the config are resolved
+against the config file, and installing without an absolute `--config` is
+refused. **Nowhere to log**: a service has no console, so without `[log] file`
+there is no way to find out why it didn't start, and the installer says so
+rather than letting you find out later. Logs rotate daily and can be `json` for
+a collector.
+
+## Metrics
+
+`[metrics] enabled = true` serves Prometheus on `/metrics`, behind a bearer
+token when one is configured — a scrape has no session and cannot get one, so
+the token is the whole control, and enabling metrics without one on a
+non-loopback bind is refused.
+
+Nothing per-machine is ever exported: no hostname, serial or cohort appears in a
+label. Per-machine series would put the estate's inventory into a metrics store
+that is usually less protected than this service is, and would multiply the
+fleet's size by every label.
+
+Three of them are worth alerting on:
+
+| Metric | Means |
+| --- | --- |
+| `scan_last_success_timestamp_seconds` | **Collection has stopped.** The failure that hides every other one, because a dashboard full of yesterday's green looks exactly like a healthy estate. |
+| `newest_run_age_seconds` | The *machines* have stopped reporting — a different fault from this service having stopped reading. |
+| `scan_files_rejected` | Something is writing files this can't parse. One is a truncated upload; a hundred is a broken collector. |
+
+A scan of a folder that can't be read fails loudly and increments
+`scan_failures_total` rather than reporting an empty folder, because "no
+machines need attention" is how an unreachable share would otherwise look.
 
 ## Licence
 
