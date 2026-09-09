@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>loadbearer fleet</title>
+<!--
+  Nothing here loads from anywhere but this origin: no CDN, no font service, no
+  analytics. The binary carries its own assets, so the dashboard works on an
+  air-gapped management network and the server can send
+  `default-src 'self'` and mean it.
+-->
+<link rel="stylesheet" href="/app.css">
+</head>
+<!-- data-palette lists the hexes used as marks, so the dataviz validator can be
+     pointed at this page directly rather than at a copy of the list. -->
+<body data-palette="#2a78d6,#e34948,#d03b3b,#fab219,#898781">
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">loadbearer <b>fleet</b></span>
+  </div>
+
+  <nav class="tabs" id="tabs" aria-label="Views">
+    <button type="button" class="tab" data-view="overview" aria-current="page">Overview</button>
+    <button type="button" class="tab" data-view="cohorts">Cohorts</button>
+    <button type="button" class="tab" data-view="machines">Machines</button>
+  </nav>
+
+  <div class="topbar-actions">
+    <span class="meta" id="generated"></span>
+    <button type="button" class="btn" id="rescan">Rescan folder</button>
+    <button type="button" class="btn btn-square" id="theme" aria-label="Switch between light and dark">
+      <span aria-hidden="true">&#9681;</span>
+    </button>
+  </div>
+</header>
+
+<!-- One filter row, above everything it scopes. The server applies it, so the
+     summary, the charts and the tables can never disagree with each other. -->
+<form class="filters" id="filters" aria-label="Filter the fleet">
+  <label class="field">
+    <span class="field-label">Measured</span>
+    <select name="since_days" id="f-since">
+      <option value="">Any time</option>
+      <option value="7">Last 7 days</option>
+      <option value="30">Last 30 days</option>
+      <option value="90">Last 90 days</option>
+      <option value="365">Last year</option>
+    </select>
+  </label>
+
+  <span id="f-tags" class="tag-filters"></span>
+
+  <label class="field">
+    <span class="field-label">Finding</span>
+    <select name="flag" id="f-flag">
+      <option value="">Any</option>
+    </select>
+  </label>
+
+  <label class="field field-grow">
+    <span class="field-label">Search</span>
+    <input type="search" name="q" id="f-q" placeholder="Hostname, serial, asset tag or CPU"
+           autocomplete="off" spellcheck="false">
+  </label>
+
+  <button type="button" class="btn btn-quiet" id="f-reset">Clear</button>
+  <span class="filter-count" id="f-count"></span>
+</form>
+
+<main id="main"></main>
+
+<footer class="footer">
+  <span id="footer-note"></span>
+</footer>
+
+<div class="tooltip" id="tooltip" role="status" hidden></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

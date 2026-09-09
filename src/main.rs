@@ -13,7 +13,9 @@
 mod analytics;
 mod index;
 mod schema;
+mod web;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -62,6 +64,25 @@ enum Command {
         /// findings under forty notices is how a dashboard stops being read.
         #[arg(long)]
         all: bool,
+    },
+    /// Serve the web dashboard.
+    Serve {
+        /// The collection folder. Scanned on startup, and again whenever
+        /// someone hits Rescan. Omit it to serve an existing index read-only.
+        #[arg(value_name = "DIR")]
+        dir: Option<PathBuf>,
+
+        /// Address to listen on. Loopback unless --allow-remote.
+        #[arg(long, default_value = "127.0.0.1:8787", value_name = "ADDR")]
+        bind: SocketAddr,
+
+        /// Listen on a network interface even though there is no sign-in yet.
+        #[arg(long)]
+        allow_remote: bool,
+
+        /// Skip the startup scan and serve whatever the index already holds.
+        #[arg(long)]
+        no_scan: bool,
     },
 }
 
@@ -120,6 +141,36 @@ fn main() -> Result<()> {
             }
             print_report(&snap, *all);
             Ok(())
+        }
+        Command::Serve {
+            dir,
+            bind,
+            allow_remote,
+            no_scan,
+        } => {
+            let mut idx = index::Index::open(&cli.index)?;
+            if let Some(dir) = dir
+                && !*no_scan
+            {
+                let report = idx.scan(dir)?;
+                tracing::info!(
+                    seen = report.seen,
+                    ingested = report.ingested,
+                    unchanged = report.unchanged,
+                    rejected = report.rejected.len(),
+                    "startup scan"
+                );
+                for (path, why) in &report.rejected {
+                    tracing::warn!(%path, %why, "skipped");
+                }
+            }
+            let state = web::AppState::new(idx, dir.clone(), Thresholds::default())?;
+            // One runtime for the server only, so every other subcommand stays
+            // a plain synchronous program.
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(web::serve(state, *bind, *allow_remote))
         }
     }
 }

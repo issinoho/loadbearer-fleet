@@ -5,9 +5,9 @@ results: point it at the folder your deployment tool drops `.json` result files
 into, and it indexes them and reports across the estate — executive summary,
 grouping, drilldown, and the outliers and red flags worth acting on.
 
-**Status: early.** Ingest, cohort analytics and the red-flag engine work from
-the command line; the web UI and authentication are not built yet. See
-[Roadmap](#roadmap).
+**Status: early.** Ingest, cohort analytics, the red-flag engine and the web
+dashboard all work. **There is no authentication yet**, so it refuses to listen
+anywhere but loopback unless you insist. See [Roadmap](#roadmap).
 
 ## How it fits together
 
@@ -44,7 +44,8 @@ loadbearer-fleet scan \\fileserver\loadbearer      # index a folder (or re-index
 loadbearer-fleet status                            # what's in the index
 loadbearer-fleet report                            # summary, cohorts and red flags
 loadbearer-fleet report --all                      # include informational flags
-loadbearer-fleet report --json                     # the whole snapshot, as the UI will see it
+loadbearer-fleet report --json                     # the whole snapshot, as the UI sees it
+loadbearer-fleet serve \\fileserver\loadbearer     # the dashboard, on http://127.0.0.1:8787
 ```
 
 Rescanning is cheap and idempotent: every run is keyed by the SHA-256 of the
@@ -78,8 +79,10 @@ resets when they're reimaged" is something an estate owner should know.
 - [x] Red flags: low grades, cohort outliers, regressions, weak components, thermal
       limits, forced runs, partial runs, RAM-backed disk targets, battery wear,
       stale results, weak identity
-- [ ] Web UI: executive summary, cohort explorer, machine drilldown with history
-- [ ] Entra ID / OIDC SSO, roles from group claims, tag-scoped authorization
+- [x] Web UI: executive summary, cohort explorer, machine table, machine drilldown
+      with history — see [The dashboard](#the-dashboard)
+- [ ] Entra ID / OIDC SSO, roles from group claims, tag-scoped authorization.
+      Until this lands the server listens on loopback only
 - [ ] Service packaging, config file, metrics
 
 ## Analysis
@@ -126,6 +129,55 @@ means an estate owner reads a thermal caveat as a failing asset:
 
 Every threshold lives in one struct with its reasoning attached, so tuning the
 engine is a config change rather than a code read.
+
+## The dashboard
+
+```
+loadbearer-fleet serve \\fileserver\loadbearer
+```
+
+Scans the folder, then serves four views on `127.0.0.1:8787`: an executive
+**overview** (how many machines need attention, grade distribution, findings by
+queue, score spread, and the ranked list of what to look at), a **cohort
+explorer** (each machine against the median of the machines like it), a sortable
+**machine table**, and a **drilldown** per machine with its score history, its
+components, its findings in full, and every subtest of its latest run.
+
+`POST /api/rescan` — the Rescan button — re-reads the folder. `GET /api/snapshot`
+returns exactly what the dashboard draws, so any view can be scripted or
+diffed; `GET /api/machine/{key}` is the drilldown payload.
+
+### It listens on loopback only
+
+There is no sign-in yet, and the index holds the hostname and firmware serial of
+every machine in the estate. A non-loopback bind therefore takes an explicit
+`--allow-remote` and logs a warning; without it the server refuses and says why.
+Until [authentication](#roadmap) lands, the intended deployment is loopback plus
+an SSH tunnel.
+
+### No build step, no CDN, one binary
+
+The HTML, CSS and JavaScript are compiled into the executable, and the charts
+are hand-rolled SVG. There is no npm, no bundler, and nothing is fetched from
+the internet at runtime — which is what makes it work on an air-gapped
+management network, and what lets the server send `default-src 'self'` and mean
+it.
+
+### The charts
+
+Built to the Claude Code `dataviz` skill's specs, and the colour work was
+computed rather than eyeballed: the diverging blue/red pair passes all six
+checks in both light and dark mode. Grades get a single hue rather than an
+ordinal ramp, because six steps cannot clear the ramp's adjacent-lightness gate
+inside the range the surface allows — and the axis already carries the order.
+Every chart has a table view, so no value is ever reachable only by hovering,
+and hover and keyboard focus show the same thing.
+
+`node scripts/check-ui.mjs` renders every chart and every view against a
+minimal DOM and asserts the geometry: no NaN reaching an SVG attribute, nothing
+painted outside its own box, bars capped at 24px, markers carrying their surface
+ring, hit targets big enough to hit, and axis labels that fit their band. It
+needs Node; the server does not, so it is deliberately outside `cargo test`.
 
 ## Licence
 

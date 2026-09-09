@@ -228,6 +228,10 @@ pub struct Cohort {
     pub cpu_model: String,
     pub comparability: Comparability,
     pub members: usize,
+    /// How many of the cohort's members survive the current filter. The
+    /// statistics beside it do **not** narrow with the filter — see
+    /// `Snapshot::filtered`.
+    pub in_view: usize,
     pub median: f64,
     pub mad: f64,
     /// The floored dispersion the z-score actually divides by.
@@ -376,7 +380,7 @@ pub fn snapshot(conn: &Connection, th: &Thresholds, now: OffsetDateTime) -> Resu
     }
 
     let flags = evaluate(&machines, &by_id, th);
-    let summary = summarise(&machines, &cohorts, &flags, &history, th);
+    let summary = summarise(&machines, &cohorts, &flags, th);
 
     Ok(Snapshot {
         generated_at: now.format(&Rfc3339)?,
@@ -596,6 +600,7 @@ fn build_cohorts(machines: &[MachineView], th: &Thresholds) -> Vec<Cohort> {
                 cpu_model: head.cpu_model.clone(),
                 comparability: head.comparability.clone(),
                 members: members.len(),
+                in_view: members.len(),
                 median: med,
                 mad: spread,
                 scale: spread.max(med.abs() * th.mad_floor_frac),
@@ -919,11 +924,13 @@ fn evaluate(
     flags
 }
 
+/// Everything in the summary is derived from the machines in view, never from a
+/// separate query, so a filtered view's headline always agrees with the rows
+/// underneath it.
 fn summarise(
     machines: &[MachineView],
     cohorts: &[Cohort],
     flags: &[Flag],
-    history: &[RunRow],
     th: &Thresholds,
 ) -> Summary {
     let scores = sorted_of(machines.iter().filter_map(|m| m.score));
@@ -960,12 +967,9 @@ fn summarise(
         .map(|f| f.machine_key.as_str())
         .collect();
 
-    let mut taken: Vec<&str> = history.iter().map(|r| r.taken_at.as_str()).collect();
-    taken.sort_unstable();
-
     Summary {
         machines: machines.len(),
-        runs: history.len(),
+        runs: machines.iter().map(|m| m.runs).sum(),
         grades,
         median_score: (!scores.is_empty()).then(|| median(&scores)),
         p10_score: (!scores.is_empty()).then(|| quantile(&scores, 0.10)),
@@ -1002,10 +1006,228 @@ fn summarise(
             .iter()
             .filter(|m| m.cohort_delta_pct.is_none())
             .count(),
-        newest_run: taken.last().map(|s| (*s).to_string()),
-        oldest_run: taken.first().map(|s| (*s).to_string()),
+        newest_run: machines
+            .iter()
+            .map(|m| m.taken_at.as_str())
+            .max()
+            .map(str::to_string),
+        oldest_run: machines
+            .iter()
+            .map(|m| m.first_seen.as_str())
+            .min()
+            .map(str::to_string),
         configurations,
     }
+}
+
+/// What the viewer has narrowed the fleet to.
+///
+/// Applied as a projection over an already-computed snapshot rather than as a
+/// `WHERE` clause, and that is the important part: **cohort statistics never
+/// narrow with the filter.** A peer group's job is to be the largest set of
+/// identically-configured machines available, so if filtering to one site
+/// recomputed the medians, the same machine's shortfall would change depending
+/// on what the viewer happened to be looking at — and a number that moves when
+/// you look at it sideways is a number nobody trusts. The filter selects which
+/// machines are *shown*; each cohort reports how many of its members are in
+/// view beside statistics drawn from all of them.
+#[derive(Debug, Clone, Default)]
+pub struct Filter {
+    /// Tag key to value. Every entry must match.
+    pub tags: BTreeMap<String, String>,
+    /// Only machines measured within this many days.
+    pub max_age_days: Option<f64>,
+    pub cohort: Option<String>,
+    /// Case-insensitive substring of hostname, key, serial, asset tag or CPU.
+    pub search: Option<String>,
+    /// Only machines carrying a flag with this code.
+    pub flag: Option<String>,
+}
+
+impl Filter {
+    fn matches(&self, m: &MachineView, flagged: &HashSet<&str>) -> bool {
+        if let Some(days) = self.max_age_days
+            && m.age_days.is_none_or(|a| a > days)
+        {
+            return false;
+        }
+        if let Some(c) = &self.cohort
+            && &m.cohort != c
+        {
+            return false;
+        }
+        if self.flag.is_some() && !flagged.contains(m.key.as_str()) {
+            return false;
+        }
+        for (k, v) in &self.tags {
+            if m.tags.get(k).map(String::as_str) != Some(v.as_str()) {
+                return false;
+            }
+        }
+        if let Some(q) = &self.search {
+            let q = q.to_lowercase();
+            let hit = [
+                Some(m.key.as_str()),
+                m.hostname.as_deref(),
+                m.serial.as_deref(),
+                m.asset_tag.as_deref(),
+                Some(m.cpu_model.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|f| f.to_lowercase().contains(&q));
+            if !hit {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Snapshot {
+    /// Narrow a snapshot to the machines a viewer asked for, recomputing the
+    /// summary so the headline always agrees with the rows beneath it.
+    pub fn filtered(&self, f: &Filter, th: &Thresholds) -> Snapshot {
+        let flagged: HashSet<&str> = match &f.flag {
+            Some(code) => self
+                .flags
+                .iter()
+                .filter(|fl| fl.code == code)
+                .map(|fl| fl.machine_key.as_str())
+                .collect(),
+            None => HashSet::new(),
+        };
+        let machines: Vec<MachineView> = self
+            .machines
+            .iter()
+            .filter(|m| f.matches(m, &flagged))
+            .cloned()
+            .collect();
+        let keys: HashSet<&str> = machines.iter().map(|m| m.key.as_str()).collect();
+        let flags: Vec<Flag> = self
+            .flags
+            .iter()
+            .filter(|fl| keys.contains(fl.machine_key.as_str()))
+            .cloned()
+            .collect();
+
+        let mut in_view: HashMap<&str, usize> = HashMap::new();
+        for m in &machines {
+            *in_view.entry(m.cohort.as_str()).or_default() += 1;
+        }
+        let cohorts: Vec<Cohort> = self
+            .cohorts
+            .iter()
+            .map(|c| Cohort {
+                in_view: in_view.get(c.id.as_str()).copied().unwrap_or(0),
+                ..c.clone()
+            })
+            .collect();
+
+        Snapshot {
+            generated_at: self.generated_at.clone(),
+            thresholds: self.thresholds.clone(),
+            summary: summarise(&machines, &cohorts, &flags, th),
+            machines,
+            cohorts,
+            flags,
+        }
+    }
+}
+
+/// One earlier run of a machine, for the history chart.
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryPoint {
+    pub run_id: i64,
+    pub taken_at: String,
+    pub score: Option<f64>,
+    pub grade: String,
+    pub tool_version: String,
+    pub comparability: Comparability,
+    pub thermal_limited: Option<bool>,
+    pub on_ac: Option<bool>,
+    pub partial: bool,
+    pub source_path: String,
+}
+
+/// A single measurement, for the drilldown table.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubtestRow {
+    pub component: String,
+    pub id: String,
+    pub value: f64,
+    pub unit: String,
+    pub score: Option<f64>,
+    pub ratio: Option<f64>,
+    pub cv: Option<f64>,
+    pub confidence: String,
+    /// `median` or `peak`. Comparing one against the other is meaningless, so
+    /// the drilldown says which each figure is.
+    pub representative: Option<String>,
+    pub scored: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Detail {
+    pub history: Vec<HistoryPoint>,
+    pub subtests: Vec<SubtestRow>,
+}
+
+/// The per-machine detail the drilldown needs, which the fleet snapshot
+/// deliberately doesn't carry: every run of one machine, and every subtest of
+/// its latest run. Held back from the snapshot because an estate of ten
+/// thousand machines would otherwise ship a hundred megabytes of measurements
+/// to draw one summary.
+pub fn detail(conn: &Connection, machine_key: &str, latest_run: i64) -> Result<Detail> {
+    let mut stmt = conn.prepare(
+        "SELECT id, taken_at, overall_score, overall_grade, tool_version, preset, profile,
+                baseline, build_isa, thermal_limited, on_ac, partial, source_path
+           FROM run WHERE machine_key = ?1 ORDER BY taken_at, id",
+    )?;
+    let history = stmt
+        .query_map([machine_key], |r| {
+            Ok(HistoryPoint {
+                run_id: r.get(0)?,
+                taken_at: r.get(1)?,
+                score: r.get(2)?,
+                grade: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                tool_version: r.get(4)?,
+                comparability: Comparability {
+                    preset: r.get(5)?,
+                    profile: r.get(6)?,
+                    baseline: r.get(7)?,
+                    build_isa: r.get(8)?,
+                },
+                thermal_limited: r.get(9)?,
+                on_ac: r.get(10)?,
+                partial: r.get(11)?,
+                source_path: r.get(12)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut stmt = conn.prepare(
+        "SELECT component, id, value, unit, score, ratio, cv, confidence, representative, scored
+           FROM subtest WHERE run_id = ?1 ORDER BY component, id",
+    )?;
+    let subtests = stmt
+        .query_map([latest_run], |r| {
+            Ok(SubtestRow {
+                component: r.get(0)?,
+                id: r.get(1)?,
+                value: r.get(2)?,
+                unit: r.get(3)?,
+                score: r.get(4)?,
+                ratio: r.get(5)?,
+                cv: r.get(6)?,
+                confidence: r.get(7)?,
+                representative: r.get(8)?,
+                scored: r.get(9)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(Detail { history, subtests })
 }
 
 #[cfg(test)]
@@ -1470,5 +1692,169 @@ mod tests {
     fn a_nan_score_cannot_leave_the_sort_order_undefined() {
         let v = sorted_of([3.0, f64::NAN, 1.0, 2.0]);
         assert_eq!(v, vec![1.0, 2.0, 3.0]);
+    }
+
+    fn tagged(site: &str) -> impl FnOnce(&mut Value) + use<'_> {
+        move |d: &mut Value| {
+            d["tags"] = json!({ "site": site });
+        }
+    }
+
+    /// The rule the whole filter design turns on. A machine's shortfall must
+    /// not depend on what the viewer happened to be looking at, so narrowing
+    /// the view narrows the rows and leaves the peer group alone.
+    #[test]
+    fn filtering_narrows_what_is_shown_without_moving_a_cohort_median() {
+        let mut e = Estate::new();
+        for i in 0..5 {
+            e.add_with(
+                &format!("GLA-{i}"),
+                1000.0,
+                "2026-09-01T10:00:00Z",
+                tagged("glasgow"),
+            );
+        }
+        // Three slower machines at the other site, enough to drag a median.
+        for i in 0..3 {
+            e.add_with(
+                &format!("EDI-{i}"),
+                700.0,
+                "2026-09-01T10:00:00Z",
+                tagged("edinburgh"),
+            );
+        }
+
+        let all = e.snap();
+        assert_eq!(all.cohorts.len(), 1, "identical hardware and configuration");
+        let fleet_median = all.cohorts[0].median;
+
+        let mut tags = BTreeMap::new();
+        tags.insert("site".to_string(), "glasgow".to_string());
+        let view = all.filtered(
+            &Filter {
+                tags,
+                ..Default::default()
+            },
+            &Thresholds::default(),
+        );
+
+        assert_eq!(view.summary.machines, 5);
+        assert_eq!(
+            view.cohorts[0].median, fleet_median,
+            "the peer group did not shrink"
+        );
+        assert_eq!(view.cohorts[0].members, 8, "still eight machines like this");
+        assert_eq!(view.cohorts[0].in_view, 5, "five of them are on screen");
+
+        let before = all
+            .machines
+            .iter()
+            .find(|m| m.hostname.as_deref() == Some("GLA-0"))
+            .and_then(|m| m.cohort_delta_pct);
+        let after = machine(&view, "GLA-0").cohort_delta_pct;
+        assert_eq!(before, after, "the same machine, the same shortfall");
+    }
+
+    #[test]
+    fn a_filter_hides_the_findings_of_the_machines_it_hides() {
+        let mut e = Estate::new();
+        e.add_with("PC-OK", 1000.0, "2026-09-01T10:00:00Z", tagged("glasgow"));
+        e.add_with("PC-HOT", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["tags"] = json!({ "site": "edinburgh" });
+            d["telemetry"] = json!({"source": "test", "sample_count": 9, "thermal_limited": true});
+        });
+
+        let all = e.snap();
+        assert_eq!(flags_for(&all, "thermal_limited").len(), 1);
+
+        let mut tags = BTreeMap::new();
+        tags.insert("site".to_string(), "glasgow".to_string());
+        let view = all.filtered(
+            &Filter {
+                tags,
+                ..Default::default()
+            },
+            &Thresholds::default(),
+        );
+        assert_eq!(view.summary.machines, 1);
+        assert!(
+            flags_for(&view, "thermal_limited").is_empty(),
+            "a finding about a machine that isn't shown must not be counted"
+        );
+        assert_eq!(view.summary.thermally_limited, 0);
+    }
+
+    #[test]
+    fn a_filter_can_select_by_age_by_text_and_by_finding() {
+        let mut e = Estate::new();
+        e.add("FRESH-1", 1000.0, "2026-09-08T10:00:00Z");
+        e.add("OLD-1", 1000.0, "2026-01-01T10:00:00Z");
+        let all = e.snap();
+        let th = Thresholds::default();
+
+        let recent = all.filtered(
+            &Filter {
+                max_age_days: Some(30.0),
+                ..Default::default()
+            },
+            &th,
+        );
+        assert_eq!(recent.summary.machines, 1);
+        assert_eq!(recent.machines[0].hostname.as_deref(), Some("FRESH-1"));
+
+        let searched = all.filtered(
+            &Filter {
+                search: Some("old".into()),
+                ..Default::default()
+            },
+            &th,
+        );
+        assert_eq!(searched.summary.machines, 1, "search is case-insensitive");
+        assert_eq!(searched.machines[0].hostname.as_deref(), Some("OLD-1"));
+
+        let stale = all.filtered(
+            &Filter {
+                flag: Some("stale".into()),
+                ..Default::default()
+            },
+            &th,
+        );
+        assert_eq!(stale.summary.machines, 1);
+        assert_eq!(stale.machines[0].hostname.as_deref(), Some("OLD-1"));
+    }
+
+    /// The drilldown's own query: every run of one machine, and the subtests of
+    /// its latest run only.
+    #[test]
+    fn the_drilldown_returns_the_whole_series_and_one_runs_measurements() {
+        let mut e = Estate::new();
+        e.add("PC-1", 1000.0, "2026-07-01T10:00:00Z");
+        e.add("PC-1", 1010.0, "2026-08-01T10:00:00Z");
+        e.add("PC-2", 900.0, "2026-08-01T10:00:00Z");
+
+        let s = e.snap();
+        let m = machine(&s, "PC-1");
+        let d = detail(e.idx.conn(), &m.key, m.run_id).unwrap();
+
+        assert_eq!(
+            d.history.len(),
+            2,
+            "both runs of this machine, and only this machine"
+        );
+        assert_eq!(
+            d.history[0].taken_at, "2026-07-01T10:00:00Z",
+            "oldest first"
+        );
+        assert!(!d.subtests.is_empty());
+        assert!(
+            d.subtests
+                .iter()
+                .any(|t| t.representative.as_deref() == Some("peak")),
+            "the drilldown has to say which figures are peaks"
+        );
+        assert!(
+            d.subtests.iter().any(|t| !t.scored),
+            "ungraded subtests are measurements too"
+        );
     }
 }
