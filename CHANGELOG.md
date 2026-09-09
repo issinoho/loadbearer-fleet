@@ -5,7 +5,7 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
-## 0.1.0 - unreleased
+## 0.1.0 - Thu, 10 Sep 2026
 
 First release. A fleet dashboard over a folder of collected
 [loadbearer](https://github.com/issinoho/loadbearer) results.
