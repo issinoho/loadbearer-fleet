@@ -42,6 +42,44 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  # `rust-version` in Cargo.toml is a promise, and a promise nothing checks is
+  # one that quietly stops being true — usually not because of anything in this
+  # crate but because a dependency raised its own floor, which a `cargo update`
+  # does silently.
+  #
+  # `check` rather than `clippy`, because clippy's lint set moves between
+  # releases: a new lint would fail this job for a reason that has nothing to do
+  # with the minimum version compiling. `--locked` because the committed
+  # lockfile is what actually gets built.
+  msrv:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Both platforms, because each build compiles a different crate set and a
+      # different set of source: `windows-service` and its own dependencies
+      # exist only on Windows, and the service integration behind
+      # `cfg(windows)` is swapped for the fallbacks behind `cfg(not(windows))`.
+      # Neither platform's floor implies the other's.
+      #
+      # (TLS is not one of the differences — this tree is rustls on both, with
+      # no openssl-sys and no schannel.)
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Keep in step with `rust-version` in Cargo.toml.
+          toolchain: '1.88'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Check against the declared minimum
+        run: cargo check --all-targets --locked
+
   # The charts are hand-rolled SVG with no framework to catch a mistake, so
   # they get rendered against a minimal DOM and the geometry asserted: no NaN
   # reaching an attribute (which drops a mark silently rather than erroring),

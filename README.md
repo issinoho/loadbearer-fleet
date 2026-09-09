@@ -191,6 +191,13 @@ matter for more than the tests: the Windows service integration is behind
 `cfg(windows)` and the fallbacks that replace it are behind
 `cfg(not(windows))`, so either build only ever compiles one of the two.
 
+CI also checks the declared MSRV (`rust-version = "1.88"`) on both platforms
+with `cargo check --all-targets --locked`. That promise is one nothing else
+would notice breaking, and it usually breaks because a dependency raised its
+own floor during a routine `cargo update` rather than because of anything in
+this crate. Dependabot groups its weekly bumps into one PR, so when one goes
+red, read which matrix leg failed before assuming the whole group is bad.
+
 ## Sign-in
 
 ```

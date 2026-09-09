@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # GitHub Actions pinned in .github/workflows/*.yml (actions/checkout,
+  # Swatinem/rust-cache, actions/setup-node, dtolnay/rust-toolchain). These are
+  # major-version pinned, so this is where routine update PRs come from.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+
+  # Rust crates from Cargo.toml / Cargo.lock. Cargo.lock is committed (this is
+  # a binary crate), so Dependabot bumps the locked versions.
+  #
+  # Grouped into one PR, as in loadbearer. The thing to know when one goes red:
+  # CI runs on both Linux and Windows, and a bump that breaks only one of them
+  # is normal — `libloading` 0.9 did exactly that in loadbearer, compiling
+  # cleanly on Windows and failing everywhere else. Read which matrix leg
+  # failed before assuming the whole group is bad, and split the PR rather than
+  # holding all of it back.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
