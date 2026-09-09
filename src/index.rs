@@ -183,6 +183,13 @@ impl Index {
     pub fn ingest_file(&mut self, path: &Path) -> Result<bool> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        self.ingest_text(&text, path)
+    }
+
+    /// Ingest a document already in memory, recording `source` as where it came
+    /// from. Splitting this out from `ingest_file` keeps the identity of a run
+    /// tied to its *content* rather than to having been read off a disk.
+    pub fn ingest_text(&mut self, text: &str, source: &Path) -> Result<bool> {
         // sha2 0.11 returns a hybrid-array `Array`, which has no `LowerHex`.
         let hash: String = Sha256::digest(text.as_bytes())
             .iter()
@@ -202,8 +209,8 @@ impl Index {
         }
 
         let doc =
-            ResultFile::from_json(&text).with_context(|| format!("parsing {}", path.display()))?;
-        self.insert(&doc, path, &hash)?;
+            ResultFile::from_json(text).with_context(|| format!("parsing {}", source.display()))?;
+        self.insert(&doc, source, &hash)?;
         Ok(true)
     }
 
@@ -347,7 +354,6 @@ impl Index {
 
     /// Raw handle for callers that need to run their own query. The analytics
     /// layer reads through this rather than growing a method per view.
-    #[allow(dead_code)]
     pub fn conn(&self) -> &Connection {
         &self.conn
     }

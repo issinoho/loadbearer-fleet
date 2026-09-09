@@ -5,8 +5,9 @@ results: point it at the folder your deployment tool drops `.json` result files
 into, and it indexes them and reports across the estate — executive summary,
 grouping, drilldown, and the outliers and red flags worth acting on.
 
-**Status: early.** The index and schema reader work; the analytics, web UI and
-authentication are not built yet. See [Roadmap](#roadmap).
+**Status: early.** Ingest, cohort analytics and the red-flag engine work from
+the command line; the web UI and authentication are not built yet. See
+[Roadmap](#roadmap).
 
 ## How it fits together
 
@@ -41,6 +42,9 @@ surfaced.
 ```
 loadbearer-fleet scan \\fileserver\loadbearer      # index a folder (or re-index it)
 loadbearer-fleet status                            # what's in the index
+loadbearer-fleet report                            # summary, cohorts and red flags
+loadbearer-fleet report --all                      # include informational flags
+loadbearer-fleet report --json                     # the whole snapshot, as the UI will see it
 ```
 
 Rescanning is cheap and idempotent: every run is keyed by the SHA-256 of the
@@ -69,13 +73,59 @@ resets when they're reimaged" is something an estate owner should know.
 
 - [x] Schema reader, tolerant of older files and forward-compatible with new fields
 - [x] Folder scan into a SQLite index, idempotent by content, full history retained
-- [ ] Cohort analytics — compare a machine against its own peer group rather than
-      the reference baseline, which sidesteps that baseline's ±10–20% uncertainty
-- [ ] Red flags: failing grades, thermal limits, partial runs, battery wear,
-      stale results, capped working sets
+- [x] Cohort analytics — compare a machine against its own peer group, and against
+      its own history, rather than against the reference baseline
+- [x] Red flags: low grades, cohort outliers, regressions, weak components, thermal
+      limits, forced runs, partial runs, RAM-backed disk targets, battery wear,
+      stale results, weak identity
 - [ ] Web UI: executive summary, cohort explorer, machine drilldown with history
 - [ ] Entra ID / OIDC SSO, roles from group claims, tag-scoped authorization
 - [ ] Service packaging, config file, metrics
+
+## Analysis
+
+### Peers first, then history, then the baseline
+
+The reference baseline answers "is this machine any good". It is the wrong tool
+for "is this machine broken": loadbearer's own baseline header puts ±10–20%
+uncertainty on the anchors, and some of them rest on three machines. A 15%
+shortfall against the baseline could be the baseline.
+
+So the primary comparison is **a machine against its peers**, and the secondary
+one is **a machine against its own history** — which is stronger still, because
+the hardware is held constant. A machine 15% down on forty identical machines in
+the same estate, or 15% down on its own last four runs, is the machine.
+
+A cohort is not "machines with the same CPU" but machines with the same CPU
+*measured the same way*: `build_isa`, `duration_preset`, `profile` and `baseline`
+each change the number without anything changing about the machine, so each is
+part of the cohort key. Installed RAM deliberately is not — two machines with the
+same CPU and different DIMM configurations really do differ, and surfacing the
+single-channel one is the point rather than something to excuse.
+
+Cohorts use **median and median absolute deviation**, not mean and standard
+deviation, because the statistic has to survive the thing it is looking for. Six
+machines at 1000 and two at 720 have a mean of 930 and a standard deviation of
+118, which puts the two bad ones 1.8 sigma out — invisible to a 3.5-sigma rule,
+because each one's damage is partly absorbed into the spread the other is
+measured against. The median stays at 1000 and names both. On a fleet of clones
+MAD collapses towards zero, so the dispersion is floored at a fraction of the
+median; that floor is usually what binds, and it puts the effective trigger at
+around a 15% shortfall.
+
+### Three queues, not one wall of red
+
+Findings are separated by what you would do about them, because mixing them
+means an estate owner reads a thermal caveat as a failing asset:
+
+| Queue | Means | Examples |
+| --- | --- | --- |
+| **machine** | a hardware decision — repair, replace, reassign | low grade, cohort outlier, regression, one weak component, worn battery |
+| **measurement** | the number can't be trusted until collection is fixed | thermally limited, run on battery, partial run, RAM-backed disk target, unstable CPU timings |
+| **coverage** | about the data we hold, not about the machine | stale result, attributed by hostname only, no peer group |
+
+Every threshold lives in one struct with its reasoning attached, so tuning the
+engine is a config change rather than a code read.
 
 ## Licence
 
