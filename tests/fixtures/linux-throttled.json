@@ -1,0 +1,1354 @@
+{
+  "schema": "loadbearer.result/1",
+  "tool_version": "1.5.0",
+  "timestamp": "2026-09-09T16:59:48.365852386Z",
+  "machine": {
+    "hostname": "FLEET-LNX-01",
+    "identity": {
+      "machine_id": "00000000000000000c42b85c237d46c8"
+    },
+    "os": "Linux (Ubuntu 26.04)",
+    "kernel": "7.0.0-30-generic",
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Core(TM) i7-10510U CPU @ 1.80GHz",
+    "cpu_vendor": "GenuineIntel",
+    "cpu_physical_cores": 4,
+    "cpu_logical_cores": 8,
+    "cpu_mhz_spot": 3400,
+    "ram_bytes": 15904301056,
+    "swap_bytes": 2147479552,
+    "disks": [
+      {
+        "name": "/dev/nvme0n1p2",
+        "mount_point": "/",
+        "file_system": "ext4",
+        "kind": "SSD",
+        "total_bytes": 502392610816,
+        "available_bytes": 268934238208,
+        "removable": false
+      },
+      {
+        "name": "/dev/nvme0n1p2",
+        "mount_point": "/var/snap/firefox/common/host-hunspell",
+        "file_system": "ext4",
+        "kind": "SSD",
+        "total_bytes": 502392610816,
+        "available_bytes": 268934238208,
+        "removable": false
+      },
+      {
+        "name": "/dev/nvme0n1p1",
+        "mount_point": "/boot/efi",
+        "file_system": "vfat",
+        "kind": "SSD",
+        "total_bytes": 535805952,
+        "available_bytes": 505778176,
+        "removable": false
+      }
+    ],
+    "battery": {
+      "vendor": "LGC-LGC6.73",
+      "model": "DELL H754V",
+      "technology": "lithium-ion",
+      "charge_pct": 100.0,
+      "state": "full",
+      "health_pct": 70.06723800952486,
+      "energy_full_wh": 36.43440246582031,
+      "energy_full_design_wh": 51.99919891357422,
+      "voltage_v": 8.519000053405762,
+      "temperature_c": 25.0
+    }
+  },
+  "config": {
+    "profile": "general",
+    "duration_preset": "thorough",
+    "curve_k": 0.5,
+    "seed": 6840143426475589633,
+    "threads": 8,
+    "baseline": "reference-v1",
+    "build_isa": "sse2"
+  },
+  "raw": [
+    {
+      "id": "cpu",
+      "label": "CPU",
+      "subtests": [
+        {
+          "id": "int_single",
+          "label": "Integer, single-core",
+          "unit": "Mops/s",
+          "direction": "higher_is_better",
+          "value": 11413.54309248773,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              11546.2326615623,
+              11513.854717406633,
+              11482.615524992727,
+              11520.938405024914,
+              11347.428481757806,
+              11359.738285529313,
+              11413.54309248773,
+              11306.803648164041,
+              11244.060804572919
+            ],
+            "median": 11413.54309248773,
+            "mean": 11415.023957944264,
+            "min": 11244.060804572919,
+            "max": 11546.2326615623,
+            "stddev": 106.85130740592876,
+            "cv": 0.009360585470481278
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "int_multi",
+          "label": "Integer, all cores",
+          "unit": "Mops/s",
+          "direction": "higher_is_better",
+          "value": 45813.52864124329,
+          "representative": "peak",
+          "stats": {
+            "runs": [
+              45612.199801950555,
+              45813.52864124329,
+              45719.18082212338,
+              45310.37093695576,
+              44857.719147161275,
+              44351.903608162815,
+              43775.95782587599,
+              43423.25356776844,
+              41346.51271327091
+            ],
+            "median": 44857.719147161275,
+            "mean": 44467.8474516125,
+            "min": 41346.51271327091,
+            "max": 45813.52864124329,
+            "stddev": 1452.3318444973072,
+            "cv": 0.03266026865990435
+          },
+          "confidence": "low",
+          "scored": true
+        },
+        {
+          "id": "float_single",
+          "label": "Float, single-core",
+          "unit": "MFLOP/s",
+          "direction": "higher_is_better",
+          "value": 8598.346294761175,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              8600.21239824695,
+              8598.346294761175,
+              8530.726703660712,
+              8591.717970585927,
+              8634.005926578053,
+              8622.697832270796,
+              8594.028107982818,
+              8642.403470142017,
+              8484.976334507028
+            ],
+            "median": 8598.346294761175,
+            "mean": 8588.790559859497,
+            "min": 8484.976334507028,
+            "max": 8642.403470142017,
+            "stddev": 50.590332014379364,
+            "cv": 0.0058902742664162675
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "float_multi",
+          "label": "Float, all cores",
+          "unit": "MFLOP/s",
+          "direction": "higher_is_better",
+          "value": 62279.24024889665,
+          "representative": "peak",
+          "stats": {
+            "runs": [
+              61734.95054106703,
+              62255.17418694123,
+              61984.288229414575,
+              61775.84659984947,
+              62279.24024889665,
+              61644.79469680753,
+              60998.29965477256,
+              61156.7405370819,
+              61438.37746858959
+            ],
+            "median": 61734.95054106703,
+            "mean": 61696.41246260228,
+            "min": 60998.29965477256,
+            "max": 62279.24024889665,
+            "stddev": 445.8733070285056,
+            "cv": 0.007226891957433909
+          },
+          "confidence": "medium",
+          "scored": true
+        },
+        {
+          "id": "hash",
+          "label": "BLAKE3 hash",
+          "unit": "MiB/s",
+          "direction": "higher_is_better",
+          "value": 4251.486916387308,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              4209.070656457852,
+              4237.076461985184,
+              4240.932053515142,
+              4253.317618742504,
+              4257.269738237984,
+              4220.792390952785,
+              4251.486916387308,
+              4303.286044681185,
+              4318.551182849969
+            ],
+            "median": 4251.486916387308,
+            "mean": 4254.642562645546,
+            "min": 4209.070656457852,
+            "max": 4318.551182849969,
+            "stddev": 35.68664740218979,
+            "cv": 0.008387695764506186
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "compress",
+          "label": "DEFLATE compress",
+          "unit": "MiB/s",
+          "direction": "higher_is_better",
+          "value": 69.29082595227523,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              69.75357621074866,
+              69.62244049661993,
+              69.23295044764608,
+              69.27266179613468,
+              66.54881953254917,
+              69.29082595227523,
+              68.63155549494537,
+              69.60080500251104,
+              69.34415940336486
+            ],
+            "median": 69.29082595227523,
+            "mean": 69.03308825964389,
+            "min": 66.54881953254917,
+            "max": 69.75357621074866,
+            "stddev": 0.986286929906382,
+            "cv": 0.01428716221121106
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "aes_gcm",
+          "label": "AES-256-GCM encrypt",
+          "unit": "MiB/s",
+          "direction": "higher_is_better",
+          "value": 2101.7242958768634,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              2098.5827023727447,
+              2089.6795259546248,
+              2107.0720675591215,
+              2107.723939650567,
+              2084.813862561733,
+              2106.1220969108517,
+              2105.8400909268553,
+              2101.7242958768634,
+              2067.8603684179093
+            ],
+            "median": 2101.7242958768634,
+            "mean": 2096.602105581252,
+            "min": 2067.8603684179093,
+            "max": 2107.723939650567,
+            "stddev": 13.47413141662793,
+            "cv": 0.006426651666884798
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "sha256",
+          "label": "SHA-256 hash",
+          "unit": "MiB/s",
+          "direction": "higher_is_better",
+          "value": 254.32424734527268,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              254.32424734527268,
+              254.13617032622756,
+              254.763691640114,
+              253.91766550417586,
+              251.04013440564194,
+              254.3871152088518,
+              254.243417436827,
+              254.35264333960765,
+              254.898301355454
+            ],
+            "median": 254.32424734527268,
+            "mean": 254.0070429513525,
+            "min": 251.04013440564194,
+            "max": 254.898301355454,
+            "stddev": 1.1518709444253457,
+            "cv": 0.004534799236436732
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "int_scale_2",
+          "label": "Integer, 2 threads",
+          "unit": "Mops/s",
+          "direction": "higher_is_better",
+          "value": 22149.96641704667,
+          "representative": "peak",
+          "stats": {
+            "runs": [
+              21864.043623946214,
+              22131.443175143315,
+              21576.608356978435,
+              22053.13772454606,
+              22149.96641704667,
+              22113.617571084975,
+              21953.02821596653,
+              22059.294941247543,
+              22019.98471500248
+            ],
+            "median": 22053.13772454606,
+            "mean": 21991.23608232914,
+            "min": 21576.608356978435,
+            "max": 22149.96641704667,
+            "stddev": 179.81754483469663,
+            "cv": 0.00817678206725212
+          },
+          "confidence": "medium",
+          "scored": false
+        },
+        {
+          "id": "int_scale_4",
+          "label": "Integer, 4 threads",
+          "unit": "Mops/s",
+          "direction": "higher_is_better",
+          "value": 42017.44906840957,
+          "representative": "peak",
+          "stats": {
+            "runs": [
+              42017.44906840957,
+              38970.95733455455,
+              41302.04461808557,
+              41048.98217429491,
+              40864.27279077261,
+              40187.062208921416,
+              40115.64576211132,
+              40086.264673542915,
+              39794.402485429666
+            ],
+            "median": 40187.062208921416,
+            "mean": 40487.45345734695,
+            "min": 38970.95733455455,
+            "max": 42017.44906840957,
+            "stddev": 910.4436476082747,
+            "cv": 0.02248705635604907
+          },
+          "confidence": "medium",
+          "scored": false
+        }
+      ]
+    },
+    {
+      "id": "memory",
+      "label": "Memory",
+      "subtests": [
+        {
+          "id": "bw_read",
+          "label": "Sequential read",
+          "unit": "GiB/s",
+          "direction": "higher_is_better",
+          "value": 14.654562750102638,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              14.651924915683301,
+              14.646324981517054,
+              14.690310796324258,
+              14.651483851636977,
+              14.607115172011888,
+              14.662052714171553,
+              14.675203092728218,
+              14.654562750102638,
+              14.665772624654894
+            ],
+            "median": 14.654562750102638,
+            "mean": 14.656083433203422,
+            "min": 14.607115172011888,
+            "max": 14.690310796324258,
+            "stddev": 0.022914150627645756,
+            "cv": 0.0015634566173206715
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "bw_write",
+          "label": "Sequential write",
+          "unit": "GiB/s",
+          "direction": "higher_is_better",
+          "value": 11.293382135731143,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              11.377629089055041,
+              11.373415492148563,
+              11.31248677320756,
+              11.291418166381039,
+              11.224470619995031,
+              11.362054957413193,
+              11.293382135731143,
+              11.181266337055124,
+              11.263750291910856
+            ],
+            "median": 11.293382135731143,
+            "mean": 11.297763762544172,
+            "min": 11.181266337055124,
+            "max": 11.377629089055041,
+            "stddev": 0.06764955253965735,
+            "cv": 0.005987871047891621
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "bw_copy",
+          "label": "Copy (memcpy)",
+          "unit": "GiB/s",
+          "direction": "higher_is_better",
+          "value": 11.114759069476843,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              11.056541579053683,
+              11.138071023136378,
+              11.270389223853146,
+              11.142290429486547,
+              11.052980301844682,
+              11.143486968433033,
+              11.114759069476843,
+              11.068008992627094,
+              11.074539904086732
+            ],
+            "median": 11.114759069476843,
+            "mean": 11.117896387999796,
+            "min": 11.052980301844682,
+            "max": 11.270389223853146,
+            "stddev": 0.06825313038687385,
+            "cv": 0.00613903278146606
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "bw_read_mt",
+          "label": "Sequential read, all cores",
+          "unit": "GiB/s",
+          "direction": "higher_is_better",
+          "value": 20.98567039251708,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              21.02159813285782,
+              20.7963840724082,
+              21.30643687136713,
+              20.951955495684523,
+              20.825623299550244,
+              20.98567039251708,
+              21.13837183770023,
+              21.061526121752994,
+              20.940346761390472
+            ],
+            "median": 20.98567039251708,
+            "mean": 21.003101442803185,
+            "min": 20.7963840724082,
+            "max": 21.30643687136713,
+            "stddev": 0.1561867850629984,
+            "cv": 0.007436367694949003
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "latency",
+          "label": "Random access latency",
+          "unit": "ns",
+          "direction": "lower_is_better",
+          "value": 149.56751126036355,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              149.5662997249681,
+              149.6300084731158,
+              149.55181550940688,
+              149.82808627286897,
+              149.56751126036355,
+              149.5949215760523,
+              149.7602751662472,
+              149.41526478305337,
+              149.02647227325315
+            ],
+            "median": 149.56751126036355,
+            "mean": 149.54896167103658,
+            "min": 149.02647227325315,
+            "max": 149.82808627286897,
+            "stddev": 0.2298824977099175,
+            "cv": 0.0015371721417604418
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "lat_l1",
+          "label": "Latency, ~L1 (16 KiB)",
+          "unit": "ns",
+          "direction": "lower_is_better",
+          "value": 1.1538126305307834,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              1.1629571119929112,
+              1.1555013665342602,
+              1.1517786408617678,
+              1.1528014006978897,
+              1.156265796064939,
+              1.2007754118546197,
+              1.1538126305307834,
+              1.153472379982897,
+              1.1523172528557304
+            ],
+            "median": 1.1538126305307834,
+            "mean": 1.1599646657084222,
+            "min": 1.1517786408617678,
+            "max": 1.2007754118546197,
+            "stddev": 0.015671941545489513,
+            "cv": 0.013510705979925888
+          },
+          "confidence": "high",
+          "scored": false
+        },
+        {
+          "id": "lat_l2",
+          "label": "Latency, ~L2 (256 KiB)",
+          "unit": "ns",
+          "direction": "lower_is_better",
+          "value": 4.014939672368174,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              4.004511318300643,
+              4.00834628572335,
+              4.023907982403204,
+              4.0128803668241915,
+              4.014939672368174,
+              4.03756240602812,
+              4.017011432527614,
+              4.013332445954624,
+              4.068378051150281
+            ],
+            "median": 4.014939672368174,
+            "mean": 4.022318884586689,
+            "min": 4.004511318300643,
+            "max": 4.068378051150281,
+            "stddev": 0.019752036146725476,
+            "cv": 0.004910609206647992
+          },
+          "confidence": "high",
+          "scored": false
+        },
+        {
+          "id": "lat_l3",
+          "label": "Latency, ~L3 (6 MiB)",
+          "unit": "ns",
+          "direction": "lower_is_better",
+          "value": 17.516595537219604,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              17.289736209178194,
+              17.56608677569116,
+              17.405092809173322,
+              17.516595537219604,
+              17.604228225998455,
+              17.857970393794496,
+              17.182110017824993,
+              17.129286413787735,
+              17.550848258212376
+            ],
+            "median": 17.516595537219604,
+            "mean": 17.45577273787559,
+            "min": 17.129286413787735,
+            "max": 17.857970393794496,
+            "stddev": 0.22921908979293912,
+            "cv": 0.013131420375081923
+          },
+          "confidence": "high",
+          "scored": false
+        },
+        {
+          "id": "lat_loaded",
+          "label": "Latency under bandwidth load",
+          "unit": "ns",
+          "direction": "lower_is_better",
+          "value": 258.725079552602,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              255.50788894291534,
+              258.725079552602,
+              257.1223228422489,
+              272.5498586592405,
+              260.6136457245177,
+              264.4072399497204,
+              261.67513061523437,
+              257.24077426181753,
+              256.82145393446484
+            ],
+            "median": 258.725079552602,
+            "mean": 260.51815494252907,
+            "min": 255.50788894291534,
+            "max": 272.5498586592405,
+            "stddev": 5.309083849639572,
+            "cv": 0.020378940004433736
+          },
+          "confidence": "high",
+          "scored": false
+        }
+      ]
+    },
+    {
+      "id": "disk",
+      "label": "Disk",
+      "subtests": [
+        {
+          "id": "seq_write",
+          "label": "Sequential write",
+          "unit": "MiB/s",
+          "direction": "higher_is_better",
+          "value": 1027.6728797495853,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              977.6393007294557,
+              710.8736953408917,
+              1040.4904517165892,
+              1027.6728797495853,
+              832.6194292539034,
+              947.6067010339156,
+              1952.3548820788758,
+              1981.8885655361137,
+              2018.384220081367
+            ],
+            "median": 1027.6728797495853,
+            "mean": 1276.6144583911887,
+            "min": 710.8736953408917,
+            "max": 2018.384220081367,
+            "stddev": 540.464148678326,
+            "cv": 0.42335737710461785
+          },
+          "confidence": "low",
+          "scored": true
+        },
+        {
+          "id": "seq_read",
+          "label": "Sequential read",
+          "unit": "MiB/s",
+          "direction": "higher_is_better",
+          "value": 2111.7629266966123,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              2110.6439852439357,
+              2107.604290720503,
+              2112.926449776204,
+              2105.350886619593,
+              2113.2364949898083,
+              2113.361749993055,
+              2112.7937581940328,
+              2111.7629266966123,
+              2111.1649109395107
+            ],
+            "median": 2111.7629266966123,
+            "mean": 2110.9828281303617,
+            "min": 2105.350886619593,
+            "max": 2113.361749993055,
+            "stddev": 2.7768061458835893,
+            "cv": 0.0013154091586538052
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "rand_read",
+          "label": "Random 4K read",
+          "unit": "IOPS",
+          "direction": "higher_is_better",
+          "value": 16401.440212861406,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              16416.589518301145,
+              16416.671015352207,
+              16401.440212861406,
+              16443.03268063661,
+              16338.586882232777,
+              16474.828645901245,
+              16167.595958853548,
+              16215.00430726014,
+              16230.1659795456
+            ],
+            "median": 16401.440212861406,
+            "mean": 16344.87946677163,
+            "min": 16167.595958853548,
+            "max": 16474.828645901245,
+            "stddev": 112.64551616370007,
+            "cv": 0.006891792404630642
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "rand_write",
+          "label": "Random 4K write",
+          "unit": "IOPS",
+          "direction": "higher_is_better",
+          "value": 37200.590778817306,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              37933.433279139266,
+              36272.65911170349,
+              37200.590778817306,
+              35728.40324146045,
+              37620.69971994232,
+              37951.61433288077,
+              35034.87380115532,
+              37814.040198320414,
+              34059.35857766243
+            ],
+            "median": 37200.590778817306,
+            "mean": 36623.96367123131,
+            "min": 34059.35857766243,
+            "max": 37951.61433288077,
+            "stddev": 1425.1087644368722,
+            "cv": 0.0389119205455175
+          },
+          "confidence": "medium",
+          "scored": true
+        },
+        {
+          "id": "rand_read_qd",
+          "label": "Random 4K read, deep queue",
+          "unit": "IOPS",
+          "direction": "higher_is_better",
+          "value": 287840.05793049623,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              288180.10990347905,
+              287840.05793049623,
+              287621.8777334247,
+              288088.45851227076,
+              288251.85455542844,
+              287999.99162810517,
+              287495.07298954827,
+              287137.72616674454,
+              286901.3024519759
+            ],
+            "median": 287840.05793049623,
+            "mean": 287724.0502079415,
+            "min": 286901.3024519759,
+            "max": 288251.85455542844,
+            "stddev": 473.3553473293494,
+            "cv": 0.001645171291684689
+          },
+          "confidence": "high",
+          "scored": false
+        },
+        {
+          "id": "rand_write_qd",
+          "label": "Random 4K write, deep queue",
+          "unit": "IOPS",
+          "direction": "higher_is_better",
+          "value": 181494.09294763635,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              152541.50487253084,
+              175005.02679578646,
+              173963.42776316765,
+              176802.71872992796,
+              185208.3503507396,
+              188258.92411592338,
+              187740.29067689274,
+              189998.34659859826,
+              181494.09294763635
+            ],
+            "median": 181494.09294763635,
+            "mean": 179001.40920568924,
+            "min": 152541.50487253084,
+            "max": 189998.34659859826,
+            "stddev": 11586.92668932032,
+            "cv": 0.06473092441415289
+          },
+          "confidence": "medium",
+          "scored": false
+        }
+      ],
+      "notes": [
+        "deep-queue random I/O approximated with 32 concurrent QD1 workers"
+      ]
+    },
+    {
+      "id": "network",
+      "label": "Network",
+      "subtests": [
+        {
+          "id": "tcp_stream",
+          "label": "TCP throughput, single stream",
+          "unit": "GiB/s",
+          "direction": "higher_is_better",
+          "value": 6.737861327237565,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              6.792098134279807,
+              6.8326220780458335,
+              6.328197119539925,
+              6.545914394876505,
+              6.758055595081926,
+              6.728857800317629,
+              6.650491194456677,
+              6.737861327237565,
+              6.747570518975285
+            ],
+            "median": 6.737861327237565,
+            "mean": 6.680185351423462,
+            "min": 6.328197119539925,
+            "max": 6.8326220780458335,
+            "stddev": 0.1560719528876732,
+            "cv": 0.023363416533706848
+          },
+          "confidence": "high",
+          "scored": true
+        },
+        {
+          "id": "tcp_parallel",
+          "label": "TCP throughput, all streams",
+          "unit": "GiB/s",
+          "direction": "higher_is_better",
+          "value": 13.370591270215419,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              14.718914324695035,
+              13.902355354548817,
+              11.52349421386389,
+              9.917455713405658,
+              15.782352816155376,
+              7.90472842368074,
+              13.976678922709992,
+              13.370591270215419,
+              9.577408389854936
+            ],
+            "median": 13.370591270215419,
+            "mean": 12.297108825458873,
+            "min": 7.90472842368074,
+            "max": 15.782352816155376,
+            "stddev": 2.6812592376316213,
+            "cv": 0.21803980721717073
+          },
+          "confidence": "low",
+          "scored": true
+        },
+        {
+          "id": "tcp_rtt",
+          "label": "TCP round-trip latency",
+          "unit": "us",
+          "direction": "lower_is_better",
+          "value": 14.48227452570601,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              12.520969198664442,
+              13.686430272450227,
+              16.522284600218093,
+              14.210342156370492,
+              14.23186693295888,
+              15.355132646793873,
+              14.48227452570601,
+              14.822191126482213,
+              14.595916035808116
+            ],
+            "median": 14.48227452570601,
+            "mean": 14.491934166161375,
+            "min": 12.520969198664442,
+            "max": 16.522284600218093,
+            "stddev": 1.0993110428466975,
+            "cv": 0.07585675108941535
+          },
+          "confidence": "medium",
+          "scored": true
+        },
+        {
+          "id": "udp_pps",
+          "label": "UDP send rate",
+          "unit": "Kpps",
+          "direction": "higher_is_better",
+          "value": 343.57655744461266,
+          "representative": "median",
+          "stats": {
+            "runs": [
+              342.3418238992258,
+              343.9145994886815,
+              345.2319035259547,
+              343.57655744461266,
+              340.8243927995527,
+              344.4743244410305,
+              338.65273674222874,
+              343.403511306103,
+              344.68963205606434
+            ],
+            "median": 343.57655744461266,
+            "mean": 343.01216463371713,
+            "min": 338.65273674222874,
+            "max": 345.2319035259547,
+            "stddev": 2.1037301090881404,
+            "cv": 0.006133106420102017
+          },
+          "confidence": "high",
+          "scored": true
+        }
+      ]
+    }
+  ],
+  "components": [
+    {
+      "id": "cpu",
+      "label": "CPU",
+      "score": 1356.834273211274,
+      "grade": "A",
+      "graded": true,
+      "confidence": "low",
+      "subtests": [
+        {
+          "id": "int_single",
+          "label": "Integer, single-core",
+          "unit": "Mops/s",
+          "value": 11413.54309248773,
+          "baseline": 6432.0,
+          "ratio": 1.7744936400012017,
+          "score": 1332.1012123713429,
+          "confidence": "high"
+        },
+        {
+          "id": "int_multi",
+          "label": "Integer, all cores",
+          "unit": "Mops/s",
+          "value": 45813.52864124329,
+          "baseline": 17660.0,
+          "ratio": 2.5941975448042633,
+          "score": 1610.651279701557,
+          "confidence": "low"
+        },
+        {
+          "id": "float_single",
+          "label": "Float, single-core",
+          "unit": "MFLOP/s",
+          "value": 8598.346294761175,
+          "baseline": 5684.0,
+          "ratio": 1.5127280603028106,
+          "score": 1229.9301038281853,
+          "confidence": "high"
+        },
+        {
+          "id": "float_multi",
+          "label": "Float, all cores",
+          "unit": "MFLOP/s",
+          "value": 62279.24024889665,
+          "baseline": 23030.0,
+          "ratio": 2.704265751146185,
+          "score": 1644.4651869669315,
+          "confidence": "medium"
+        },
+        {
+          "id": "hash",
+          "label": "BLAKE3 hash",
+          "unit": "MiB/s",
+          "value": 4251.486916387308,
+          "baseline": 1873.0,
+          "ratio": 2.2698808950279274,
+          "score": 1506.612390440198,
+          "confidence": "high"
+        },
+        {
+          "id": "compress",
+          "label": "DEFLATE compress",
+          "unit": "MiB/s",
+          "value": 69.29082595227523,
+          "baseline": 44.37,
+          "ratio": 1.5616593633598204,
+          "score": 1249.6637001048803,
+          "confidence": "high"
+        },
+        {
+          "id": "aes_gcm",
+          "label": "AES-256-GCM encrypt",
+          "unit": "MiB/s",
+          "value": 2101.7242958768634,
+          "baseline": 760.2,
+          "ratio": 2.7646991526925326,
+          "score": 1662.7384498749443,
+          "confidence": "high"
+        },
+        {
+          "id": "sha256",
+          "label": "SHA-256 hash",
+          "unit": "MiB/s",
+          "value": 254.32424734527268,
+          "baseline": 355.7,
+          "ratio": 0.7149964783392542,
+          "score": 845.5746438601705,
+          "confidence": "high"
+        }
+      ],
+      "informational": [
+        {
+          "id": "int_scale_2",
+          "label": "Integer, 2 threads",
+          "unit": "Mops/s",
+          "direction": "higher_is_better",
+          "value": 22149.96641704667,
+          "confidence": "medium"
+        },
+        {
+          "id": "int_scale_4",
+          "label": "Integer, 4 threads",
+          "unit": "Mops/s",
+          "direction": "higher_is_better",
+          "value": 42017.44906840957,
+          "confidence": "medium"
+        }
+      ]
+    },
+    {
+      "id": "memory",
+      "label": "Memory",
+      "score": 1172.9514119231144,
+      "grade": "A",
+      "graded": true,
+      "confidence": "high",
+      "subtests": [
+        {
+          "id": "bw_read",
+          "label": "Sequential read",
+          "unit": "GiB/s",
+          "value": 14.654562750102638,
+          "baseline": 10.64,
+          "ratio": 1.3773085291449847,
+          "score": 1173.5878872692,
+          "confidence": "high"
+        },
+        {
+          "id": "bw_write",
+          "label": "Sequential write",
+          "unit": "GiB/s",
+          "value": 11.293382135731143,
+          "baseline": 6.849,
+          "ratio": 1.648909641660263,
+          "score": 1284.0987663183323,
+          "confidence": "high"
+        },
+        {
+          "id": "bw_copy",
+          "label": "Copy (memcpy)",
+          "unit": "GiB/s",
+          "value": 11.114759069476843,
+          "baseline": 6.498,
+          "ratio": 1.7104892381466363,
+          "score": 1307.8567345648514,
+          "confidence": "high"
+        },
+        {
+          "id": "bw_read_mt",
+          "label": "Sequential read, all cores",
+          "unit": "GiB/s",
+          "value": 20.98567039251708,
+          "baseline": 16.32,
+          "ratio": 1.2858866662081543,
+          "score": 1133.9694291329702,
+          "confidence": "high"
+        },
+        {
+          "id": "latency",
+          "label": "Random access latency",
+          "unit": "ns",
+          "value": 149.56751126036355,
+          "baseline": 147.6,
+          "ratio": 0.9868453299531169,
+          "score": 993.40089085581,
+          "confidence": "high"
+        }
+      ],
+      "informational": [
+        {
+          "id": "lat_l1",
+          "label": "Latency, ~L1 (16 KiB)",
+          "unit": "ns",
+          "direction": "lower_is_better",
+          "value": 1.1538126305307834,
+          "confidence": "high"
+        },
+        {
+          "id": "lat_l2",
+          "label": "Latency, ~L2 (256 KiB)",
+          "unit": "ns",
+          "direction": "lower_is_better",
+          "value": 4.014939672368174,
+          "confidence": "high"
+        },
+        {
+          "id": "lat_l3",
+          "label": "Latency, ~L3 (6 MiB)",
+          "unit": "ns",
+          "direction": "lower_is_better",
+          "value": 17.516595537219604,
+          "confidence": "high"
+        },
+        {
+          "id": "lat_loaded",
+          "label": "Latency under bandwidth load",
+          "unit": "ns",
+          "direction": "lower_is_better",
+          "value": 258.725079552602,
+          "confidence": "high"
+        }
+      ]
+    },
+    {
+      "id": "disk",
+      "label": "Disk",
+      "score": 1719.2224262687366,
+      "grade": "S",
+      "graded": true,
+      "confidence": "low",
+      "subtests": [
+        {
+          "id": "seq_write",
+          "label": "Sequential write",
+          "unit": "MiB/s",
+          "value": 1027.6728797495853,
+          "baseline": 342.3,
+          "ratio": 3.0022579016932083,
+          "score": 1732.7024850484886,
+          "confidence": "low"
+        },
+        {
+          "id": "seq_read",
+          "label": "Sequential read",
+          "unit": "MiB/s",
+          "value": 2111.7629266966123,
+          "baseline": 571.6,
+          "ratio": 3.6944767786854658,
+          "score": 1922.102176962886,
+          "confidence": "high"
+        },
+        {
+          "id": "rand_read",
+          "label": "Random 4K read",
+          "unit": "IOPS",
+          "value": 16401.440212861406,
+          "baseline": 8195.0,
+          "ratio": 2.0013959991289085,
+          "score": 1414.7070365022253,
+          "confidence": "high"
+        },
+        {
+          "id": "rand_write",
+          "label": "Random 4K write",
+          "unit": "IOPS",
+          "value": 37200.590778817306,
+          "baseline": 10820.0,
+          "ratio": 3.438132234641156,
+          "score": 1854.2201149381256,
+          "confidence": "medium"
+        }
+      ],
+      "informational": [
+        {
+          "id": "rand_read_qd",
+          "label": "Random 4K read, deep queue",
+          "unit": "IOPS",
+          "direction": "higher_is_better",
+          "value": 287840.05793049623,
+          "confidence": "high"
+        },
+        {
+          "id": "rand_write_qd",
+          "label": "Random 4K write, deep queue",
+          "unit": "IOPS",
+          "direction": "higher_is_better",
+          "value": 181494.09294763635,
+          "confidence": "medium"
+        }
+      ],
+      "notes": [
+        "deep-queue random I/O approximated with 32 concurrent QD1 workers"
+      ]
+    },
+    {
+      "id": "network",
+      "label": "Network",
+      "score": 1884.2371308507502,
+      "grade": "S",
+      "graded": false,
+      "confidence": "low",
+      "subtests": [
+        {
+          "id": "tcp_stream",
+          "label": "TCP throughput, single stream",
+          "unit": "GiB/s",
+          "value": 6.737861327237565,
+          "baseline": 1.956,
+          "ratio": 3.444714379978305,
+          "score": 1855.9941756315684,
+          "confidence": "high"
+        },
+        {
+          "id": "tcp_parallel",
+          "label": "TCP throughput, all streams",
+          "unit": "GiB/s",
+          "value": 13.370591270215419,
+          "baseline": 2.939,
+          "ratio": 4.549367563870507,
+          "score": 2132.9246503030777,
+          "confidence": "low"
+        },
+        {
+          "id": "tcp_rtt",
+          "label": "TCP round-trip latency",
+          "unit": "us",
+          "value": 14.48227452570601,
+          "baseline": 39.8,
+          "ratio": 2.7481870979144243,
+          "score": 1657.765694516093,
+          "confidence": "medium"
+        },
+        {
+          "id": "udp_pps",
+          "label": "UDP send rate",
+          "unit": "Kpps",
+          "value": 343.57655744461266,
+          "baseline": 93.13,
+          "ratio": 3.6892146187545656,
+          "score": 1920.7328337784425,
+          "confidence": "high"
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "score": 1398.6626096417433,
+    "grade": "A",
+    "profile": "general",
+    "why": [
+      "lifted by Disk (score 1719)",
+      "lifted by CPU (score 1357)",
+      "low measurement confidence in: CPU, Disk"
+    ]
+  },
+  "notes": [
+    "clocks fell over the run (3366 -> 1078 MHz mean), so peak-reported          subtests may never have reached boost \u2014 confidence lowered for cpu/int_multi, cpu/float_multi, cpu/int_scale_2, cpu/int_scale_4"
+  ],
+  "model_ref": [
+    {
+      "component": "cpu",
+      "model": "Intel Core i7-10510U",
+      "samples": 1,
+      "measured": "2026-08-30",
+      "build_isa": "sse2",
+      "subtests": [
+        {
+          "id": "int_single",
+          "value": 11413.54309248773,
+          "reference": 5266.0,
+          "delta_pct": 116.74027900660332
+        },
+        {
+          "id": "int_multi",
+          "value": 45813.52864124329,
+          "reference": 16440.0,
+          "delta_pct": 178.67109879101756
+        },
+        {
+          "id": "float_single",
+          "value": 8598.346294761175,
+          "reference": 4190.0,
+          "delta_pct": 105.21112875325001
+        },
+        {
+          "id": "float_multi",
+          "value": 62279.24024889665,
+          "reference": 23470.0,
+          "delta_pct": 165.35679697016042
+        },
+        {
+          "id": "hash",
+          "value": 4251.486916387308,
+          "reference": 1971.0,
+          "delta_pct": 115.70202518454127
+        },
+        {
+          "id": "compress",
+          "value": 69.29082595227523,
+          "reference": 39.78,
+          "delta_pct": 74.18508283628765
+        },
+        {
+          "id": "aes_gcm",
+          "value": 2101.7242958768634,
+          "reference": 671.5,
+          "delta_pct": 212.98947071881807
+        },
+        {
+          "id": "sha256",
+          "value": 254.32424734527268,
+          "reference": 153.1,
+          "delta_pct": 66.11642543780059
+        }
+      ],
+      "delta_pct": 124.37980761500684,
+      "verdict": "CPU is ~124% above a typical Intel Core i7-10510U (newer stepping, better cooling, or a native build)"
+    }
+  ],
+  "telemetry": {
+    "source": "sysinfo",
+    "sample_count": 2050,
+    "mhz_start": 3366.25,
+    "mhz_end": 1078.25,
+    "mhz_min": 500.0,
+    "mhz_max": 4346.5,
+    "mhz_mean": 2257.0745731707316,
+    "thermal_limited": true
+  },
+  "tags": {
+    "site": "edinburgh",
+    "ring": "pilot"
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "schema": "loadbearer.result/1",
+  "tool_version": "1.2.4",
+  "timestamp": "2026-09-08T09:15:00.0000000Z",
+  "machine": {
+    "hostname": "FLEET-OLD-01",
+    "os": "Windows 10 Pro",
+    "kernel": "19045",
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Core(TM) i5-6300U CPU @ 2.40GHz",
+    "cpu_vendor": "GenuineIntel",
+    "cpu_physical_cores": 2,
+    "cpu_logical_cores": 4,
+    "cpu_mhz_spot": 2400,
+    "ram_bytes": 8465125376,
+    "swap_bytes": 0,
+    "disks": [
+      {
+        "name": "OS",
+        "mount_point": "C:\\",
+        "file_system": "NTFS",
+        "kind": "SSD",
+        "total_bytes": 255790084096,
+        "available_bytes": 61003644928,
+        "removable": false
+      }
+    ]
+  },
+  "config": {
+    "profile": "general",
+    "duration_preset": "thorough",
+    "curve_k": 0.5,
+    "seed": 6840143426475589633,
+    "threads": 4,
+    "baseline": "reference-v1",
+    "build_isa": "sse2"
+  },
+  "raw": [
+    {
+      "id": "cpu",
+      "label": "CPU",
+      "subtests": [
+        {
+          "id": "int_single",
+          "label": "Integer, single-core",
+          "unit": "Mops/s",
+          "direction": "higher_is_better",
+          "value": 4200.0,
+          "stats": {
+            "runs": [4180.0, 4210.0, 4200.0],
+            "median": 4200.0,
+            "mean": 4196.7,
+            "min": 4180.0,
+            "max": 4210.0,
+            "stddev": 12.5,
+            "cv": 0.003
+          },
+          "confidence": "high",
+          "scored": true
+        }
+      ],
+      "notes": []
+    }
+  ],
+  "components": [
+    {
+      "id": "cpu",
+      "label": "CPU",
+      "score": 720.0,
+      "grade": "C",
+      "graded": true,
+      "subtests": [
+        {
+          "id": "int_single",
+          "label": "Integer, single-core",
+          "unit": "Mops/s",
+          "value": 4200.0,
+          "baseline": 6432.0,
+          "ratio": 0.653,
+          "score": 720.0,
+          "confidence": "high"
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "score": 720.0,
+    "grade": "C",
+    "profile": "general",
+    "why": ["held back by CPU (score 720)"]
+  }
+}

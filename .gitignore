@@ -1,0 +1,6 @@
+/target
+# The index is derived from the collection folder — rebuildable, never a source
+# of truth, and it contains real machine serials once pointed at a live share.
+*.db
+*.db-wal
+*.db-shm
