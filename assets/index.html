@@ -82,8 +82,13 @@
 
 <main id="main"></main>
 
+<!-- The build goes here rather than in the topbar: it is the answer to "which
+     version am I looking at" when something is being reported, not something
+     to read on the way past. Filled from the snapshot, so it names the build
+     that produced what is on screen. -->
 <footer class="footer">
   <span id="footer-note"></span>
+  <span class="footer-build" id="footer-build"></span>
 </footer>
 
 <div class="tooltip" id="tooltip" role="status" hidden></div>

@@ -277,6 +277,15 @@ pub struct Summary {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
+    /// Which build produced this. It travels with the snapshot rather than
+    /// being asked for separately, so that a saved `report --json` — or one
+    /// diffed against another server's — is attributable to a build, and so
+    /// the dashboard can show it without a second request.
+    pub version: &'static str,
+    /// The commit this was built from, `-dirty` if the tree wasn't clean, or
+    /// `unknown` outside a repository. `version` alone can't identify a build:
+    /// every commit between two releases reports the same one.
+    pub build: &'static str,
     pub generated_at: String,
     pub thresholds: Thresholds,
     pub summary: Summary,
@@ -383,6 +392,8 @@ pub fn snapshot(conn: &Connection, th: &Thresholds, now: OffsetDateTime) -> Resu
     let summary = summarise(&machines, &cohorts, &flags, th);
 
     Ok(Snapshot {
+        version: env!("CARGO_PKG_VERSION"),
+        build: env!("FLEET_BUILD"),
         generated_at: now.format(&Rfc3339)?,
         thresholds: th.clone(),
         summary,
@@ -1140,6 +1151,8 @@ impl Snapshot {
             .collect();
 
         Snapshot {
+            version: self.version,
+            build: self.build,
             generated_at: self.generated_at.clone(),
             thresholds: self.thresholds.clone(),
             summary: summarise(&machines, &cohorts, &flags, th),

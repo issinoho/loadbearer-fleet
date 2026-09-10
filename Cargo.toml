@@ -3,6 +3,9 @@ name = "loadbearer-fleet"
 version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
+# Declared rather than left to auto-detection, so it is visible here that the
+# binary carries a stamped build identity.
+build = "build.rs"
 description = "Fleet dashboard for loadbearer: indexes collected result files and reports across an estate"
 license = "MIT"
 

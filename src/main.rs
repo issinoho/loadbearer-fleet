@@ -30,7 +30,9 @@ use analytics::{FlagKind, Severity, Thresholds};
 use config::{Config, LogFormat};
 
 #[derive(Parser, Debug)]
-#[command(name = "loadbearer-fleet", version, about)]
+// `version` from build.rs rather than Cargo.toml: the long form names the
+// commit, the target and the profile, which is what a bug report needs.
+#[command(name = "loadbearer-fleet", version = env!("FLEET_VERSION"), about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -241,6 +243,20 @@ fn main() -> Result<()> {
         config.server.index = index.clone();
     }
     init_logging(&config.log, cli.log_level.as_deref())?;
+    // First line of every run, before any work, because a service log rotates
+    // daily and outlives upgrades: without this, a line from six weeks ago
+    // can't be attributed to the build that wrote it. Here rather than in
+    // `serve` so that a `scan` from a scheduled task says it too. The pid is
+    // what distinguishes a restart from a reload in a file being appended to
+    // by successive processes.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build = env!("FLEET_BUILD"),
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        pid = std::process::id(),
+        "loadbearer-fleet starting"
+    );
 
     match &cli.command {
         Command::InitConfig => unreachable!("handled above"),

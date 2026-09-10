@@ -1334,6 +1334,13 @@ async function route() {
     state.snap = await fetchSnapshot();
     $('#generated').textContent = `indexed ${state.snap.summary.runs} run(s) · read ${when(state.snap.generated_at)}`;
     $('#f-count').textContent = `${state.snap.summary.machines} machine(s) in view`;
+    // From the snapshot rather than baked into the page, so it names the build
+    // that answered — including right after an upgrade, when the browser may
+    // still be holding cached HTML from the old one.
+    if (state.snap.version) {
+      const build = state.snap.build && state.snap.build !== 'unknown' ? ` (${state.snap.build})` : '';
+      $('#footer-build').textContent = `loadbearer-fleet ${state.snap.version}${build}`;
+    }
     syncFilterControls();
     render();
   } catch (err) {

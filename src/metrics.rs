@@ -136,11 +136,20 @@ pub fn render(snapshot: &Snapshot, runtime: &Runtime, now: OffsetDateTime) -> St
     let s = &snapshot.summary;
     let mut out = Text(String::with_capacity(4096));
 
+    // Both labels, because the version alone doesn't identify a build: every
+    // commit between two releases reports the same one. `version` stays a bare
+    // semver so it can be compared; `build` is the commit.
     out.family(
         "build_info",
-        "Always 1; the version is in the label.",
+        "Always 1; the version and commit are in the labels.",
         "gauge",
-        &[(vec![("version", env!("CARGO_PKG_VERSION"))], 1.0)],
+        &[(
+            vec![
+                ("version", env!("CARGO_PKG_VERSION")),
+                ("build", env!("FLEET_BUILD")),
+            ],
+            1.0,
+        )],
     );
     out.gauge(
         "uptime_seconds",
@@ -382,11 +391,20 @@ mod tests {
         assert!(text.contains("loadbearer_fleet_machines_by_grade{grade=\"S\"}"));
         assert!(text.contains("loadbearer_fleet_findings{severity=\"critical\"}"));
         assert!(text.contains("loadbearer_fleet_score{quantile=\"0.5\"}"));
-        assert!(text.contains(concat!(
-            "loadbearer_fleet_build_info{version=\"",
-            env!("CARGO_PKG_VERSION"),
-            "\"}"
-        )));
+        // Both labels, in this order. The commit is what actually identifies a
+        // build, so a future edit that drops it should fail here rather than
+        // quietly leave the metric unable to tell two builds of one version
+        // apart.
+        assert!(
+            text.contains(concat!(
+                "loadbearer_fleet_build_info{version=\"",
+                env!("CARGO_PKG_VERSION"),
+                "\",build=\"",
+                env!("FLEET_BUILD"),
+                "\"}"
+            )),
+            "{text}"
+        );
     }
 
     /// The metric an operator should page on.

@@ -407,6 +407,10 @@ table.data td.wrap { white-space: normal; }
 }
 
 .footer { padding: 16px 20px 32px; color: var(--text-muted); font-size: 12px; text-align: center; }
+/* Own line, so it doesn't shift when the rescan note above it appears and
+   goes. Same muted colour and size as the note: discreet by position, not by
+   being made hard to read. */
+.footer-build { display: block; margin-top: 4px; }
 
 @media (prefers-reduced-motion: reduce) {
   main.loading { transition: none; }
