@@ -230,7 +230,8 @@ mod windows_impl {
         // before one is built — which also means Running is not reported until
         // the folder has actually been read once.
         let result = (|| -> Result<()> {
-            let index = crate::index::Index::open(&config.server.index)?;
+            let index = crate::index::Index::open(&config.server.index)?
+                .with_archive(config.server.archive_dir.as_deref())?;
             let state =
                 crate::web::AppState::new(index, config, crate::analytics::Thresholds::default())?;
             if config.server.collection_dir.is_some() {

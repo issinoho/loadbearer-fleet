@@ -30,6 +30,7 @@ rand = "0.10.2"
 openidconnect = { version = "4.0.1", features = ["reqwest"] }
 base64 = "0.23.1"
 tracing-appender = "0.2.5"
+flate2 = "1.1.10"
 
 [profile.release]
 lto = true

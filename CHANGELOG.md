@@ -7,6 +7,23 @@ notes, so each one has to stand on its own.
 
 ## Unreleased
 
+- **`backup <file>`** takes a consistent snapshot of the index while the
+  dashboard is serving, via SQLite's `VACUUM INTO` — copying a live database
+  with `cp` is a torn read, and nobody stops a dashboard for a backup agent.
+  Refuses to overwrite; restore is putting the file back where `index` points.
+- **`archive_dir`**, optional, keeps every document indexed: gzipped,
+  content-addressed, about 8 KB a run. It exists for the collection pattern
+  where each machine overwrites one file, which leaves the index as the only
+  record of earlier runs — with this set, that record is in files, so the index
+  is genuinely derived again and moving servers is a copy. Archived before
+  indexed, so "in the index" implies "kept".
+- **`scan` reads `.json.gz` as well as `.json`**, which is what makes importing
+  an archive just a scan, and lets a collection share be gzipped.
+- Moving between instances, consolidating two of them, backup and restore are
+  therefore all file copies plus a scan. There is deliberately no export format:
+  the interchange format is `loadbearer.result/1`, which loadbearer already
+  promises to keep stable.
+
 - **An index this build can't read is now kept, not dropped.** A change to the
   index format renames the existing file to
   `fleet-index.superseded-v1-<when>.db` and rebuilds a fresh one from the

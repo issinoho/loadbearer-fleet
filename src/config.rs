@@ -54,6 +54,21 @@ pub struct Server {
     pub collection_dir: Option<PathBuf>,
     /// Where the derived index lives. Safe to delete.
     pub index: PathBuf,
+    /// Keep a copy of every result document this indexes, content-addressed.
+    ///
+    /// Unset by default, because it is only worth its disk when the collection
+    /// folder doesn't already hold a file per run. When each machine overwrites
+    /// a single file, the folder holds only the latest result and the index
+    /// becomes the sole record of the runs before it — this puts that record
+    /// back into files, so the index is genuinely derived again and moving to
+    /// another server is a copy rather than a migration.
+    ///
+    /// About 8 KB per run: gzipped `loadbearer.result/1` documents exactly as
+    /// they arrived, named by their SHA-256, so the same document is never
+    /// stored twice and a backup tool sees immutable files it need only copy
+    /// once.
+    #[serde(default)]
+    pub archive_dir: Option<PathBuf>,
     /// How often to rescan the folder by itself. Zero switches it off and
     /// leaves rescanning to the button.
     ///
@@ -129,6 +144,7 @@ impl Default for Server {
             public_url: "http://127.0.0.1:8787".to_string(),
             collection_dir: None,
             index: PathBuf::from("fleet-index.db"),
+            archive_dir: None,
             scan_interval_minutes: scan_interval_minutes(),
         }
     }
@@ -298,6 +314,7 @@ impl Config {
             .collection_dir
             .as_deref()
             .map(|p| beside(base, p));
+        self.server.archive_dir = self.server.archive_dir.as_deref().map(|p| beside(base, p));
         self.log.file = self.log.file.as_deref().map(|p| beside(base, p));
     }
 
@@ -422,6 +439,19 @@ collection_dir = 'PUT-THE-PATH-TO-YOUR-RESULTS-SHARE-HERE'
 # see "Upgrading" in the README, because what that costs you depends on whether
 # your collector keeps a file per run.
 index = "fleet-index.db"
+
+# Optional. Keeps a gzipped copy of every result document this indexes, named
+# by its SHA-256, at about 8 KB per run.
+#
+# Worth setting when your collector overwrites one file per machine, because
+# then the collection folder holds only the latest result and the index is the
+# only record of everything earlier. With this set, that record is in files
+# again: the index goes back to being disposable, backups see immutable files,
+# and moving to another server is a copy rather than a migration. Leave it
+# unset if your collector already writes a file per run - it would only be
+# storing a second copy of what you already keep.
+#
+# archive_dir = 'PUT-THE-PATH-FOR-THE-DOCUMENT-ARCHIVE-HERE'
 
 [auth]
 # "oidc" for single sign-on, "none" for an unauthenticated dashboard — which is

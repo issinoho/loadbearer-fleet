@@ -19,14 +19,15 @@
 //! per run plus a collector that overwrites one file per machine means the
 //! index accumulates runs whose files no longer exist. Rebuilding it then
 //! recovers the current state of the fleet and silently loses the trend — the
-//! comparison this exists to make. So the index is derived exactly when the
-//! collection folder keeps a file per run, and is the only copy of the history
-//! when it doesn't.
+//! comparison this exists to make.
 //!
-//! Which is why a version change renames the old file rather than dropping its
-//! tables: the rebuild costs a rescan either way, and being wrong about which
-//! of those two situations an operator is in should not cost them their
-//! history. See `set_aside`.
+//! So "derived" holds exactly when the documents are kept somewhere, and there
+//! are two ways that happens: the collection folder keeps a file per run, or
+//! `archive_dir` is set and this keeps one itself (see `Index::keep`). Where
+//! neither is true, the index is the only copy of the history — which is why a
+//! version change renames the old file rather than dropping its tables. The
+//! rebuild costs a rescan either way, and being wrong about which situation an
+//! operator is in should not cost them their history. See `set_aside`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -131,6 +132,32 @@ fn set_aside(path: &Path, found: i64) -> Result<()> {
     Ok(())
 }
 
+/// Read a result document, transparently un-gzipping a `.json.gz`.
+///
+/// Two reasons it handles both. The document archive is gzipped — a result is
+/// about 40 KB of JSON and a fifth of that compressed — so importing an
+/// archive is just scanning it. And a collection share is a fine place to
+/// gzip, at which point a collector can write `.json.gz` directly and this
+/// reads it without being told.
+fn read_document(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if path.extension().and_then(|e| e.to_str()) != Some("gz") {
+        return String::from_utf8(bytes)
+            .with_context(|| format!("{} is not UTF-8", path.display()));
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut text)
+        .with_context(|| format!("decompressing {}", path.display()))?;
+    Ok(text)
+}
+
+/// Does this look like a result document rather than something else on the
+/// share? Extension only — whether it *is* one is the parser's job.
+fn is_document(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.ends_with(".json") || name.ends_with(".json.gz")
+}
+
 fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
@@ -177,6 +204,8 @@ fn free_name(path: &Path, found: i64) -> std::path::PathBuf {
 
 pub struct Index {
     conn: Connection,
+    /// Where to keep a copy of every document ingested, if anywhere.
+    archive: Option<std::path::PathBuf>,
 }
 
 /// What one scan did, for logging and for the UI's "last refreshed" line.
@@ -203,6 +232,48 @@ impl Index {
         Self::init(conn)
     }
 
+    /// Keep a copy of every document ingested from here on, content-addressed
+    /// under `dir`. See `Server::archive_dir` for when that is worth doing.
+    pub fn with_archive(mut self, dir: Option<&Path>) -> Result<Self> {
+        if let Some(dir) = dir {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating the document archive at {}", dir.display()))?;
+            self.archive = Some(dir.to_path_buf());
+        }
+        Ok(self)
+    }
+
+    /// A consistent copy of the index, safe to take while the dashboard is
+    /// running.
+    ///
+    /// `VACUUM INTO` rather than a file copy, and that is the whole point: a
+    /// plain copy of a live SQLite database is a torn read, and nobody stops a
+    /// dashboard nightly so a backup agent can have it. WAL lets this read
+    /// while `serve` writes.
+    ///
+    /// The result is a compacted database of the current format, not an
+    /// archive format — restore is putting it back where the index goes.
+    pub fn backup_to(&self, target: &Path) -> Result<u64> {
+        if let Some(parent) = target.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // SQLite refuses to overwrite, and so should this: silently replacing
+        // somebody's last good copy is not a thing a backup command should do.
+        if target.exists() {
+            anyhow::bail!(
+                "{} already exists; move it aside or pick another name",
+                target.display()
+            );
+        }
+        self.conn
+            .execute("VACUUM INTO ?1", params![target.to_string_lossy()])
+            .with_context(|| format!("writing a snapshot of the index to {}", target.display()))?;
+        Ok(std::fs::metadata(target)?.len())
+    }
+
     /// Test-only: a throwaway index that never touches disk.
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
@@ -210,6 +281,7 @@ impl Index {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        let archive = None;
         // WAL so a scan writing doesn't block the dashboard reading.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -287,7 +359,7 @@ impl Index {
              CREATE INDEX IF NOT EXISTS tag_lookup ON tag(key, value);",
         )?;
         conn.pragma_update(None, "user_version", INDEX_VERSION)?;
-        Ok(Self { conn })
+        Ok(Self { conn, archive })
     }
 
     /// Walk `root` and ingest every result file under it.
@@ -330,7 +402,7 @@ impl Index {
             if !entry.file_type().is_file() {
                 continue;
             }
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            if !is_document(path) {
                 continue;
             }
             report.seen += 1;
@@ -347,8 +419,7 @@ impl Index {
 
     /// Returns whether the file was new. `false` means it was already indexed.
     pub fn ingest_file(&mut self, path: &Path) -> Result<bool> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let text = read_document(path)?;
         self.ingest_text(&text, path)
     }
 
@@ -376,8 +447,50 @@ impl Index {
 
         let doc =
             ResultFile::from_json(text).with_context(|| format!("parsing {}", source.display()))?;
+
+        // Archived before it is indexed, so that "in the index" always implies
+        // "kept". If the archive can't be written, the file is left unindexed
+        // and reported, and the next scan retries it — which surfaces as a
+        // rejected file in the log, the metrics and the UI, rather than as
+        // retention that quietly stopped working.
+        self.keep(text, &hash)?;
         self.insert(&doc, source, &hash)?;
         Ok(true)
+    }
+
+    /// Keep the document under its own hash: `ab/abcdef….json.gz`.
+    ///
+    /// Content-addressed, so re-ingesting the same document is a no-op and the
+    /// same bytes are never stored twice. The two-character prefix keeps
+    /// directory sizes sane — a million runs across 256 directories rather
+    /// than in one.
+    fn keep(&self, text: &str, hash: &str) -> Result<()> {
+        let Some(root) = &self.archive else {
+            return Ok(());
+        };
+        let dir = root.join(&hash[..2]);
+        let target = dir.join(format!("{hash}.json.gz"));
+        // Immutable by construction: same name, same bytes.
+        if target.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+
+        // Written under a temporary name and renamed into place, so a crash or
+        // a full disk can't leave a truncated file sitting there for ever
+        // afterwards looking complete. The name is a claim about the contents.
+        let partial = dir.join(format!("{hash}.json.gz.partial"));
+        let mut encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(&partial)
+                .with_context(|| format!("creating {}", partial.display()))?,
+            flate2::Compression::default(),
+        );
+        std::io::Write::write_all(&mut encoder, text.as_bytes())
+            .and_then(|()| encoder.finish().map(|_| ()))
+            .with_context(|| format!("writing {}", partial.display()))?;
+        std::fs::rename(&partial, &target)
+            .with_context(|| format!("moving {} into place", partial.display()))?;
+        Ok(())
     }
 
     fn insert(&mut self, doc: &ResultFile, path: &Path, hash: &str) -> Result<()> {
@@ -608,6 +721,165 @@ mod tests {
         let conn = Connection::open(path).expect("open");
         conn.query_row("SELECT COUNT(*) FROM run", [], |r| r.get(0))
             .expect("count")
+    }
+
+    /// The point of the archive: the run survives its own result file being
+    /// overwritten, so the index is genuinely derived again and a rebuild
+    /// doesn't cost the trend.
+    #[test]
+    fn an_archived_run_outlives_the_file_it_came_from() {
+        let dir = scratch("archive");
+        let results = dir.join("results");
+        let archive = dir.join("archive");
+        std::fs::create_dir_all(&results).unwrap();
+
+        let write = |month: &str, score: f64| {
+            let mut doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(fixture("win-modern.json")).unwrap())
+                    .unwrap();
+            doc["timestamp"] = serde_json::json!(format!("2026-{month}-01T10:00:00Z"));
+            doc["overall"]["score"] = serde_json::json!(score);
+            // The same filename every time, as an overwriting collector does.
+            std::fs::write(results.join("PC-01.json"), doc.to_string()).unwrap();
+        };
+
+        {
+            let mut idx = Index::open(&dir.join("i.db"))
+                .unwrap()
+                .with_archive(Some(&archive))
+                .unwrap();
+            write("07", 1500.0);
+            idx.scan(&results).unwrap();
+            write("09", 1200.0);
+            idx.scan(&results).unwrap();
+            assert_eq!(idx.run_count().unwrap(), 2, "both runs indexed");
+        }
+
+        // The folder has lost July. Rebuild from the folder alone and it stays
+        // lost; rebuild from the archive and it comes back.
+        {
+            let mut idx = Index::open(&dir.join("from-folder.db")).unwrap();
+            idx.scan(&results).unwrap();
+            assert_eq!(idx.run_count().unwrap(), 1, "the folder only has September");
+        }
+        {
+            let mut idx = Index::open(&dir.join("from-archive.db")).unwrap();
+            idx.scan(&archive).unwrap();
+            assert_eq!(
+                idx.run_count().unwrap(),
+                2,
+                "the archive still has both, so importing it restores the history"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_archive_stores_a_document_once_and_names_it_by_its_hash() {
+        let dir = scratch("archive-dedup");
+        let archive = dir.join("archive");
+        let mut idx = Index::open(&dir.join("i.db"))
+            .unwrap()
+            .with_archive(Some(&archive))
+            .unwrap();
+
+        idx.ingest_file(&fixture("win-modern.json")).unwrap();
+        // The same document again, under another name: one run, one file.
+        let copy = dir.join("renamed.json");
+        std::fs::copy(fixture("win-modern.json"), &copy).unwrap();
+        idx.ingest_file(&copy).unwrap();
+
+        let kept: Vec<_> = walkdir::WalkDir::new(&archive)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(kept.len(), 1, "content-addressed, so stored once: {kept:?}");
+        assert!(kept[0].ends_with(".json.gz"), "{}", kept[0]);
+
+        let hash: String = idx
+            .conn
+            .query_row("SELECT content_hash FROM run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept[0], format!("{hash}.json.gz"), "named by its hash");
+        assert!(
+            archive.join(&hash[..2]).is_dir(),
+            "sharded by the first two characters"
+        );
+        // Nothing half-written left behind.
+        assert!(!kept[0].ends_with(".partial"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gzipped document has to be readable wherever a plain one is, or
+    /// importing an archive would need a second code path.
+    #[test]
+    fn a_gzipped_document_is_ingested_like_any_other() {
+        let dir = scratch("gz");
+        let text = std::fs::read_to_string(fixture("win-modern.json")).unwrap();
+        let path = dir.join("PC-01.json.gz");
+        let mut enc = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).unwrap(),
+            flate2::Compression::default(),
+        );
+        std::io::Write::write_all(&mut enc, text.as_bytes()).unwrap();
+        enc.finish().unwrap();
+
+        let mut idx = Index::open_in_memory().unwrap();
+        let report = idx.scan(&dir).unwrap();
+        assert_eq!(report.seen, 1, "a .json.gz counts as a document");
+        assert_eq!(report.ingested, 1);
+        assert_eq!(idx.run_count().unwrap(), 1);
+
+        // And it is the same run as the uncompressed original, by content.
+        let mut plain = Index::open_in_memory().unwrap();
+        plain.ingest_file(&fixture("win-modern.json")).unwrap();
+        let gz_hash: String = idx
+            .conn
+            .query_row("SELECT content_hash FROM run", [], |r| r.get(0))
+            .unwrap();
+        let plain_hash: String = plain
+            .conn
+            .query_row("SELECT content_hash FROM run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(gz_hash, plain_hash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A snapshot has to be a real database with the same contents, not a
+    /// file-shaped hope.
+    #[test]
+    fn a_backup_is_a_complete_and_openable_copy() {
+        let dir = scratch("backup");
+        let db = dir.join("i.db");
+        let mut idx = Index::open(&db).unwrap();
+        for f in ["win-modern.json", "linux-throttled.json", "low-end.json"] {
+            idx.ingest_file(&fixture(f)).unwrap();
+        }
+
+        let snapshot = dir.join("snapshots").join("fleet.db");
+        let bytes = idx.backup_to(&snapshot).unwrap();
+        assert!(bytes > 0, "wrote nothing");
+        assert!(snapshot.exists(), "did not create the parent directory");
+
+        let restored = Index::open(&snapshot).unwrap();
+        assert_eq!(restored.run_count().unwrap(), 3);
+        assert_eq!(restored.machine_count().unwrap(), 3);
+        assert_eq!(
+            restored.tag_values().unwrap(),
+            idx.tag_values().unwrap(),
+            "the whole thing, not just the run table"
+        );
+
+        // Refuses to clobber: overwriting somebody's last good copy is not a
+        // thing a backup command should do quietly.
+        let err = idx
+            .backup_to(&snapshot)
+            .expect_err("must refuse")
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The whole point of `set_aside`. An index this build can't read holds

@@ -92,6 +92,16 @@ enum Command {
         #[arg(long)]
         no_scan: bool,
     },
+    /// Take a consistent copy of the index, safe to run while it is serving.
+    ///
+    /// For a backup agent to call. The collection folder is the thing actually
+    /// worth backing up — this covers the run history the index holds that the
+    /// folder may not, when a collector overwrites one file per machine.
+    Backup {
+        /// Where to write the snapshot. Must not already exist.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
     /// Print a starter configuration file, placeholders included.
     InitConfig,
     /// Contact the identity provider and report what the settings resolve to,
@@ -222,7 +232,8 @@ fn main() -> Result<()> {
     match &cli.command {
         Command::InitConfig => unreachable!("handled above"),
         Command::Scan { dir } => {
-            let mut idx = index::Index::open(&config.server.index)?;
+            let mut idx = index::Index::open(&config.server.index)?
+                .with_archive(config.server.archive_dir.as_deref())?;
             let report = idx.scan(dir)?;
             println!(
                 "scanned {}: {} file(s), {} new, {} already indexed",
@@ -241,6 +252,22 @@ fn main() -> Result<()> {
                 idx.run_count()?,
                 idx.machine_count()?
             );
+            Ok(())
+        }
+        Command::Backup { file } => {
+            let idx = index::Index::open(&config.server.index)?;
+            let bytes = idx.backup_to(file)?;
+            println!(
+                "wrote {} ({:.1} MB) from {} run(s)",
+                file.display(),
+                bytes as f64 / (1024.0 * 1024.0),
+                idx.run_count()?
+            );
+            if config.server.archive_dir.is_none() {
+                println!(
+                    "note: no archive_dir is set, so this snapshot is the only copy of any run                      whose result file has since been overwritten. See \"Upgrading\" and                      \"Backup and restore\" in the README."
+                );
+            }
             Ok(())
         }
         Command::Status => {
@@ -319,7 +346,8 @@ fn main() -> Result<()> {
             if let Some(bind) = bind {
                 config.server.bind = *bind;
             }
-            let idx = index::Index::open(&config.server.index)?;
+            let idx = index::Index::open(&config.server.index)?
+                .with_archive(config.server.archive_dir.as_deref())?;
             let state = web::AppState::new(idx, &config, Thresholds::default())?;
             if config.server.collection_dir.is_some() && !*no_scan {
                 // Through the same path the timer and the button use, so the

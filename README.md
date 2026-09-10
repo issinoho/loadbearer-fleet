@@ -165,10 +165,10 @@ Three decisions shape everything else:
 deleting it costs a rescan and nothing else — which is why its shape can change
 freely and why there is nothing to migrate. With one caveat that depends on
 your collector: the index keeps a row per *run*, so if each machine overwrites a
-single file, the index ends up holding history the folder no longer has, which
-is why a format change renames it rather than dropping it. See [what an
-index-format change does to your
-history](#what-an-index-format-change-does-to-your-history).
+single file, the index ends up holding history the folder no longer has — which
+is why a format change renames it rather than dropping it, and why
+[`archive_dir`](#backup-restore-and-moving-to-another-server) exists to put
+that history back into files.
 
 **It reads the schema, not loadbearer's code.** loadbearer's `VERSIONING.md`
 makes the `schema`-tagged JSON a stability contract and says in the same breath
@@ -195,6 +195,7 @@ loadbearer-fleet serve \\fileserver\loadbearer     # the dashboard, on http://12
 loadbearer-fleet init-config > fleet.toml          # a starter config, placeholders included
 loadbearer-fleet serve --config fleet.toml         # with single sign-on
 loadbearer-fleet check-auth --config fleet.toml    # check the identity provider settings
+loadbearer-fleet backup fleet-2026-09-10.db        # consistent snapshot, safe while serving
 ```
 
 Rescanning is cheap and idempotent: every run is keyed by the SHA-256 of the
@@ -233,6 +234,8 @@ resets when they're reimaged" is something an estate owner should know.
 - [x] Entra ID / OIDC SSO with PKCE, roles from group claims, tag-scoped
       authorization — see [Sign-in](#sign-in)
 - [x] Service packaging, config file, metrics — see [Running it as a service](#running-it-as-a-service)
+- [x] Backup, restore and moving between instances — see [Backup, restore, and
+      moving to another server](#backup-restore-and-moving-to-another-server)
 
 ## Analysis
 
@@ -518,15 +521,78 @@ preserved file, which is an ordinary SQLite database that any tool can open.
 But the live "compare a machine with its own past" comparison will have less to
 work with until new runs accumulate.
 
-To avoid the reset altogether, **collect one file per run** —
-`--output …\%COMPUTERNAME%-2026-09-10.json`, or dated folders, since `scan`
-walks subdirectories. Then the folder genuinely holds everything and the index
-really is disposable, which is how it is meant to be. The trade-off:
-loadbearer's `--skip-if-newer-than` guard works off the mtime of a stable
-`--output` path, so it pairs with overwriting and not with this.
+Two ways to avoid the reset altogether. **Set `archive_dir`**, which keeps
+every document indexed so the rebuild is complete whatever your collector does
+— see [Backup, restore, and moving to another
+server](#backup-restore-and-moving-to-another-server). Or **collect one file
+per run**, `--output …\%COMPUTERNAME%-2026-09-10.json` or dated folders, since
+`scan` walks subdirectories; the trade-off there is that loadbearer's
+`--skip-if-newer-than` guard works off the mtime of a stable `--output` path,
+so it pairs with overwriting and not with this.
 
 Delete the preserved files whenever you have decided you don't want them. They
 are never read again.
+
+## Backup, restore, and moving to another server
+
+The short version: **the collection folder is the thing worth backing up, and
+it is almost certainly already on a share your backup system covers.** This
+tool only reads it. Everything else is either rebuildable or a config file
+that belongs in source control.
+
+| | Back it up? | Why |
+| --- | --- | --- |
+| The collection folder | **Yes** — you probably already do | The results themselves. Nothing here writes to it. |
+| `archive_dir`, if set | **Yes** | Immutable, content-addressed copies of every result indexed. Small files that never change, so incremental backups copy each one once. |
+| The index | Optional | Rebuildable at ~340 runs/second — 60,000 runs in about three minutes. Worth a snapshot only in the case below. |
+| The config file | Yes, in source control | Forty lines of TOML. |
+| Sessions | No | In memory. A restart signs people out regardless. |
+
+### If your collector overwrites one file per machine
+
+Then the folder holds only each machine's latest result, and the index is the
+only record of the runs before it — so *something* has to be kept. Two ways,
+and the first is better:
+
+**Set `archive_dir`.** Every document indexed is kept, gzipped and named by its
+SHA-256, at about **8 KB per run** — 60,000 runs is half a gigabyte. That puts
+the history back into files, which means the index goes back to being
+disposable, and moving servers becomes a copy. A run is archived *before* it is
+indexed, so "in the index" always implies "kept"; if the archive can't be
+written the file is reported and retried rather than indexed anyway.
+
+**Or snapshot the index.** `loadbearer-fleet backup <file>` writes a consistent
+copy **while the dashboard is running** — it uses SQLite's `VACUUM INTO`, because
+copying a live database with `cp` gives you a torn read and nobody stops a
+dashboard nightly for a backup agent. Point your agent at it:
+
+```
+loadbearer-fleet --config fleet.toml backup D:\backups\fleet-2026-09-10.db
+```
+
+It refuses to overwrite an existing file. Restore is: stop the service, put the
+snapshot where `index` points, delete any `-wal`/`-shm` beside it, start.
+
+### Moving to another server
+
+```
+# on the new server: same config, then either
+loadbearer-fleet scan \\fileserver\loadbearer      # if the folder has a file per run
+loadbearer-fleet scan D:\archive                   # or import the archive you copied over
+```
+
+There is no export format and no import command, deliberately. The interchange
+format is `loadbearer.result/1` — the contract loadbearer already promises —
+so moving data is moving files, and `scan` reads `.json` and `.json.gz` alike.
+Nothing new to version, nothing that can drift.
+
+**Consolidating two servers** is the same operation: copy both archives into
+one place and scan it. Runs are keyed by the SHA-256 of their document, so
+anything the two instances both saw is stored and counted once.
+
+An index copied from another server is fine too, as long as both are the same
+release — it is a database of a particular internal format, not an interchange
+file, which is why the archive is the better answer for anything long-lived.
 
 ## Metrics
 
