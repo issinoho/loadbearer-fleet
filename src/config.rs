@@ -12,6 +12,13 @@
 //! identity provider that says nothing useful. So the values are checked for
 //! the placeholder marker at load time and named individually.
 //!
+//! That includes the paths, which fail in a worse way than the identity
+//! settings do: they don't fail at all. An unedited `log.file` creates a
+//! directory named `PUT-THE-PATH-FOR-THE-LOG-FILE-HERE` and logs into it
+//! contentedly, and an unedited `collection_dir` is an unreachable folder,
+//! which is reported and survived by design. Both leave you with something
+//! that looks configured.
+//!
 //! **It validates the combination, not just the fields.** Serving an
 //! unauthenticated dashboard, or a session cookie, over plain HTTP on a network
 //! interface is the mistake worth catching, and it is a property of several
@@ -341,6 +348,18 @@ impl Config {
             );
         }
         check_placeholder("server.public_url", &self.server.public_url)?;
+        // Paths, checked before the `auth.mode = "none"` return below, because
+        // they matter whether or not anybody signs in. A placeholder left in
+        // one of these doesn't fail loudly: `log.file` would create a
+        // *directory* named `PUT-THE-PATH-FOR-THE-LOG-FILE-HERE`, and an
+        // unreachable collection folder is reported and survived. Both look
+        // like a configuration that worked.
+        check_placeholder_path(
+            "server.collection_dir",
+            self.server.collection_dir.as_deref(),
+        )?;
+        check_placeholder_path("server.archive_dir", self.server.archive_dir.as_deref())?;
+        check_placeholder_path("log.file", self.log.file.as_deref())?;
 
         if self.auth.mode == AuthMode::None {
             if !self.auth.grants.is_empty() {
@@ -544,12 +563,20 @@ fn beside(base: &Path, path: &Path) -> PathBuf {
 fn check_placeholder(field: &str, value: &str) -> Result<()> {
     if value.contains(PLACEHOLDER) {
         bail!(
-            "{field} still has the starter placeholder in it ({value:?}). Fill it in — a \
-             placeholder here fails later, at the identity provider, with an error that says \
-             nothing useful."
+            "{field} still has the starter placeholder in it ({value:?}). Fill it in — left as \
+             it is, it fails much later and somewhere else, with an error that says nothing \
+             about this file."
         );
     }
     Ok(())
+}
+
+/// The same check for the path settings, which are optional.
+fn check_placeholder_path(field: &str, value: Option<&Path>) -> Result<()> {
+    match value {
+        Some(p) => check_placeholder(field, &p.to_string_lossy()),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -585,6 +612,58 @@ mod tests {
             .expect_err("a file full of placeholders must not start")
             .to_string();
         assert!(err.contains("placeholder"), "{err}");
+    }
+
+    /// The path placeholders are checked on the way past `auth.mode = "none"`,
+    /// not after it. Sign-in is the last thing somebody configures, so the
+    /// unauthenticated config is exactly the one that reaches a placeholder
+    /// path — and left in, `log.file` creates a directory with that name and
+    /// then logs happily into it.
+    #[test]
+    fn placeholder_paths_are_refused_without_sign_in_configured() {
+        for (field, mut c) in [
+            (
+                "log.file",
+                Config {
+                    log: Log {
+                        file: Some(PathBuf::from("PUT-THE-PATH-FOR-THE-LOG-FILE-HERE")),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "server.collection_dir",
+                Config {
+                    server: Server {
+                        collection_dir: Some(PathBuf::from(
+                            "PUT-THE-PATH-TO-YOUR-RESULTS-SHARE-HERE",
+                        )),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            (
+                "server.archive_dir",
+                Config {
+                    server: Server {
+                        archive_dir: Some(PathBuf::from(
+                            "PUT-THE-PATH-FOR-THE-DOCUMENT-ARCHIVE-HERE",
+                        )),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+        ] {
+            c.auth.mode = AuthMode::None;
+            let err = c
+                .validate()
+                .expect_err("a placeholder path must not start")
+                .to_string();
+            assert!(err.contains(field), "{field} not named in: {err}");
+        }
     }
 
     /// The failure this check exists for: the admin filled in the tenant but
