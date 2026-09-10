@@ -67,6 +67,15 @@ const LOGIN_COOKIE: &str = "lbf_login";
 /// How long a half-finished sign-in stays valid. Long enough for a password, a
 /// second factor and a consent screen; short enough not to accumulate.
 const PENDING_TTL_MINUTES: i64 = 15;
+/// How many half-finished sign-ins to hold at once.
+///
+/// `/auth/login` is reachable without a session, and each call records a state,
+/// a nonce and a PKCE verifier for fifteen minutes — so without a ceiling,
+/// unauthenticated requests grow this map for as long as they keep coming. Far
+/// more than a real estate needs concurrently in flight: a dashboard for a
+/// thousand machines has a handful of people signing in at once, not a
+/// thousand.
+const MAX_PENDING: usize = 1024;
 
 /// The client type after discovery has filled in the endpoints.
 type OidcClient = CoreClient<
@@ -220,11 +229,26 @@ impl Authenticator {
             .remove(&Self::key(token));
     }
 
-    fn remember_pending(&self, state: &str, pending: Pending) {
+    /// `false` when the map is full, which the caller turns into a refusal.
+    fn remember_pending(&self, state: &str, pending: Pending) -> bool {
         let now = OffsetDateTime::now_utc();
         let mut map = self.pending.lock().expect("pending lock");
         map.retain(|_, p| p.expires > now);
+        // Sweeping first means the cap only bites when that many sign-ins are
+        // genuinely in flight inside the TTL. Refusing the new one rather than
+        // evicting an old one is deliberate: evicting would let a flood of
+        // requests break the sign-in someone is halfway through, turning a
+        // memory bound into a way to deny them access.
+        if map.len() >= MAX_PENDING && !map.contains_key(state) {
+            tracing::warn!(
+                pending = map.len(),
+                "refusing to start another sign-in: too many are already in flight. If this is \
+                 not a burst of real users, something is calling /auth/login in a loop"
+            );
+            return false;
+        }
         map.insert(state.to_string(), pending);
+        true
     }
 
     /// Single use: a code may be redeemed once, so the record goes with it.
@@ -388,7 +412,13 @@ fn safe_next(next: Option<String>) -> String {
     let ok = candidate.starts_with('/')
         && !candidate.starts_with("//")
         && !candidate.contains('\\')
-        && !candidate.contains("://");
+        && !candidate.contains("://")
+        // Control characters cannot appear in a `Location` header, and a
+        // browser strips tabs and newlines from a URL before acting on it — so
+        // one here is either an attempt to smuggle something past the checks
+        // above or a response that will not build. Neither is a redirect worth
+        // attempting.
+        && !candidate.chars().any(char::is_control);
     if ok { candidate } else { "/".to_string() }
 }
 
@@ -423,7 +453,7 @@ pub async fn login(
     let (url, csrf, nonce) = request.set_pkce_challenge(challenge).url();
 
     let state_value = csrf.secret().clone();
-    auth.remember_pending(
+    if !auth.remember_pending(
         &state_value,
         Pending {
             verifier,
@@ -431,7 +461,11 @@ pub async fn login(
             next: safe_next(q.next),
             expires: OffsetDateTime::now_utc() + Duration::minutes(PENDING_TTL_MINUTES),
         },
-    );
+    ) {
+        return Err(AuthError::busy(
+            "too many sign-ins are already in progress; try again in a moment",
+        ));
+    }
 
     Ok((
         [(
@@ -658,6 +692,16 @@ impl AuthError {
         }
     }
 
+    /// 503 rather than 500: nothing is broken, and a proxy or a browser may
+    /// reasonably retry a moment later.
+    fn busy(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            internal: None,
+        }
+    }
+
     fn internal(e: anyhow::Error) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -820,6 +864,42 @@ mod tests {
         assert!(auth.take_pending("old").is_none());
     }
 
+    /// `/auth/login` needs no session, and each call holds a state, a nonce and
+    /// a PKCE verifier for fifteen minutes — so without a ceiling, requests
+    /// nobody authenticated grow this map for as long as they keep arriving.
+    #[test]
+    fn half_finished_sign_ins_cannot_grow_without_limit() {
+        let auth = Authenticator::new(&Config::default());
+        let pending = || Pending {
+            verifier: PkceCodeVerifier::new("v".repeat(43)),
+            nonce: Nonce::new("n".into()),
+            next: "/".into(),
+            expires: OffsetDateTime::now_utc() + Duration::minutes(PENDING_TTL_MINUTES),
+        };
+
+        for i in 0..MAX_PENDING {
+            assert!(
+                auth.remember_pending(&format!("state-{i}"), pending()),
+                "sign-in {i} is within the cap and must be accepted"
+            );
+        }
+        assert!(
+            !auth.remember_pending("one-too-many", pending()),
+            "past the cap a new sign-in is refused rather than making room"
+        );
+
+        // And the refusal must not have cost anyone their sign-in: evicting to
+        // make space would turn a memory bound into a way to deny access.
+        assert!(
+            auth.take_pending("state-0").is_some(),
+            "the oldest in-flight sign-in must still complete"
+        );
+        assert!(
+            auth.remember_pending("now-there-is-room", pending()),
+            "taking one should free a slot"
+        );
+    }
+
     /// Where sign-in is switched off there is still exactly one authorization
     /// path — the caller is simply a local administrator.
     #[test]
@@ -877,6 +957,12 @@ mod tests {
             "/\\evil.example.com",
             "javascript:alert(1)",
             "",
+            // A browser strips these from a URL before acting on it, and they
+            // cannot go in a `Location` header either.
+            "/\nevil",
+            "/\revil",
+            "/\tevil",
+            "/ok\u{0}",
         ] {
             assert_eq!(
                 safe_next(Some(hostile.into())),

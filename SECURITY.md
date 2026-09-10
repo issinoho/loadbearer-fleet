@@ -38,6 +38,17 @@ It:
 - **does not terminate TLS.** Put a reverse proxy in front of it;
 - **reads** the collection folder and never writes to it; **writes** the index,
   and the document archive if `archive_dir` is set;
+- **treats the collection folder as untrusted input**, because anything that
+  can write there controls it — in the documented deployment, every machine in
+  the estate. A document is refused above **16 MB**, on its size on disk before
+  it is read and again on what it decompresses to, so a `.json.gz` cannot turn
+  a few megabytes on the share into gigabytes in memory. A rejected file is
+  reported and the rest of the scan continues;
+- **caps sign-ins in flight** at 1024, since `/auth/login` needs no session and
+  each call holds a state, a nonce and a PKCE verifier for fifteen minutes.
+  Past the cap a *new* sign-in is refused with a 503 rather than an existing
+  one being evicted, so a flood cannot break a sign-in somebody is halfway
+  through;
 - signs users in with OpenID Connect (authorization code flow with PKCE, no
   client secret required), holding sessions **in memory** keyed by the SHA-256
   of an opaque random token, in an `HttpOnly`, `SameSite=Lax` cookie marked
@@ -96,6 +107,11 @@ been audited":
   indistinguishable from one that doesn't exist, that both halves of the
   sign-in CSRF defence are required, that the post-sign-in redirect cannot
   leave the site, and that sessions expire and are stored only as hashes.
+  Also, from the input side: that a real compression bomb — built in the test,
+  not mocked — is refused *before* it is decompressed, that an oversized plain
+  document is refused on its size alone, and that half-finished sign-ins cannot
+  grow without limit. Each of those three was watched failing with its guard
+  removed before being kept.
 - **Not verified end to end:** the authorization-code exchange and ID-token
   verification, which need a live identity provider. Those rest on the
   [`openidconnect`](https://crates.io/crates/openidconnect) crate. Discovery,

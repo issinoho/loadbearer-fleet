@@ -132,6 +132,21 @@ fn set_aside(path: &Path, found: i64) -> Result<()> {
     Ok(())
 }
 
+/// The largest document this will read, compressed or not.
+///
+/// A result is about 40 KB, so this is roughly 400x headroom — big enough that
+/// no real document will ever meet it, small enough that a hostile one cannot
+/// exhaust the machine. Both halves matter, because **anything that can write
+/// to the collection folder controls this input**, and in the documented
+/// deployment that is every machine in the estate.
+///
+/// Without a cap, gzip's ~1030:1 ratio turns 16 MB on the share into 16 GB in
+/// memory, and the startup scan pays that cost too — so a single file could
+/// stop the dashboard coming up at all, which is the failure that hides every
+/// other one. Rejecting on size has to happen *before* the read, because the
+/// schema reader rejecting the document afterwards is far too late.
+const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Read a result document, transparently un-gzipping a `.json.gz`.
 ///
 /// Two reasons it handles both. The document archive is gzipped — a result is
@@ -140,14 +155,45 @@ fn set_aside(path: &Path, found: i64) -> Result<()> {
 /// gzip, at which point a collector can write `.json.gz` directly and this
 /// reads it without being told.
 fn read_document(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+
+    // Refuse on the file's own size before reading it, so a large `.json` is
+    // never held in memory at all.
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    if len > MAX_DOCUMENT_BYTES {
+        anyhow::bail!(
+            "{} is {} bytes, over the {} byte limit for a result document — a result is about \
+             40 KB, so this is not one",
+            path.display(),
+            len,
+            MAX_DOCUMENT_BYTES
+        );
+    }
+
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if path.extension().and_then(|e| e.to_str()) != Some("gz") {
         return String::from_utf8(bytes)
             .with_context(|| format!("{} is not UTF-8", path.display()));
     }
+
+    // Read one byte past the limit rather than up to it, so hitting the cap is
+    // distinguishable from a document that happens to be exactly that long.
     let mut text = String::new();
-    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&bytes[..]), &mut text)
+    flate2::read::GzDecoder::new(&bytes[..])
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_string(&mut text)
         .with_context(|| format!("decompressing {}", path.display()))?;
+    if text.len() as u64 > MAX_DOCUMENT_BYTES {
+        anyhow::bail!(
+            "{} decompresses to over {} bytes from {} on disk, which is a compression bomb \
+             rather than a result document",
+            path.display(),
+            MAX_DOCUMENT_BYTES,
+            len
+        );
+    }
     Ok(text)
 }
 
@@ -748,6 +794,80 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(name)
+    }
+
+    /// Anything that can write to the collection folder controls this input,
+    /// and in the documented deployment that is every machine in the estate.
+    /// gzip reaches about 1030:1, so without a cap a few megabytes on the share
+    /// become gigabytes in memory — and the startup scan pays the same cost, so
+    /// one file could stop the dashboard coming up at all.
+    ///
+    /// Rejecting has to happen before the whole thing is in memory. The schema
+    /// reader refusing it afterwards is far too late, which is exactly what it
+    /// used to do.
+    #[test]
+    fn a_compression_bomb_is_refused_before_it_is_decompressed() {
+        use std::io::Write as _;
+
+        let dir = scratch("bomb");
+        let path = dir.join("bomb.json.gz");
+        let mut gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).expect("create"),
+            flate2::Compression::best(),
+        );
+        // Compresses to a few kilobytes; well over the cap once expanded.
+        let chunk = vec![b'A'; 1024 * 1024];
+        for _ in 0..(MAX_DOCUMENT_BYTES / chunk.len() as u64 + 2) {
+            gz.write_all(&chunk).expect("write");
+        }
+        gz.finish().expect("finish");
+
+        let on_disk = std::fs::metadata(&path).expect("metadata").len();
+        assert!(
+            on_disk < MAX_DOCUMENT_BYTES,
+            "the point of the test is a small file that expands past the cap; this one is \
+             {on_disk} bytes on disk"
+        );
+
+        // Deliberately not `expect_err`: on a regression that would print the
+        // whole decompressed document, and 17 MB of "AAAA..." in a CI log is
+        // its own small outage.
+        let err = match read_document(&path) {
+            Ok(text) => panic!("read {} bytes instead of refusing", text.len()),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("compression bomb"),
+            "refused, but not for the right reason: {err}"
+        );
+
+        // And through the real scan path, where it must be reported and
+        // survived rather than taking the process with it.
+        let mut idx = Index::open_in_memory().unwrap();
+        let report = idx.scan(&dir).expect("a bomb must not fail the whole scan");
+        assert_eq!(report.ingested, 0);
+        assert_eq!(report.rejected.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The uncompressed path has the same exposure without needing gzip at all.
+    #[test]
+    fn an_oversized_document_is_refused_on_its_size_alone() {
+        let dir = scratch("oversize");
+        let path = dir.join("big.json");
+        std::fs::write(&path, vec![b'A'; MAX_DOCUMENT_BYTES as usize + 1]).expect("write");
+
+        // Deliberately not `expect_err`: on a regression that would print the
+        // whole decompressed document, and 17 MB of "AAAA..." in a CI log is
+        // its own small outage.
+        let err = match read_document(&path) {
+            Ok(text) => panic!("read {} bytes instead of refusing", text.len()),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("over the"), "wrong refusal: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
