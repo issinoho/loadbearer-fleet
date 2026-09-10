@@ -15,6 +15,7 @@ mod auth;
 mod config;
 mod index;
 mod metrics;
+mod reference;
 mod schema;
 mod service;
 mod web;
@@ -119,6 +120,12 @@ enum Command {
     },
     /// Print a starter configuration file, placeholders included.
     InitConfig,
+    /// Print the command-line and configuration reference as Markdown.
+    ///
+    /// Generated from the definitions in this binary, so it describes the
+    /// version you are holding rather than whatever the documentation says.
+    /// The wiki page is this output.
+    Reference,
     /// Contact the identity provider and report what the settings resolve to,
     /// so a wrong tenant fails at deploy time rather than at first sign-in.
     CheckAuth,
@@ -134,6 +141,9 @@ enum ServiceAction {
     /// The entry point the Windows service controller calls. Not meant to be
     /// run by hand — use `serve` for that.
     Run {
+        /// Passed through from `service install`, which records it in the
+        /// service's own command line so the refusal is agreed to once at
+        /// install time rather than on every start.
         #[arg(long)]
         allow_remote: bool,
     },
@@ -147,6 +157,9 @@ enum ServiceAction {
         /// omitted for an account that needs one.
         #[arg(long, value_name = "PASSWORD")]
         password: Option<String>,
+        /// Record the non-loopback agreement in the installed service's
+        /// command line, so `service run` carries it. Same meaning, and the
+        /// same warning, as `serve --allow-remote`.
         #[arg(long)]
         allow_remote: bool,
     },
@@ -225,11 +238,21 @@ fn init_logging(log: &config::Log, cli_level: Option<&str>) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    // `init-config` writes to stdout and must stay pipeable, so it runs before
-    // any logging is set up.
-    if matches!(cli.command, Command::InitConfig) {
-        print!("{}", Config::starter());
-        return Ok(());
+    // Both of these write a document to stdout and must stay pipeable, so they
+    // run before logging is set up — and before the config is loaded, since
+    // `reference` describes the settings rather than needing them and must
+    // work on a machine that has never been configured.
+    match cli.command {
+        Command::InitConfig => {
+            print!("{}", Config::starter());
+            return Ok(());
+        }
+        Command::Reference => {
+            use clap::CommandFactory;
+            print!("{}", reference::markdown(Cli::command()));
+            return Ok(());
+        }
+        _ => {}
     }
     // CLI over file over default, so a service can be configured in a file and
     // still be poked at by hand. The config is loaded before logging is set up
@@ -259,7 +282,7 @@ fn main() -> Result<()> {
     );
 
     match &cli.command {
-        Command::InitConfig => unreachable!("handled above"),
+        Command::InitConfig | Command::Reference => unreachable!("handled above"),
         Command::Scan { dir } => {
             let mut idx = index::Index::open(&config.server.index)?
                 .with_archive(config.server.archive_dir.as_deref())?;

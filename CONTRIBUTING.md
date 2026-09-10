@@ -137,6 +137,18 @@ Leave `Cargo.toml`'s version and `CHANGELOG.md` alone — that happens at releas
 time, and the steps are in
 [Releases](README.md#releases).
 
+**If you add or change a command, a flag or a configuration key, don't write it
+up by hand.** `src/reference.rs` builds the reference from the clap definition
+and from `Config::starter()`, so the doc comment *is* the documentation. Two
+tests hold that line: one fails if any command or argument has no help text,
+and one fails if a configuration key never reaches `init-config` — which is
+what the reference embeds. The wiki page is regenerated from the binary at
+release time:
+
+```
+loadbearer-fleet reference > Command-Line-and-Configuration.md
+```
+
 ## Reporting bugs
 
 Open a [GitHub issue](https://github.com/issinoho/loadbearer-fleet/issues/new/choose).

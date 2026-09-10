@@ -255,6 +255,13 @@ loadbearer-fleet backup fleet-2026-09-10.db        # consistent snapshot, safe w
 loadbearer-fleet forget PC-01                      # remove a decommissioned machine
 ```
 
+Those are the ones worth knowing by heart. For the rest — every command, every
+option, every configuration key — see
+[Command line and configuration](https://github.com/issinoho/loadbearer-fleet/wiki/Command-Line-and-Configuration)
+in the wiki, or `--help`, or `loadbearer-fleet reference` to print that same
+page from the binary you are actually holding. The wiki page *is* that output,
+so it cannot describe a flag that does not exist.
+
 Rescanning is cheap and idempotent: every run is keyed by the SHA-256 of the
 document it came from, so an unchanged file is a no-op and a file the collector
 renamed on copy doesn't become a second run.
@@ -740,7 +747,7 @@ machines need attention" is how an unreachable share would otherwise look.
 
 ## Releases
 
-Tagging is the whole trigger, but four things have to be true first, and the
+Tagging is the whole trigger, but five things have to be true first, and the
 release workflow only catches one of them:
 
 1. **Bump `version` in `Cargo.toml`**, then `cargo build` so `Cargo.lock`
@@ -753,7 +760,14 @@ release workflow only catches one of them:
 3. **Update the version in the README's download commands.** Getting started
    names the archive, so `$V` in those two snippets goes stale on every
    release and it is the first thing a new user copies.
-4. **Check CI is green on the commit you are about to tag** — the release
+4. **Regenerate the wiki reference** if the CLI or the config file changed.
+   It is a separate repository, so nothing in CI can notice it has gone stale:
+   ```
+   loadbearer-fleet reference > Command-Line-and-Configuration.md
+   ```
+   The tests guarantee everything is *documented*, not that the published page
+   is current.
+5. **Check CI is green on the commit you are about to tag** — the release
    workflow builds and publishes without re-running the test suite.
 
 Then:

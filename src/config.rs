@@ -472,6 +472,14 @@ index = "fleet-index.db"
 #
 # archive_dir = 'PUT-THE-PATH-FOR-THE-DOCUMENT-ARCHIVE-HERE'
 
+# How often to re-read the collection folder by itself. This is what makes it a
+# service rather than a command: a dashboard that only refreshes when somebody
+# happens to click is out of date exactly when nobody is looking at it. Zero
+# switches the timer off and leaves rescanning to the button. Raise it if the
+# share is large - every scan re-reads and re-hashes every document, which is
+# what makes indexing idempotent by content.
+scan_interval_minutes = 15
+
 [auth]
 # "oidc" for single sign-on, "none" for an unauthenticated dashboard — which is
 # refused on anything but a loopback bind.
@@ -504,6 +512,12 @@ groups_claim = "groups"
 
 # How long a session lasts before signing in again.
 session_hours = 8
+
+# Scopes beyond "openid profile email". Entra needs none of these for group
+# claims - those come from the token configuration on the app registration
+# rather than from a scope - so leave it empty unless your provider says
+# otherwise.
+extra_scopes = []
 
 [log]
 # "text" for a console, "json" for a log collector.
