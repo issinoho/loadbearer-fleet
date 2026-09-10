@@ -1,3 +1,5 @@
+![loadbearer-fleet — compare every machine with the machines like it](assets/banner.svg)
+
 # loadbearer-fleet
 
 A fleet dashboard over collected [loadbearer](https://github.com/issinoho/loadbearer)
@@ -93,6 +95,11 @@ tools. Nothing else: TLS is rustls, so there is no OpenSSL to find.
 ```
 http://127.0.0.1:8787
 ```
+
+![The overview: how many machines need attention, the grade distribution, findings split by queue](assets/screenshot-overview.png)
+
+*The overview, rendered from the four anonymised result files in
+`tests/fixtures` — real measurements, identifiers replaced.*
 
 That's it. The overview shows your one machine and its grade against the
 reference baseline, and **0 machines need attention** — with nothing to compare

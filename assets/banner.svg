@@ -1,0 +1,48 @@
+<!--
+  README header. Same construction as loadbearer's og-image so the two projects
+  read as a family: the gradient, the cyan rule across the top, the mark, then
+  the wordmark with "fleet" carrying the weight — matching how the dashboard's
+  own topbar sets it.
+
+  The dark background is deliberate: GitHub renders a README on white or on
+  near-black depending on the reader's theme, and a dark panel sits correctly on
+  both, where a transparent one would have to pick a side.
+
+  Text is drawn with the same system sans the dashboard uses, with fallbacks,
+  because a banner that depends on a webfont is a banner that renders wrong
+  wherever the font isn't.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300"
+     role="img" aria-label="loadbearer-fleet — compare every machine with the machines like it">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0f14"/>
+      <stop offset="1" stop-color="#111a24"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="300" fill="url(#bg)"/>
+  <rect width="1200" height="6" fill="#22d3ee"/>
+
+  <g transform="translate(72,63) scale(0.68)">
+    <rect width="256" height="256" rx="56" fill="#0f1720" stroke="#232c38" stroke-width="2"/>
+    <path d="M54,103 Q54,96 61,96 H75 Q82,96 82,103 V204 H54 Z" fill="#22d3ee"/>
+    <path d="M94,71 Q94,64 101,64 H115 Q122,64 122,71 V204 H94 Z" fill="#22d3ee"/>
+    <path d="M134,157 Q134,150 141,150 H155 Q162,150 162,157 V204 H134 Z" fill="#e34948"/>
+    <path d="M174,89 Q174,82 181,82 H195 Q202,82 202,89 V204 H174 Z" fill="#22d3ee"/>
+    <rect x="40" y="204" width="176" height="18" rx="9" fill="#22d3ee"/>
+  </g>
+
+  <text x="286" y="134" font-family="system-ui, 'Segoe UI', Inter, sans-serif" font-size="72">
+    <tspan fill="#9aa7b4" font-weight="500">loadbearer</tspan><tspan
+           fill="#e8ecf1" font-weight="800"> fleet</tspan>
+  </text>
+
+  <text x="290" y="184" font-family="system-ui, 'Segoe UI', Inter, sans-serif"
+        font-size="30" font-weight="500" fill="#9aa7b4">Compare every machine with the machines like it.</text>
+
+  <g font-family="ui-monospace, 'JetBrains Mono', Consolas, monospace" font-size="24">
+    <text x="290" y="240" fill="#6b7887">$</text>
+    <text x="316" y="240" fill="#e8ecf1">loadbearer-fleet serve \\fileserver\loadbearer</text>
+    <text x="290" y="276" fill="#9aa7b4">3 machines need attention</text>
+  </g>
+</svg>

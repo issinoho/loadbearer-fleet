@@ -1,0 +1,38 @@
+<!--
+  loadbearer-fleet.
+
+  Deliberately a sibling of loadbearer's mark, not a copy of it: the same dark
+  rounded square, the same cyan, the same base bar the structure stands on.
+
+  What changes is what stands on that base. loadbearer draws a beam borne by
+  three even columns — the load being carried. This draws a row of columns of
+  *differing* heights, because this tool doesn't bear the load, it measures the
+  things that do; and one of them is short and red, because finding that one is
+  the entire point. Height and hue both carry it, so it survives being read in
+  greyscale or by someone who can't tell the red from the cyan.
+
+  One file for both themes: the dark container works on light and dark browser
+  chrome alike.
+
+  Two things that only became apparent once it was rendered and looked at.
+  The columns are rounded at the data end and square where they meet the base
+  — the rule the dashboard's own charts follow — because rounded bottoms left a
+  notch at each corner and read as floating above the base. And they are inset
+  well inside the base, as loadbearer's are, so the base's own rounded ends
+  fall outside their footprint instead of biting a dark wedge out of the outer
+  two.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256"
+     role="img" aria-label="loadbearer-fleet">
+  <rect width="256" height="256" rx="56" fill="#0f1720"/>
+
+  <!-- the fleet: four machines, measured -->
+  <path d="M54,103 Q54,96 61,96 H75 Q82,96 82,103 V204 H54 Z" fill="#22d3ee"/>
+  <path d="M94,71 Q94,64 101,64 H115 Q122,64 122,71 V204 H94 Z" fill="#22d3ee"/>
+  <!-- the one worth looking at -->
+  <path d="M134,157 Q134,150 141,150 H155 Q162,150 162,157 V204 H134 Z" fill="#e34948"/>
+  <path d="M174,89 Q174,82 181,82 H195 Q202,82 202,89 V204 H174 Z" fill="#22d3ee"/>
+
+  <!-- the base they all stand on, shared with loadbearer's mark -->
+  <rect x="40" y="204" width="176" height="18" rx="9" fill="#22d3ee"/>
+</svg>

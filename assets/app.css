@@ -116,15 +116,12 @@ a { color: inherit; }
 
 .brand { display: flex; align-items: center; gap: 8px; }
 
-.brand-mark {
-  width: 12px;
-  height: 20px;
-  border-radius: 2px 2px 4px 4px;
-  background: var(--series-1);
-  display: inline-block;
-}
+/* The mark carries its own dark panel, so it needs no theming — it sits
+   correctly on both surfaces, which is the reason it has one. */
+.brand-mark { display: block; border-radius: 5px; }
 
 .brand-name { font-size: 15px; color: var(--text-secondary); }
+/* "fleet" carries the weight, as in the wordmark. */
 .brand-name b { color: var(--text-primary); font-weight: 600; }
 
 .tabs { display: flex; gap: 2px; margin-left: 12px; }

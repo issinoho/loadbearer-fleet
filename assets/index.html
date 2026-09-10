@@ -11,6 +11,10 @@
   `default-src 'self'` and mean it.
 -->
 <link rel="stylesheet" href="/app.css">
+<!-- SVG rather than .ico: it is text, so it compiles into the binary with
+     everything else, and it scales to whatever size the browser or the pinned
+     tab wants. -->
+<link rel="icon" type="image/svg+xml" href="/logo-mark.svg">
 </head>
 <!-- data-palette lists the hexes used as marks, so the dataviz validator can be
      pointed at this page directly rather than at a copy of the list. -->
@@ -18,7 +22,7 @@
 
 <header class="topbar">
   <div class="brand">
-    <span class="brand-mark" aria-hidden="true"></span>
+    <img class="brand-mark" src="/logo-mark.svg" alt="" width="22" height="22">
     <span class="brand-name">loadbearer <b>fleet</b></span>
   </div>
 

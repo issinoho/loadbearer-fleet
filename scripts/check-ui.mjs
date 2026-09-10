@@ -117,6 +117,7 @@ function auditChart(name, host) {
   check(name, !!root, 'no <svg> was produced');
   if (!root) return;
   auditSvg(name, root);
+  auditAxisLabels(name, host);
 }
 
 /** Every <svg> anywhere under a rendered view. */
@@ -208,6 +209,32 @@ function auditSvg(name, root) {
   }
 }
 
+/**
+ * No axis may print the same tick twice.
+ *
+ * The ticks can be numerically correct and still render as 0, 1, 1, 2, 2 once
+ * an integer formatter has been through them, which is what a two-machine bar
+ * chart used to do. Numbers alone can't catch that, so this reads the text.
+ */
+function auditAxisLabels(name, host) {
+  const root = host.children ? host.children.find((c) => c.tagName === 'svg') : null;
+  if (!root) return;
+  const seen = new Map();
+  walk(root, (n) => {
+    // The y-axis ticks: right-aligned text in the left gutter.
+    if (n.tagName !== 'text' || n.attrs['text-anchor'] !== 'end') return;
+    const text = textOf(n);
+    if (!/^[-\d]/.test(text)) return;
+    seen.set(text, (seen.get(text) || 0) + 1);
+  });
+  for (const [text, times] of seen) {
+    if (times > 1) {
+      failures.push(`${name}: the y-axis prints ${JSON.stringify(text)} ${times} times — `
+        + 'correct ticks, duplicated labels');
+    }
+  }
+}
+
 /** x-axis labels must fit the band they sit in, or neighbours collide. */
 function auditLabelFit(name, host, bandCount) {
   const root = host.children.find((c) => c.tagName === 'svg');
@@ -245,6 +272,19 @@ function host(w = 700) {
   });
   auditChart('columnChart/grades', h);
   auditLabelFit('columnChart/grades', h, 6);
+}
+
+// A small estate, which is where the axis used to print 0, 1, 1, 2, 2: the
+// tallest bar is 2, so without a minimum step the ticks land on halves and the
+// integer formatter prints each one twice.
+{
+  const h = host();
+  mod.columnChart(h, {
+    rows: [['S', 1], ['A', 2], ['B', 1], ['C', 0], ['D', 0], ['F', 0]]
+      .map(([label, value]) => ({ label, value })),
+    unit: 'machines',
+  });
+  auditChart('columnChart/small-counts', h);
 }
 
 // Score bands: more categories, longer labels - the collision case.

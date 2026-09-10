@@ -50,6 +50,9 @@ use crate::metrics::{self, Runtime, ScanStamp};
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
+// An SVG rather than an .ico so it is text, and compiles in with everything
+// else instead of needing `include_bytes!` and a binary in the repository.
+const LOGO_SVG: &str = include_str!("../assets/logo-mark.svg");
 
 pub struct AppState {
     index: Mutex<Index>,
@@ -430,6 +433,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/app.js",
             get(|| async { asset(APP_JS, "text/javascript; charset=utf-8") }),
+        )
+        // The favicon is fetched for every page including the sign-in failure
+        // page, so like the stylesheet it stays outside the session check.
+        .route(
+            "/logo-mark.svg",
+            get(|| async { asset(LOGO_SVG, "image/svg+xml") }),
         )
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
@@ -941,7 +950,7 @@ mod tests {
         // A service manager has to be able to ask whether the process is alive,
         // and the sign-in failure page is styled by the same stylesheet it
         // would otherwise be unable to load.
-        for uri in ["/api/health", "/app.css", "/app.js"] {
+        for uri in ["/api/health", "/app.css", "/app.js", "/logo-mark.svg"] {
             assert_eq!(get(&state, uri, None).await.status, StatusCode::OK, "{uri}");
         }
         assert!(
@@ -1139,6 +1148,31 @@ mod tests {
             squeezed * 2 < plain,
             "{squeezed} compressed against {plain} plain is not worth the CPU"
         );
+    }
+
+    /// The page names the favicon, so the two have to agree: a link tag
+    /// pointing at a 404 is a broken icon in every tab and an error nowhere.
+    #[tokio::test]
+    async fn the_favicon_the_page_asks_for_is_the_one_served() {
+        let state = state_for(&Config::default());
+
+        let page = get(&state, "/", None).await.body;
+        let href = page
+            .lines()
+            .find(|l| l.contains("rel=\"icon\""))
+            .and_then(|l| l.split("href=\"").nth(1))
+            .and_then(|l| l.split('"').next())
+            .expect("the page should declare an icon")
+            .to_string();
+        assert_eq!(href, "/logo-mark.svg");
+
+        let icon = get(&state, &href, None).await;
+        assert_eq!(icon.status, StatusCode::OK);
+        assert!(icon.body.contains("<svg"), "not an SVG: {}", icon.body);
+
+        // The topbar uses the same file, so there is one mark rather than two
+        // that can drift apart.
+        assert!(page.contains("src=\"/logo-mark.svg\""));
     }
 
     #[tokio::test]

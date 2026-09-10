@@ -104,12 +104,24 @@ function debounce(fn, ms) {
   return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
 }
 
-/** Y-axis ticks on clean round numbers, per the marks spec. */
-export function niceTicks(max, count = 4) {
+/**
+ * Y-axis ticks on clean round numbers, per the marks spec.
+ *
+ * `minStep` exists because these axes count whole things. Without it, a chart
+ * whose tallest bar is 2 machines gets a step of 0.5 and an axis reading
+ * 0, 1, 1, 2, 2 — the ticks are right, but the integer formatter prints each
+ * one twice. One or two machines in a grade bucket is the *normal* case on a
+ * small estate, so it showed up immediately once the page was looked at rather
+ * than reasoned about.
+ */
+export function niceTicks(max, count = 4, minStep = 0) {
   if (!(max > 0)) return { max: 1, ticks: [0, 1] };
   const raw = max / count;
   const mag = 10 ** Math.floor(Math.log10(raw));
-  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw) || 10 * mag;
+  const step = Math.max(
+    minStep,
+    [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw) || 10 * mag,
+  );
   const top = Math.ceil(max / step) * step;
   const ticks = [];
   for (let v = 0; v <= top + 1e-9; v += step) ticks.push(v);
@@ -203,7 +215,8 @@ export function columnChart(host, { rows, fill, unit = '', tipTitle }) {
   const plotH = 170;
   const height = plotH + m.top + m.bottom; // the fixed height includes the axis band
   const plotW = width - m.left - m.right;
-  const { max, ticks } = niceTicks(Math.max(...rows.map((r) => r.value), 0));
+  // Whole machines and whole scores, so never a fractional tick.
+  const { max, ticks } = niceTicks(Math.max(...rows.map((r) => r.value), 0), 4, 1);
   const y = (v) => m.top + plotH - (v / max) * plotH;
   const band = plotW / Math.max(rows.length, 1);
   const barW = Math.min(24, Math.max(6, band - 14));
@@ -408,7 +421,7 @@ export function lineChart(host, { points }) {
   const times = points.map((p) => +new Date(p.taken_at));
   const t0 = Math.min(...times);
   const t1 = Math.max(...times);
-  const { max, ticks } = niceTicks(Math.max(...points.map((p) => p.score || 0)));
+  const { max, ticks } = niceTicks(Math.max(...points.map((p) => p.score || 0)), 4, 1);
   const x = (t) => (t1 === t0 ? m.left + plotW / 2 : m.left + ((t - t0) / (t1 - t0)) * plotW);
   const y = (v) => m.top + plotH - (v / max) * plotH;
   const root = svg('svg', { class: 'chart', viewBox: `0 0 ${width} ${height}`, width, height });
