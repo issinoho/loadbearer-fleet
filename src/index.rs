@@ -208,6 +208,26 @@ pub struct Index {
     archive: Option<std::path::PathBuf>,
 }
 
+/// A machine that `forget` could act on.
+#[derive(Debug, Clone)]
+pub struct Forgettable {
+    pub key: String,
+    pub hostname: Option<String>,
+    pub runs: i64,
+}
+
+/// What forgetting a machine removes, and what it can't.
+#[derive(Debug, Default, Clone)]
+pub struct ForgetPlan {
+    pub runs: i64,
+    pub archived: Vec<std::path::PathBuf>,
+    /// Result files still in the collection folder. While any of these exist,
+    /// the next scan will index the machine again — which is the one thing
+    /// about removal that surprises people, so it is reported rather than
+    /// assumed.
+    pub sources_still_present: Vec<String>,
+}
+
 /// What one scan did, for logging and for the UI's "last refreshed" line.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanReport {
@@ -604,6 +624,88 @@ impl Index {
         Ok(())
     }
 
+    /// One machine, as `forget` needs to see it before deciding anything.
+    pub fn machines_matching(&self, needle: &str) -> Result<Vec<Forgettable>> {
+        // Key first, then hostname, because the key is what the index is
+        // actually organised by and an operator will usually type a hostname.
+        let mut stmt = self.conn.prepare(
+            "SELECT machine_key, hostname, COUNT(*) FROM run
+               WHERE machine_key = ?1 COLLATE NOCASE OR hostname = ?1 COLLATE NOCASE
+               GROUP BY machine_key ORDER BY machine_key",
+        )?;
+        let rows = stmt
+            .query_map([needle], |r| {
+                Ok(Forgettable {
+                    key: r.get(0)?,
+                    hostname: r.get(1)?,
+                    runs: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// What `forget` would do, without doing it.
+    pub fn forget_plan(&self, key: &str) -> Result<ForgetPlan> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT content_hash, source_path FROM run WHERE machine_key = ?1")?;
+        let rows = stmt
+            .query_map([key], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut plan = ForgetPlan::default();
+        for (hash, source) in rows {
+            plan.runs += 1;
+            if let Some(root) = &self.archive {
+                let doc = root.join(&hash[..2]).join(format!("{hash}.json.gz"));
+                if doc.exists() {
+                    plan.archived.push(doc);
+                }
+            }
+            // Only what is still there: a path recorded on another server, or
+            // a file already deleted, is not something to tell them about.
+            if Path::new(&source).exists() {
+                plan.sources_still_present.push(source);
+            }
+        }
+        plan.sources_still_present.sort();
+        plan.sources_still_present.dedup();
+        Ok(plan)
+    }
+
+    /// Remove a machine: its runs, and the documents this archived for them.
+    ///
+    /// Deliberately **not** the files in the collection folder. This tool has
+    /// no code that writes there, and deleting an estate's authoritative
+    /// results is not a thing it should start doing on the strength of a
+    /// hostname typed at a prompt. The plan reports which files are still
+    /// there instead, because while they are, the next scan will index this
+    /// machine straight back.
+    pub fn forget(&mut self, key: &str) -> Result<ForgetPlan> {
+        let plan = self.forget_plan(key)?;
+        if plan.runs == 0 {
+            return Ok(plan);
+        }
+
+        // The child tables declare ON DELETE CASCADE and `foreign_keys` is on,
+        // so components, subtests and tags go with their runs.
+        let removed = self
+            .conn
+            .execute("DELETE FROM run WHERE machine_key = ?1", [key])?;
+        debug_assert_eq!(removed as i64, plan.runs);
+
+        for doc in &plan.archived {
+            std::fs::remove_file(doc)
+                .with_context(|| format!("removing the archived document {}", doc.display()))?;
+        }
+        // Leave the two-character shard directories: empty ones cost nothing
+        // and removing them races another scan writing into them.
+        Ok(plan)
+    }
+
     pub fn run_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -721,6 +823,161 @@ mod tests {
         let conn = Connection::open(path).expect("open");
         conn.query_row("SELECT COUNT(*) FROM run", [], |r| r.get(0))
             .expect("count")
+    }
+
+    /// A scan only ever adds, so removing a machine has to be asked for. This
+    /// checks the whole of it goes: runs, and the rows that hang off them.
+    #[test]
+    fn forgetting_a_machine_takes_its_runs_and_everything_under_them() {
+        let mut idx = Index::open_in_memory().unwrap();
+        for f in ["win-modern.json", "linux-throttled.json", "low-end.json"] {
+            idx.ingest_file(&fixture(f)).unwrap();
+        }
+        let before: i64 = idx
+            .conn
+            .query_row("SELECT COUNT(*) FROM subtest", [], |r| r.get(0))
+            .unwrap();
+        assert!(before > 0);
+
+        let found = idx.machines_matching("FLEET-WIN-01").unwrap();
+        assert_eq!(found.len(), 1, "matched by hostname");
+        assert_eq!(found[0].runs, 1);
+
+        let plan = idx.forget(&found[0].key).unwrap();
+        assert_eq!(plan.runs, 1);
+        assert_eq!(idx.run_count().unwrap(), 2, "the other two are untouched");
+        assert_eq!(idx.machine_count().unwrap(), 2);
+
+        // The cascade is the part worth asserting: components, subtests and
+        // tags are separate tables and could easily be orphaned.
+        for table in ["component", "subtest", "tag"] {
+            let orphans: i64 = idx
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE run_id NOT IN (SELECT id FROM run)"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphans, 0, "{table} rows left behind");
+        }
+        assert!(
+            idx.machines_matching("FLEET-WIN-01").unwrap().is_empty(),
+            "and it is gone"
+        );
+    }
+
+    #[test]
+    fn forgetting_removes_the_archived_documents_too() {
+        let dir = scratch("forget-archive");
+        let archive = dir.join("archive");
+        let mut idx = Index::open(&dir.join("i.db"))
+            .unwrap()
+            .with_archive(Some(&archive))
+            .unwrap();
+        idx.ingest_file(&fixture("win-modern.json")).unwrap();
+        idx.ingest_file(&fixture("low-end.json")).unwrap();
+
+        let count_docs = || {
+            walkdir::WalkDir::new(&archive)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .count()
+        };
+        assert_eq!(count_docs(), 2);
+
+        let key = idx.machines_matching("FLEET-WIN-01").unwrap()[0]
+            .key
+            .clone();
+        let plan = idx.forget(&key).unwrap();
+        assert_eq!(plan.archived.len(), 1);
+        assert_eq!(
+            count_docs(),
+            1,
+            "only the forgotten machine's document goes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The surprise worth reporting: while the result file is still on the
+    /// share, the next scan indexes the machine straight back.
+    #[test]
+    fn forgetting_reports_the_source_files_that_would_bring_it_back() {
+        let dir = scratch("forget-source");
+        let results = dir.join("results");
+        std::fs::create_dir_all(&results).unwrap();
+        let source = results.join("PC-01.json");
+        std::fs::copy(fixture("win-modern.json"), &source).unwrap();
+
+        let mut idx = Index::open(&dir.join("i.db")).unwrap();
+        idx.scan(&results).unwrap();
+        let key = idx.machines_matching("FLEET-WIN-01").unwrap()[0]
+            .key
+            .clone();
+
+        let plan = idx.forget(&key).unwrap();
+        assert_eq!(plan.sources_still_present.len(), 1, "{plan:?}");
+        assert!(plan.sources_still_present[0].contains("PC-01.json"));
+
+        // And it does come back, which is why that is worth saying out loud.
+        idx.scan(&results).unwrap();
+        assert_eq!(idx.run_count().unwrap(), 1);
+
+        // Once the file is gone, forgetting sticks.
+        let key = idx.machines_matching("FLEET-WIN-01").unwrap()[0]
+            .key
+            .clone();
+        std::fs::remove_file(&source).unwrap();
+        let plan = idx.forget(&key).unwrap();
+        assert!(plan.sources_still_present.is_empty());
+        idx.scan(&results).unwrap();
+        assert_eq!(idx.run_count().unwrap(), 0, "stays forgotten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plan_alone_changes_nothing() {
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.ingest_file(&fixture("win-modern.json")).unwrap();
+        let key = idx.machines_matching("FLEET-WIN-01").unwrap()[0]
+            .key
+            .clone();
+        let plan = idx.forget_plan(&key).unwrap();
+        assert_eq!(plan.runs, 1);
+        assert_eq!(idx.run_count().unwrap(), 1, "dry run must not remove");
+    }
+
+    /// Hostnames are reissued between machines, so one can match two. Guessing
+    /// which to delete is not a thing to do.
+    #[test]
+    fn one_hostname_can_match_two_machines() {
+        let mut idx = Index::open_in_memory().unwrap();
+        let text = std::fs::read_to_string(fixture("win-modern.json")).unwrap();
+        for serial in ["SN-FIRST", "SN-SECOND"] {
+            let mut doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+            doc["machine"]["identity"]["serial"] = serde_json::json!(serial);
+            idx.ingest_text(&doc.to_string(), Path::new("x.json"))
+                .unwrap();
+        }
+        let found = idx.machines_matching("FLEET-WIN-01").unwrap();
+        assert_eq!(found.len(), 2, "two machines, one reissued hostname");
+        assert!(
+            idx.machines_matching("SN-FIRST").unwrap().len() == 1,
+            "the key is unambiguous"
+        );
+    }
+
+    #[test]
+    fn forgetting_something_that_was_never_there_is_not_an_error() {
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.ingest_file(&fixture("win-modern.json")).unwrap();
+        let plan = idx.forget("no-such-machine").unwrap();
+        assert_eq!(plan.runs, 0);
+        assert_eq!(idx.run_count().unwrap(), 1);
+        assert!(idx.machines_matching("no-such-machine").unwrap().is_empty());
     }
 
     /// The point of the archive: the run survives its own result file being

@@ -92,6 +92,19 @@ enum Command {
         #[arg(long)]
         no_scan: bool,
     },
+    /// Remove a machine from the index, and the documents archived for it.
+    ///
+    /// For a decommissioned machine, or a removal request. Deleting its result
+    /// file from the collection folder is not enough on its own: a scan only
+    /// ever adds, so the run stays indexed until something removes it.
+    Forget {
+        /// Hostname, or the machine key shown in the dashboard.
+        #[arg(value_name = "MACHINE")]
+        machine: String,
+        /// Say what would go, change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Take a consistent copy of the index, safe to run while it is serving.
     ///
     /// For a backup agent to call. The collection folder is the thing actually
@@ -254,6 +267,71 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::Forget { machine, dry_run } => {
+            let mut idx = index::Index::open(&config.server.index)?
+                .with_archive(config.server.archive_dir.as_deref())?;
+
+            let found = idx.machines_matching(machine)?;
+            let target = match found.as_slice() {
+                [] => anyhow::bail!(
+                    "no machine in the index matches {machine:?}. Try the hostname, or the \
+                     machine key the dashboard shows on the drilldown."
+                ),
+                [one] => one.clone(),
+                // Hostnames get reissued, so two machines can share one. Which
+                // of them to forget is not a guess worth making.
+                many => {
+                    let list = many
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "  {}  ({} run(s), hostname {})",
+                                m.key,
+                                m.runs,
+                                m.hostname.as_deref().unwrap_or("none recorded")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(
+                            "
+",
+                        );
+                    anyhow::bail!(
+                        "{machine:?} matches {} machines — hostnames get reissued between \
+                         machines, so pick one by its key:
+{list}",
+                        many.len()
+                    )
+                }
+            };
+
+            let plan = if *dry_run {
+                idx.forget_plan(&target.key)?
+            } else {
+                idx.forget(&target.key)?
+            };
+
+            let verb = if *dry_run { "would remove" } else { "removed" };
+            println!(
+                "{verb} {} run(s) for {} ({})",
+                plan.runs,
+                target.hostname.as_deref().unwrap_or("no hostname recorded"),
+                target.key
+            );
+            if !plan.archived.is_empty() {
+                println!("{verb} {} archived document(s)", plan.archived.len());
+            }
+            if !plan.sources_still_present.is_empty() {
+                println!(
+                    "\nStill in the collection folder — the next scan will index this \
+                     machine again unless these go:"
+                );
+                for path in &plan.sources_still_present {
+                    println!("  {path}");
+                }
+            }
+            Ok(())
+        }
         Command::Backup { file } => {
             let idx = index::Index::open(&config.server.index)?;
             let bytes = idx.backup_to(file)?;
@@ -265,7 +343,9 @@ fn main() -> Result<()> {
             );
             if config.server.archive_dir.is_none() {
                 println!(
-                    "note: no archive_dir is set, so this snapshot is the only copy of any run                      whose result file has since been overwritten. See \"Upgrading\" and                      \"Backup and restore\" in the README."
+                    "note: no archive_dir is set, so this snapshot is the only copy of any \
+                     run whose result file has since been overwritten. See \"Upgrading\" \
+                     and \"Backup and restore\" in the README."
                 );
             }
             Ok(())

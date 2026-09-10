@@ -7,6 +7,17 @@ notes, so each one has to stand on its own.
 
 ## Unreleased
 
+- **`forget <machine>`** removes a machine from the index and deletes the
+  documents archived for it. A scan only ever adds, so deleting a result file
+  from the collection folder left the run indexed and the machine on the
+  dashboard, still counting towards the fleet total and its cohort median —
+  which is the same property that lets the index keep history an overwriting
+  collector has discarded, seen from the other side. Takes a hostname or a
+  machine key, refuses to guess when a reissued hostname matches two machines,
+  and has `--dry-run`. It deliberately does not touch the collection folder;
+  it reports which files are still there, because while they are the next scan
+  indexes the machine straight back.
+
 - **`backup <file>`** takes a consistent snapshot of the index while the
   dashboard is serving, via SQLite's `VACUUM INTO` — copying a live database
   with `cp` is a torn read, and nobody stops a dashboard for a backup agent.

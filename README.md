@@ -196,6 +196,7 @@ loadbearer-fleet init-config > fleet.toml          # a starter config, placehold
 loadbearer-fleet serve --config fleet.toml         # with single sign-on
 loadbearer-fleet check-auth --config fleet.toml    # check the identity provider settings
 loadbearer-fleet backup fleet-2026-09-10.db        # consistent snapshot, safe while serving
+loadbearer-fleet forget PC-01                      # remove a decommissioned machine
 ```
 
 Rescanning is cheap and idempotent: every run is keyed by the SHA-256 of the
@@ -572,6 +573,50 @@ loadbearer-fleet --config fleet.toml backup D:\backups\fleet-2026-09-10.db
 
 It refuses to overwrite an existing file. Restore is: stop the service, put the
 snapshot where `index` points, delete any `-wal`/`-shm` beside it, start.
+
+### Removing a machine — deleting its file is not enough
+
+A scan only ever **adds**. Delete a machine's result file from the collection
+folder and nothing changes: the run stays indexed, the machine stays on the
+dashboard, and it keeps counting towards the fleet total and its cohort's
+median. That is the same property that lets the index hold history an
+overwriting collector has discarded, and it surprises people in the other
+direction.
+
+```
+loadbearer-fleet forget PC-01 --dry-run   # say what would go
+loadbearer-fleet forget PC-01             # runs, and archived documents
+```
+
+It takes a hostname or the machine key the drilldown shows, removes that
+machine's runs and everything hanging off them, and deletes the documents it
+archived for them. If a hostname matches two machines — they get reissued — it
+lists both and asks you to pick by key rather than guessing.
+
+**It does not touch the collection folder.** Nothing in this tool writes there,
+and deleting an estate's authoritative results on the strength of a hostname
+typed at a prompt is not a habit worth starting. So `forget` tells you which
+files are still present, because while they are, the next scan indexes the
+machine straight back:
+
+```
+removed 1 run(s) for PC-01 (SN-0012345)
+removed 1 archived document(s)
+
+Still in the collection folder — the next scan will index this machine again
+unless these go:
+  \\fileserver\loadbearer\PC-01.json
+```
+
+So a decommissioned machine, or a removal request, is three rungs:
+
+1. Delete its result files from the collection folder.
+2. `loadbearer-fleet forget <machine>` — index rows and archived copies.
+3. Nothing else. Sessions hold no fleet data and metrics carry no machine
+   labels.
+
+Do them in that order and it stays gone; do only (2) and it returns within
+`scan_interval_minutes`.
 
 ### Moving to another server
 
