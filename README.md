@@ -51,7 +51,11 @@ the dashboard work. Two things worth getting right from the start:
 - **`--output` takes a file, not a folder.** Name it after the machine, as
   above, so results from different machines land side by side instead of
   overwriting each other. The dashboard doesn't care what they are called — it
-  identifies machines from what is *inside* them — but you will.
+  identifies machines from what is *inside* them — but you will. For one
+  machine you are trying this on, that is the whole story; across an estate
+  there is a second overwrite to think about, and it is
+  [worth two minutes now](#name-the-collected-copy-per-run-not-per-machine)
+  rather than after the history you wanted is gone.
 - **Standardise on one `--duration` across the estate.** Results are only
   comparable within the same one, which is why the cohort analysis treats it as
   part of a machine's peer group. `normal` is the sensible fleet default;
@@ -166,12 +170,61 @@ Three decisions shape everything else:
 
 **The folder is the source of truth.** The index is a derived read model, so
 deleting it costs a rescan and nothing else — which is why its shape can change
-freely and why there is nothing to migrate. With one caveat that depends on
-your collector: the index keeps a row per *run*, so if each machine overwrites a
-single file, the index ends up holding history the folder no longer has — which
-is why a format change renames it rather than dropping it, and why
+freely and why there is nothing to migrate. That holds only as far as your
+collector lets it: the index keeps a row per *run*, so if each machine
+overwrites a single file, the index ends up holding history the folder no
+longer has, and "derived" quietly stops being true. It is why a format change
+renames the index rather than dropping it, why
 [`archive_dir`](#backup-restore-and-moving-to-another-server) exists to put
-that history back into files.
+that history back into files, and why the collected copy is worth naming
+properly — next.
+
+### Name the collected copy per run, not per machine
+
+The usual deployment recipe writes a fixed path on each machine and copies it
+to a share under a fixed name:
+
+```
+loadbearer run --output "%ProgramData%\loadbearer\%COMPUTERNAME%.json"
+#   then: copy it to \\fileserver\loadbearer\PC-01.json
+```
+
+That is two overwrites, and only the first one has to be there.
+
+**The local name must stay fixed.** loadbearer's `--skip-if-newer-than` — the
+gate that stops an estate being re-benchmarked every sweep — reads the mtime of
+the `--output` file and nothing else, because loadbearer deliberately persists
+no state of its own. Put a timestamp in that path and the file never
+pre-exists, so the gate never fires and every machine runs every time. Nothing
+errors; the flag just stops working.
+
+**The collected name is free.** So put the timestamp there instead:
+
+```
+\\fileserver\loadbearer\PC-01\2026-09-10T1147Z.json
+```
+
+Filenames mean nothing here — a run is identified by the SHA-256 of its
+document, and a machine by what is inside it — so a folder per machine is fine,
+and the same run collected twice under two names is still one run. What it buys
+is that no result is ever destroyed before this has read it. Without it, a run
+survives only if a scan happened to fall between two sweeps; the default
+interval is 15 minutes against a sweep measured in days, so it usually does,
+but "usually" is not what you want from an audit trail.
+
+Set [`archive_dir`](#backup-restore-and-moving-to-another-server) as well.
+The two do different jobs: timestamped names mean nothing is lost *before*
+indexing, and the archive means nothing is lost *after* — it survives a
+retention policy on the share and a move to another server, at about a fifth of
+the raw size.
+
+Then let the share age out. A run this has indexed stays indexed after its file
+is deleted (that is what [`forget`](#removing-a-machine--deleting-its-file-is-not-enough)
+is for), and a scan re-reads and re-hashes every document it finds, which is
+what makes it idempotent — so the total file count, not the folder layout, is
+what a scan costs. At a thousand machines reporting weekly, that is ~52,000
+files and ~2 GB a year; keeping the share to a recent window and leaving the
+long tail to the archive keeps scans quick.
 
 **It reads the schema, not loadbearer's code.** loadbearer's `VERSIONING.md`
 makes the `schema`-tagged JSON a stability contract and says in the same breath
