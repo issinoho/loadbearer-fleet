@@ -37,7 +37,7 @@ which is a separate tool — install it first.
 part raises none of the warnings [described below](#a-note-on-the-windows-binary):
 
 ```powershell
-$LB = "1.5.1"   # or whatever is current on the releases page
+$LB = "1.5.2"   # or whatever is current on the releases page
 $zip = "loadbearer-$LB-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/issinoho/loadbearer/releases/download/v$LB/$zip" -OutFile $zip
 Expand-Archive $zip -DestinationPath . -Force
