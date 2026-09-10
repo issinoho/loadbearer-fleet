@@ -5,6 +5,77 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.3.2 - Thu, 10 Sep 2026
+
+Fixes a regression this project shipped in 0.3.0, and answers a question an IT
+department will ask on day one: which machines belong to whom.
+
+### `report --json` is pipeable again
+
+**If you script against `report --json`, this is the release you want.** In
+0.3.0 and 0.3.1 it did not parse:
+
+```
+$ loadbearer-fleet report --json | jq .summary
+parse error: Invalid numeric literal at line 1, column 5
+```
+
+The build-identity line added in 0.3.0 was written to **stdout**, which is
+where `tracing_subscriber` puts a console log by default, so it arrived ahead
+of the JSON with ANSI colour codes attached. The README describes that command
+as "the whole snapshot, as the UI sees it" and the wiki says it can be
+scripted or diffed; neither was true for two releases.
+
+**Logging now goes to stderr** when no `[log] file` is configured, which is
+where a command-line tool's diagnostics belong. Two consequences worth
+knowing:
+
+- A configured log file is unaffected — that path never touched stdout.
+- If you were capturing console output by redirecting **stdout**, redirect
+  stderr instead (`2>`), or set `[log] file` and stop depending on the
+  console.
+
+`tests/stdout_is_data.rs` now runs the real binary and parses what comes back
+for `report --json`, `init-config` and `reference`, and fails on a stray
+escape code. Nothing guarded those three pipeable outputs before, which is how
+this got through twice.
+
+### Group machines by whatever you label them with
+
+- **Every tag key is now its own sortable column** in the machine table.
+  Previously they were joined into one unsortable cell — and joining could not
+  have sorted usefully anyway, since `ring=canary site=glasgow owner=jsmith`
+  sorts by whichever key comes first alphabetically. Ask for the table by owner
+  and you got it by ring.
+- **Search matches tag values.** It covered hostname, serial, asset tag and CPU
+  model — every identifier except the one you put there yourself. Tag *keys* are
+  deliberately still not matched: searching `site` should not return every
+  machine that has one.
+
+Nothing to configure for either. A `--tag owner=jsmith` becomes a filter, a
+column and a search term on its own, and one person owning several machines is
+just a repeated value. Tags remain outside the cohort key, so labelling an
+estate never disturbs a peer group.
+
+### Documentation
+
+- **[Labelling machines, and a word about
+  owners](https://github.com/issinoho/loadbearer-fleet#labelling-machines-and-a-word-about-owners)**
+  — tagging an owner works, but that value then lives in every result document,
+  the index, `archive_dir` and every backup, and it is frozen at the moment of
+  the run. Where the assignment already lives in Intune or an asset system,
+  joining on `serial` or `asset_tag` costs less and stays current.
+- **Where the collector fits, and why Intune is different.** `loadbearer`
+  spawns no process and makes no network call, so something always has to move
+  its output to the folder this reads. PDQ and Ansible have a step for that;
+  Intune has none, so the script does the copy itself — which makes the run
+  context and the share's permissions the thing to get right. Covered in
+  [What sits in front of this](https://github.com/issinoho/loadbearer-fleet/wiki),
+  in [Troubleshooting](https://github.com/issinoho/loadbearer-fleet/wiki/Troubleshooting)
+  for when nothing arrives, and written up in full — marked untested — in
+  loadbearer's
+  [Fleet Deployment](https://github.com/issinoho/loadbearer/wiki/Fleet-Deployment#intune-and-anything-else-with-no-pull-file-step).
+
 ## 0.3.1 - Thu, 10 Sep 2026
 
 **Security fix. Upgrade if anything other than you can write to your
