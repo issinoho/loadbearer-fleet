@@ -10,6 +10,140 @@ web dashboard and single sign-on all work. Out of the box it runs
 unauthenticated on loopback; point it at your identity provider and it does OIDC
 with roles and per-site scoping. See [Roadmap](#roadmap).
 
+## Getting started
+
+The dashboard reads a folder of result files, so the whole job is: get one
+result into one folder, then point this at the folder. No configuration file, no
+sign-in, no database to create. Five minutes, and the last step is a browser.
+
+### 1. Collect one result
+
+The results come from [loadbearer](https://github.com/issinoho/loadbearer),
+which is a separate tool — install it first.
+
+**Windows** (PowerShell). Its Windows binary *is* Authenticode-signed, so this
+part raises none of the warnings [described below](#a-note-on-the-windows-binary):
+
+```powershell
+$zip = "loadbearer-1.5.1-x86_64-pc-windows-msvc.zip"
+Invoke-WebRequest "https://github.com/issinoho/loadbearer/releases/download/v1.5.1/$zip" -OutFile $zip
+Expand-Archive $zip -DestinationPath . -Force
+mkdir C:\loadbearer\results
+.\loadbearer-1.5.1-x86_64-pc-windows-msvc\loadbearer.exe `
+  run --duration short --output C:\loadbearer\results\$env:COMPUTERNAME.json
+```
+
+**Linux** (Ubuntu 22.04 / 24.04 / 26.04):
+
+```bash
+sudo add-apt-repository ppa:issinoho/loadbearer
+sudo apt install loadbearer
+mkdir -p ~/loadbearer/results
+loadbearer run --duration short --output ~/loadbearer/results/$(hostname).json
+```
+
+`--duration short` is about ten seconds per benchmark, which is enough to see
+the dashboard work. Two things worth getting right from the start:
+
+- **`--output` takes a file, not a folder.** Name it after the machine, as
+  above, so results from different machines land side by side instead of
+  overwriting each other. The dashboard doesn't care what they are called — it
+  identifies machines from what is *inside* them — but you will.
+- **Standardise on one `--duration` across the estate.** Results are only
+  comparable within the same one, which is why the cohort analysis treats it as
+  part of a machine's peer group. `normal` is the sensible fleet default;
+  `short` is for trying things out.
+
+### 2. Get loadbearer-fleet
+
+Download the archive for your platform from the
+[latest release](https://github.com/issinoho/loadbearer-fleet/releases/latest)
+and unpack it. There is nothing to install: one binary, no runtime, no
+dependencies.
+
+**Windows** — take the `-x86_64-pc-windows-msvc.zip`, unzip it anywhere, then:
+
+```powershell
+cd loadbearer-fleet-0.1.0-x86_64-pc-windows-msvc
+.\loadbearer-fleet.exe serve C:\loadbearer\results
+```
+
+**Linux** — take the `-x86_64-unknown-linux-gnu.tar.gz`:
+
+```bash
+curl -LO https://github.com/issinoho/loadbearer-fleet/releases/download/v0.1.0/loadbearer-fleet-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+tar xzf loadbearer-fleet-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd loadbearer-fleet-0.1.0-x86_64-unknown-linux-gnu
+./loadbearer-fleet serve ~/loadbearer/results
+```
+
+Or build it yourself:
+
+```
+cargo install --git https://github.com/issinoho/loadbearer-fleet --locked
+```
+
+That needs Rust 1.88 or newer **and a C compiler** — SQLite is compiled from
+source and bundled in, which is why there's no database to install. On
+Debian/Ubuntu that's `build-essential`; on Windows, the Visual Studio C++ build
+tools. Nothing else: TLS is rustls, so there is no OpenSSL to find.
+
+### 3. Open it
+
+```
+http://127.0.0.1:8787
+```
+
+That's it. The overview shows your one machine and its grade against the
+reference baseline, and **0 machines need attention** — with nothing to compare
+it against, there is nothing yet to say. The reason is filed as an
+informational note, under *Show 1 informational* on the overview and on the
+**Cohorts** tab: a peer group needs four machines running the same hardware and
+the same configuration before its median means anything. Collect a few more and
+the comparison that actually matters switches itself on.
+
+### What you get without configuring anything
+
+| | |
+| --- | --- |
+| Listening on | `127.0.0.1:8787` — loopback only, and it [refuses](#it-will-not-put-the-estate-on-the-wire-in-the-clear) to listen wider without sign-in and TLS |
+| Sign-in | None. Everyone who can reach the port is an administrator, and the header says so |
+| The index | `fleet-index.db`, in whatever directory you started it from. Derived data — delete it and it rebuilds |
+| Refresh | Rescans the folder every 15 minutes, or when you press **Rescan folder** |
+
+Starting it before you have any results is fine — an empty folder serves an
+empty dashboard, and results appear as they land.
+
+### Then, in whatever order suits
+
+- **Point it at the real collection folder** instead of a local one. Anything
+  the process can read works, including a UNC path:
+  `loadbearer-fleet serve \\fileserver\loadbearer`. Have your deployment tool
+  write each machine's `--output` there — see loadbearer's
+  [Fleet Deployment](https://github.com/issinoho/loadbearer/wiki/Fleet-Deployment)
+  wiki page for the unattended side, including the `--tag` labels this groups by.
+- **Run it as a service** so it survives a reboot and rescans on its own —
+  see [Running it as a service](#running-it-as-a-service).
+- **Turn on single sign-on** before anyone but you can reach it — see
+  [Sign-in](#sign-in).
+
+### A note on the Windows binary
+
+It is **unsigned**, and unlike loadbearer it never gets signed: CI can't reach
+the code-signing certificate, and nothing re-signs it by hand afterwards. So on
+a clean Windows install expect one of these:
+
+- **SmartScreen** — "Windows protected your PC". *More info → Run anyway*, or
+  `Unblock-File .\loadbearer-fleet.exe` before running it.
+- **Smart App Control**, on by default on clean Windows 11 installs — blocks
+  unsigned binaries outright, with no allow-list or file-hash exception. Build
+  from source with the `cargo install` line above, or run it on a machine
+  without SAC.
+- **WDAC / AppLocker** — add a **file-hash** rule; hash rules permit an
+  unsigned binary where publisher rules don't. The exact SHA-256 of the
+  executable inside the archive is listed in the release's `SHA256SUMS`, which
+  is why it's there.
+
 ## How it fits together
 
 ```
