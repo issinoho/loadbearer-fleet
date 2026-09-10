@@ -27,11 +27,12 @@ which is a separate tool — install it first.
 part raises none of the warnings [described below](#a-note-on-the-windows-binary):
 
 ```powershell
-$zip = "loadbearer-1.5.1-x86_64-pc-windows-msvc.zip"
-Invoke-WebRequest "https://github.com/issinoho/loadbearer/releases/download/v1.5.1/$zip" -OutFile $zip
+$LB = "1.5.1"   # or whatever is current on the releases page
+$zip = "loadbearer-$LB-x86_64-pc-windows-msvc.zip"
+Invoke-WebRequest "https://github.com/issinoho/loadbearer/releases/download/v$LB/$zip" -OutFile $zip
 Expand-Archive $zip -DestinationPath . -Force
 mkdir C:\loadbearer\results
-.\loadbearer-1.5.1-x86_64-pc-windows-msvc\loadbearer.exe `
+& ".\loadbearer-$LB-x86_64-pc-windows-msvc\loadbearer.exe" `
   run --duration short --output C:\loadbearer\results\$env:COMPUTERNAME.json
 ```
 
@@ -66,16 +67,18 @@ dependencies.
 **Windows** — take the `-x86_64-pc-windows-msvc.zip`, unzip it anywhere, then:
 
 ```powershell
-cd loadbearer-fleet-0.1.0-x86_64-pc-windows-msvc
+$V = "0.2.0"
+cd "loadbearer-fleet-$V-x86_64-pc-windows-msvc"
 .\loadbearer-fleet.exe serve C:\loadbearer\results
 ```
 
 **Linux** — take the `-x86_64-unknown-linux-gnu.tar.gz`:
 
 ```bash
-curl -LO https://github.com/issinoho/loadbearer-fleet/releases/download/v0.1.0/loadbearer-fleet-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-tar xzf loadbearer-fleet-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd loadbearer-fleet-0.1.0-x86_64-unknown-linux-gnu
+V=0.2.0
+curl -LO "https://github.com/issinoho/loadbearer-fleet/releases/download/v$V/loadbearer-fleet-$V-x86_64-unknown-linux-gnu.tar.gz"
+tar xzf "loadbearer-fleet-$V-x86_64-unknown-linux-gnu.tar.gz"
+cd "loadbearer-fleet-$V-x86_64-unknown-linux-gnu"
 ./loadbearer-fleet serve ~/loadbearer/results
 ```
 
@@ -665,16 +668,33 @@ machines need attention" is how an unreachable share would otherwise look.
 
 ## Releases
 
-Tagging is the whole trigger:
+Tagging is the whole trigger, but four things have to be true first, and the
+release workflow only catches one of them:
+
+1. **Bump `version` in `Cargo.toml`**, then `cargo build` so `Cargo.lock`
+   follows. The release build uses `--locked` and refuses otherwise — this is
+   the one that fails loudly.
+2. **Consolidate and date the `## Unreleased` section** of
+   [CHANGELOG.md](CHANGELOG.md) into `## X.Y.Z - <date>`. The workflow lifts
+   that section *verbatim* as the release notes, so it wants to read as one
+   note rather than as a pile of appended bullets.
+3. **Update the version in the README's download commands.** Getting started
+   names the archive, so `$V` in those two snippets goes stale on every
+   release and it is the first thing a new user copies.
+4. **Check CI is green on the commit you are about to tag** — the release
+   workflow builds and publishes without re-running the test suite.
+
+Then:
 
 ```
-# 1. bump `version` in Cargo.toml, then `cargo build` so Cargo.lock follows
-#    (the release build uses --locked and will refuse otherwise)
-# 2. date the CHANGELOG section — the tag's notes are that section, verbatim
-# 3. commit, then:
-git tag -a v0.1.0 -m "loadbearer-fleet 0.1.0"
+git commit -m "Release X.Y.Z"
+git tag -a vX.Y.Z -m "loadbearer-fleet X.Y.Z"
 git push origin main --follow-tags
 ```
+
+Versioning follows loadbearer's: a new subcommand or capability is a **minor**
+bump, polish is a **patch**, and a breaking change to the CLI or to a
+`schema`-tagged format would be **major**.
 
 `release.yml` then builds a self-contained binary for Windows and Linux,
 archives each with the README, licence, changelog and a starter config
@@ -683,7 +703,7 @@ accepts), attaches a **build-provenance attestation** to each, writes
 `SHA256SUMS`, and creates the Release with those notes.
 
 ```
-gh attestation verify loadbearer-fleet-0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify loadbearer-fleet-*-x86_64-unknown-linux-gnu.tar.gz \
   --repo issinoho/loadbearer-fleet
 ```
 

@@ -5,50 +5,64 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
-## Unreleased
+## 0.2.0 - Thu, 10 Sep 2026
 
-- **`forget <machine>`** removes a machine from the index and deletes the
-  documents archived for it. A scan only ever adds, so deleting a result file
-  from the collection folder left the run indexed and the machine on the
-  dashboard, still counting towards the fleet total and its cohort median —
-  which is the same property that lets the index keep history an overwriting
-  collector has discarded, seen from the other side. Takes a hostname or a
-  machine key, refuses to guess when a reissued hostname matches two machines,
-  and has `--dry-run`. It deliberately does not touch the collection folder;
-  it reports which files are still there, because while they are the next scan
-  indexes the machine straight back.
+Everything an estate needs in order to move, back up and forget — plus one
+chart bug that had been on screen since the charts were written.
+
+### Moving, backup and removal
 
 - **`backup <file>`** takes a consistent snapshot of the index while the
-  dashboard is serving, via SQLite's `VACUUM INTO` — copying a live database
-  with `cp` is a torn read, and nobody stops a dashboard for a backup agent.
-  Refuses to overwrite; restore is putting the file back where `index` points.
-- **`archive_dir`**, optional, keeps every document indexed: gzipped,
-  content-addressed, about 8 KB a run. It exists for the collection pattern
-  where each machine overwrites one file, which leaves the index as the only
-  record of earlier runs — with this set, that record is in files, so the index
-  is genuinely derived again and moving servers is a copy. Archived before
-  indexed, so "in the index" implies "kept".
+  dashboard is still serving, using SQLite's `VACUUM INTO`. A plain copy of a
+  live database is a torn read, and nobody stops a dashboard nightly so a
+  backup agent can have it. Refuses to overwrite; restoring is putting the file
+  back where `index` points.
+- **`archive_dir`** (optional) keeps every document indexed: gzipped,
+  content-addressed, about 8 KB a run against 40 KB raw. It exists for the
+  collection pattern where each machine overwrites one file, which otherwise
+  leaves the index as the sole record of earlier runs. With it set, that record
+  is in files again, so the index is genuinely derived and moving servers is a
+  copy rather than a migration. A run is archived *before* it is indexed, so
+  "in the index" implies "kept".
 - **`scan` reads `.json.gz` as well as `.json`**, which is what makes importing
-  an archive just a scan, and lets a collection share be gzipped.
-- Moving between instances, consolidating two of them, backup and restore are
-  therefore all file copies plus a scan. There is deliberately no export format:
-  the interchange format is `loadbearer.result/1`, which loadbearer already
-  promises to keep stable.
+  an archive just a scan — and lets a collection share be gzipped for a fifth
+  of the space.
+- **`forget <machine>`** removes a machine from the index and deletes the
+  documents archived for it. A scan only ever adds, so deleting a result file
+  left the run indexed and the machine still counting towards the fleet total
+  and its cohort median. Takes a hostname or a machine key, has `--dry-run`,
+  and lists both candidates rather than guessing when a reissued hostname
+  matches two machines. It does not touch the collection folder — it reports
+  which files are still there, because while they are, the next scan indexes
+  the machine straight back.
+- **An index this build cannot read is now kept rather than dropped.** A change
+  to the index format renames the file to
+  `fleet-index.superseded-v1-<when>.db` and rebuilds a fresh one. Dropping the
+  tables was only harmless if the collection folder keeps a file per run; a
+  rename costs the same rescan and leaves the history on disk. A rename that
+  fails stops startup with an explanation rather than falling back to deleting.
 
-- **An index this build can't read is now kept, not dropped.** A change to the
-  index format renames the existing file to
-  `fleet-index.superseded-v1-<when>.db` and rebuilds a fresh one from the
-  collection folder. It used to drop the tables in place, which is only
-  harmless if the folder keeps a file per run: the index holds a row per run,
-  so a collector that overwrites one file per machine leaves the index as the
-  sole record of everything earlier. Renaming costs the same rescan and leaves
-  the history on disk. A rename that fails stops startup with an explanation
-  rather than falling back to deleting.
-- **Axis labels can no longer repeat.** A chart whose tallest bar was 2
-  machines drew ticks on halves and printed `0, 1, 1, 2, 2` through an integer
-  formatter — the normal case on a small estate. Counting axes now take a
-  minimum step of 1, and `scripts/check-ui.mjs` fails on a duplicated label.
-- A favicon and README branding, and upgrade instructions.
+There is deliberately no export format and no import command: the interchange
+format is `loadbearer.result/1`, which loadbearer already promises to keep
+stable, so moving between servers and consolidating two of them are both file
+copies plus a scan.
+
+### Fixed
+
+- **A chart axis could print the same label twice.** With a tallest bar of two
+  machines the ticks landed on halves and the integer formatter rendered
+  `0, 1, 1, 2, 2` — and one or two machines in a grade bucket is the normal
+  case on a small estate, so it was there from the start. Counting axes now
+  take a minimum step of one, and `scripts/check-ui.mjs` fails on a duplicated
+  label so it cannot come back.
+
+### Documentation
+
+- A getting-started walkthrough for a clean start on Windows and Linux, with
+  every command run rather than written from memory.
+- A favicon, a README banner and a screenshot of the overview.
+- Sections on upgrading, on backup and restore, and on what removing a machine
+  actually takes.
 
 ## 0.1.0 - Thu, 10 Sep 2026
 
