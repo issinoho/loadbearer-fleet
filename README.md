@@ -728,6 +728,14 @@ Two things to know:
   rule needs — hash rules permit an unsigned binary where publisher rules
   don't.
 
+## Contributing
+
+Bug reports, fixes and well-scoped features are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the checks, the project's opinions, and
+the testing conventions. For anything security-related, please use
+[SECURITY.md](SECURITY.md) rather than a public issue; it also documents the
+attack surface and what has and hasn't been verified.
+
 ## Licence
 
 MIT.

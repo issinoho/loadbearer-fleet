@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Something wrong with a benchmark number itself
+    url: https://github.com/issinoho/loadbearer/issues/new/choose
+    about: The measurements come from loadbearer, a separate tool. If a subtest looks wrong rather than the way this presents it, report it there.
+  - name: How the analysis works
+    url: https://github.com/issinoho/loadbearer-fleet#analysis
+    about: Cohorts, why it uses median and MAD, and the three queues findings go in. Still unclear? Open a blank issue.
+  - name: Security vulnerability
+    url: https://github.com/issinoho/loadbearer-fleet/security/policy
+    about: Please don't file a public issue for a security report — see the security policy.

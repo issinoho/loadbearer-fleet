@@ -1,0 +1,102 @@
+name: Bug report
+description: Something isn't working the way it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. The more of the fields below
+        you can fill in, the faster it is to track down.
+
+        **If it's a number that looks wrong** rather than a crash, the single
+        most useful thing you can attach is the result document itself — that
+        is what the analysis actually reads. Replace the identifiers if you'd
+        rather; the measurements are what matter.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description, and what you expected instead.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: loadbearer-fleet --version
+      placeholder: loadbearer-fleet 0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Where is it running?
+      options:
+        - Windows, from a terminal
+        - Windows, as a service
+        - Linux, from a terminal
+        - Linux, under systemd
+        - Built from source
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: How was it started?
+      description: The command line, and the config file if you're using one (redact the tenant and client IDs).
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part?
+      description: A rough guess is fine — it just helps to know where to look first.
+      options:
+        - Reading result files / a file was rejected
+        - The numbers — a grade, a cohort comparison, a trend
+        - A finding that fired when it shouldn't, or didn't when it should
+        - The dashboard — a chart, a table, a view
+        - Sign-in, roles or tag scoping
+        - Running as a service, or the config file
+        - Backup, the archive, forget, or moving between servers
+        - Metrics
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: result_file
+    attributes:
+      label: The result document, if the issue is about a number or a rejected file
+      description: |
+        Attach the `.json` (drag it into this box), or paste it. Identifiers can
+        be replaced — `tests/fixtures/` in this repo shows the shape that's
+        still useful. If a file was rejected, the exact message from the log or
+        the scan output helps too.
+      render: json
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        Run with `--log-level debug` if you can. Redact hostnames and serials if
+        you'd rather — but say that you have, so a missing value isn't mistaken
+        for a bug.
+      render: shell
+
+  - type: textarea
+    id: fleet
+    attributes:
+      label: Anything about the estate that might matter
+      description: |
+        Roughly how many machines, whether your collector overwrites one file
+        per machine or writes one per run, whether `archive_dir` is set, and
+        whether the collection folder is local or a share. Several behaviours
+        genuinely differ between those.
