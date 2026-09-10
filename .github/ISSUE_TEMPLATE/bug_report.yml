@@ -30,7 +30,7 @@ body:
         build — the version number on its own is the same for every commit
         between two releases, so it can't tell a release apart from a local
         build of something halfway to the next one.
-      placeholder: loadbearer-fleet 0.2.1 (1a2b3c4d5 2026-09-10, x86_64-pc-windows-msvc, release)
+      placeholder: loadbearer-fleet 0.3.0 (1a2b3c4d5 2026-09-10, x86_64-pc-windows-msvc, release)
     validations:
       required: true
 

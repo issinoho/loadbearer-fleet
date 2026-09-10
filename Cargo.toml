@@ -1,6 +1,6 @@
 [package]
 name = "loadbearer-fleet"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 # Declared rather than left to auto-detection, so it is visible here that the

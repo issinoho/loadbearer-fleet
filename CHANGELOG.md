@@ -5,6 +5,89 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.3.0 - Thu, 10 Sep 2026
+
+Answering "which build am I looking at", and making the documentation something
+the binary generates rather than something anyone has to remember to update.
+Nothing about the analysis, the index or the dashboard's numbers changed, so
+upgrading is replacing the binary.
+
+### It says which build it is
+
+- **The version and the commit now appear everywhere they are asked for.**
+  `--version` gives the long form, the first line of every run's log gives it
+  structured, `report --json` and `/api/snapshot` carry it, `/metrics` labels
+  `build_info` with it, and the dashboard shows it in the footer:
+
+  ```
+  loadbearer-fleet 0.3.0 (a1b2c3d4e 2026-09-10, x86_64-pc-windows-msvc, release)
+  ```
+
+  The version alone could never answer the question — every commit between two
+  releases reports the same one, so a bug report naming `0.2.1` could be the
+  release or a local build of anything on the way to this one. A `build.rs`
+  stamps the commit, with `-dirty` when the tree was not clean.
+- **The log says it on the first line of every run**, before any work, and
+  carries the pid. A service log rotates daily and outlives upgrades, so
+  without this a line from six weeks ago cannot be attributed to the build
+  that wrote it, and a restart is indistinguishable from a reload. It is on
+  every command, not just `serve`, so a `scan` from a scheduled task says it
+  too.
+- **The dashboard takes it from the snapshot**, not from the page, so it names
+  the build that actually answered — including right after an upgrade, when a
+  browser may still be holding cached HTML from the old one.
+- `build_info` **gains a `build` label** alongside `version`. If you have a
+  recording rule on that metric, it now has one more label; `version` is still
+  a bare semver so anything comparing versions is unaffected.
+
+### `reference`, and two settings that were never written down
+
+- **`loadbearer-fleet reference`** prints the whole command-line and
+  configuration reference as Markdown, generated from the definitions in the
+  binary you are holding. It is also the
+  [wiki page](https://github.com/issinoho/loadbearer-fleet/wiki/Command-Line-and-Configuration),
+  which means the reference cannot describe a flag that does not exist. Writing
+  those tables by hand would have been a second copy of `--help` and
+  `init-config` with nothing checking the three agreed.
+- **`init-config` now emits `scan_interval_minutes` and `extra_scopes`.** Both
+  worked, and both appeared in no generated artefact at all —
+  `scan_interval_minutes` being the setting this project's own README calls the
+  difference between a service and a command. The starter file is what the
+  release archive ships as `loadbearer-fleet.example.toml`, so they were
+  missing there too.
+- **Two `--allow-remote` flags were undocumented** — on `service run` and
+  `service install`, which is to say on the flag that opts you out of a
+  security refusal. Both now have help text.
+
+Those three were not found by reading. Two tests came with the generator: one
+fails if any command or argument has no help text, the other if a configuration
+key never reaches `init-config`, compared against a serialised
+`Config::default()` — which is every field there is, by construction. They
+failed on their first run and named all four gaps.
+
+### Documentation
+
+- **The collection folder wants one file per run, and the README now says so
+  rather than filing it under a caveat.** With a collector that overwrites one
+  file per machine, the index holds history the folder does not, and "the
+  folder is the source of truth, the index is derived" stops being true. The
+  fix belongs at the gather step, not the write step: loadbearer's
+  `--skip-if-newer-than` reads the mtime of its `--output` file and nothing
+  else, so timestamping *that* path silently stops the gate ever firing and
+  re-benchmarks the estate every sweep. See
+  [Keep every run](https://github.com/issinoho/loadbearer/wiki/Fleet-Deployment#keep-every-run-not-just-the-latest).
+- **The wiki now covers what gets looked up rather than read**: the generated
+  reference, the [findings
+  catalogue](https://github.com/issinoho/loadbearer-fleet/wiki/Findings) with
+  all fourteen rules and every threshold, the [HTTP
+  API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API),
+  [metrics](https://github.com/issinoho/loadbearer-fleet/wiki/Metrics), and
+  [troubleshooting](https://github.com/issinoho/loadbearer-fleet/wiki/Troubleshooting).
+- The metrics page carries one thing worth acting on if you alert on this
+  service: the four `scan_*` detail metrics are **absent** until a scan has
+  succeeded, so a rule written only on their age stays silent through exactly
+  the outage it was written for. Use `absent(...) or time() - ... > 3600`.
+
 ## 0.2.1 - Thu, 10 Sep 2026
 
 One fix, and the setup instructions that walked you into a wall. Nothing about
