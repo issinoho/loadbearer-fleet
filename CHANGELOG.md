@@ -5,6 +5,39 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.2.1 - Thu, 10 Sep 2026
+
+One fix, and the setup instructions that walked you into a wall. Nothing about
+the analysis, the dashboard or the index changed, so upgrading is replacing the
+binary.
+
+- **A placeholder left in a path setting is refused now**, as the identity
+  settings already were. `init-config` writes
+  `file = 'PUT-THE-PATH-FOR-THE-LOG-FILE-HERE'` and nothing checked it, so an
+  unedited config created a *directory* with that name and logged into it
+  contentedly. `collection_dir` and `archive_dir` are checked too. These fail
+  in a worse way than the identity settings do — they don't fail: a placeholder
+  tenant at least produces an error from the provider, however unhelpful, while
+  an unreachable collection folder is reported and survived by design. Both
+  leave you with something that looks configured. The checks run *before* the
+  `auth.mode = "none"` shortcut rather than after it, which is the whole point:
+  sign-in is the last thing anyone sets up, so the unauthenticated config is
+  exactly the one that reaches a placeholder path.
+- **The service setup in the README told you to run a command that fails.**
+  `init-config > C:\ProgramData\loadbearer-fleet\fleet.toml` cannot work on a
+  machine that hasn't been set up, because `>` does not create the folder — it
+  fails with "Could not find a part of the path". It creates the folder first
+  now, and writes with `Set-Content -Encoding utf8` rather than `>`, because
+  Windows PowerShell 5.1 redirects as UTF-16 and the config is read as UTF-8,
+  which gets you `stream did not contain valid UTF-8` at a point where a
+  corrupt file is the more natural suspicion. The Linux path had the same
+  missing directory plus the `sudo` redirect trap, where the shell opens the
+  file as you before `sudo` gets a say.
+- The repository now meets GitHub's community standards — a security policy
+  with the [threat model spelled
+  out](https://github.com/issinoho/loadbearer-fleet/blob/main/SECURITY.md),
+  contributing guide, code of conduct and issue forms.
+
 ## 0.2.0 - Thu, 10 Sep 2026
 
 Everything an estate needs in order to move, back up and forget — plus one
