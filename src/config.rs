@@ -245,8 +245,19 @@ impl Default for Auth {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
-    /// The group's object ID, not its display name. Display names are
-    /// renameable and not unique; Entra puts object IDs in the token anyway.
+    /// Whatever the provider actually puts in the groups claim, matched
+    /// exactly.
+    ///
+    /// Which is not the same thing on every provider, and guessing wrong is
+    /// the usual reason a sign-in succeeds and lands no role. **Entra** emits
+    /// group **object IDs**, so use those — display names there are
+    /// renameable and not unique. **Authelia, Keycloak and Authentik** emit
+    /// group **names**, so use the name as written in their user directory.
+    ///
+    /// If in doubt, sign in and read the refusal: it counts the groups it
+    /// decoded, so `0 group(s)` means the claim never reached the ID token,
+    /// and any other number means the claim is fine and these values don't
+    /// match it.
     pub group: String,
     pub role: Role,
     /// Restrict this grant to machines carrying all of these tags. Absent means
@@ -570,19 +581,31 @@ enabled = false
 # port is reachable from this host alone.
 token = ""
 
-# Who gets in, and over how much of the estate. Use the group's object ID, not
-# its display name: names are renameable and not unique, and the token carries
-# object IDs anyway.
+# Who gets in, and over how much of the estate.
+#
+# `group` is matched exactly against whatever the provider puts in the claim,
+# and that differs by provider:
+#
+#   Entra ID                       the group's object ID. Display names there
+#                                  are renameable and not unique, and the token
+#                                  carries object IDs anyway.
+#   Authelia / Keycloak /          the group name, as written in the user
+#   Authentik                      directory.
+#
+# Guessing wrong is the usual reason a sign-in succeeds and lands no role. If
+# it happens, read the refusal: it counts the groups it decoded, so "0 group(s)"
+# means the claim never reached the ID token and any other number means the
+# claim is fine and these values do not match it.
 #
 # The most privileged matching grant wins. Scopes are the union of the matching
 # grants at that role, so somebody in two site groups sees both sites.
 
 [[auth.grants]]
-group = "PUT-THE-OBJECT-ID-OF-YOUR-FLEET-ADMINS-GROUP-HERE"
+group = "PUT-THE-GROUP-YOUR-FLEET-ADMINS-ARE-IN-HERE"
 role = "admin"    # read the dashboard, and trigger a rescan
 
 [[auth.grants]]
-group = "PUT-THE-OBJECT-ID-OF-YOUR-FLEET-VIEWERS-GROUP-HERE"
+group = "PUT-THE-GROUP-YOUR-FLEET-VIEWERS-ARE-IN-HERE"
 role = "viewer"   # read the dashboard
 
 # A team that should only see its own site. Tags come from loadbearer's --tag,

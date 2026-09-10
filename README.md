@@ -468,9 +468,14 @@ client — the flow needs no client secret, and a secret in a config file on a
 management server is a secret in every backup of that server — with the redirect
 URI `<public_url>/auth/callback`.
 
-Roles come from group claims. On Entra, emit the `groups` claim from the app
-registration's **Token configuration** (it is a token setting, not a scope), and
-map group **object IDs** to roles:
+Roles come from group claims. `group` is matched **exactly** against whatever
+the provider puts in the claim, and that is not the same thing everywhere:
+Entra emits group **object IDs**, while Authelia, Keycloak and Authentik emit
+group **names**. Getting it wrong is the usual reason a sign-in succeeds and
+lands no role.
+
+On Entra, emit the `groups` claim from the app registration's **Token
+configuration** — it is a token setting, not a scope — and map object IDs:
 
 ```toml
 [[auth.grants]]
@@ -487,6 +492,11 @@ The most privileged matching grant wins; scopes are the union of the matching
 grants at that role, so somebody in two site groups sees both sites. Someone who
 authenticates but matches no grant is refused rather than shown an empty
 dashboard — authenticating is not the same as being authorized.
+
+**That refusal is also the diagnostic.** It counts the groups it decoded, so
+`0 group(s)` means the claim never reached the ID token — a provider-side
+problem — and any other number means the claim arrived fine and these values
+don't match it.
 
 **Tag scoping is enforced in the data layer.** A viewer's scope is pushed into
 the same filter every request is projected through, and it is read from the
