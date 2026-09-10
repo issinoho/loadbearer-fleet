@@ -81,7 +81,7 @@ dependencies.
 **Windows** — take the `-x86_64-pc-windows-msvc.zip`, unzip it anywhere, then:
 
 ```powershell
-$V = "0.3.2"
+$V = "0.4.0"
 cd "loadbearer-fleet-$V-x86_64-pc-windows-msvc"
 .\loadbearer-fleet.exe serve C:\loadbearer\results
 ```
@@ -89,7 +89,7 @@ cd "loadbearer-fleet-$V-x86_64-pc-windows-msvc"
 **Linux** — take the `-x86_64-unknown-linux-gnu.tar.gz`:
 
 ```bash
-V=0.3.2
+V=0.4.0
 curl -LO "https://github.com/issinoho/loadbearer-fleet/releases/download/v$V/loadbearer-fleet-$V-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf "loadbearer-fleet-$V-x86_64-unknown-linux-gnu.tar.gz"
 cd "loadbearer-fleet-$V-x86_64-unknown-linux-gnu"

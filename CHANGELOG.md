@@ -5,6 +5,80 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.4.0 - Thu, 10 Sep 2026
+
+Sign-in against a **self-hosted** identity provider — Authelia, Keycloak,
+Authentik — now works where it previously could not. Minor rather than patch
+because there is a new configuration setting; nothing changed about the
+analysis, the index or the dashboard, so upgrading is replacing the binary.
+
+### `auth.ca_bundle`
+
+**A provider behind an internal certificate authority was unreachable, and
+there was nothing you could do about it.** The HTTP client verifies against a
+built-in root set and deliberately does not read the machine's trust store, so
+installing your CA on the server changed nothing and no setting existed to
+point at it. Discovery simply failed.
+
+```toml
+[auth]
+ca_bundle = '/etc/loadbearer-fleet/internal-ca.pem'
+```
+
+A PEM file of extra authorities, **added** to the built-in roots rather than
+replacing them — so moving the provider onto a publicly-trusted certificate
+later needs no change here, and a publicly-trusted one (Let's Encrypt via
+DNS-01 works for an internal-only hostname) needs no setting at all. There is
+still no option to skip verification, and there won't be.
+
+An empty PEM file is refused rather than accepted: it would leave the provider
+untrusted while looking configured, which is the worst of both. Both failures
+name the setting *and* the file, because somebody who has already installed the
+CA on the server will not believe the problem is here.
+
+### `check-auth` says what it will look for
+
+It reported the client type and redirect URI; it now also reports the scopes it
+will request and where its certificate trust comes from:
+
+```
+discovery succeeded for https://auth.example.internal
+  client_id:    loadbearer-fleet
+  client type:  public (PKCE, no secret)
+  redirect URI: https://fleet.example.internal/auth/callback
+  groups claim: groups
+  extra scopes: groups
+  CA trust:     built-in roots + /etc/loadbearer-fleet/internal-ca.pem
+  grants:       2
+```
+
+And it now states the requirement that catches people out: **this reads the ID
+token and never calls the userinfo endpoint**, so a `groups` claim that only
+appears at userinfo is invisible — you sign in successfully and match no grant.
+On Entra that means a token-configuration change and no scope; on a self-hosted
+provider it usually means the opposite, `extra_scopes = ["groups"]`, plus
+whatever that provider calls the setting for which claims go in the ID token.
+
+There is a new
+[Self-hosted providers](https://github.com/issinoho/loadbearer-fleet#self-hosted-providers--authelia-keycloak-authentik)
+section covering both, and
+[SECURITY.md](https://github.com/issinoho/loadbearer-fleet/blob/main/SECURITY.md)
+now records how the provider's certificate is verified and that discovery does
+not follow redirects — following one from a discovery URL would make this an
+SSRF primitive.
+
+### Also
+
+- **A guard this project shipped in 0.3.0 was weaker than its own description.**
+  The test that proves `init-config` documents every configuration key passed
+  with a key missing, because TOML has no null: the serializer omits a `None`,
+  so every `Option` setting was invisible to it — `collection_dir`,
+  `archive_dir` and `log.file` among them. It now builds a configuration with
+  every field written out and no `..Default::default()`, so the *compiler*
+  enforces completeness and a new setting will not build until the test names
+  it. The 0.3.0 notes and `CONTRIBUTING.md` both called it "every field there
+  is, by construction"; that was true only of fields with values.
+
 ## 0.3.2 - Thu, 10 Sep 2026
 
 Fixes a regression this project shipped in 0.3.0, and answers a question an IT
