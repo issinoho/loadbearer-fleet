@@ -12,6 +12,16 @@ web dashboard and single sign-on all work. Out of the box it runs
 unauthenticated on loopback; point it at your identity provider and it does OIDC
 with roles and per-site scoping. See [Roadmap](#roadmap).
 
+This file is written to be read start to finish. The
+[wiki](https://github.com/issinoho/loadbearer-fleet/wiki) holds what gets
+looked *up*: the
+[command and configuration reference](https://github.com/issinoho/loadbearer-fleet/wiki/Command-Line-and-Configuration)
+(generated from the binary), the
+[findings catalogue](https://github.com/issinoho/loadbearer-fleet/wiki/Findings),
+the [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API),
+[metrics](https://github.com/issinoho/loadbearer-fleet/wiki/Metrics), and
+[troubleshooting](https://github.com/issinoho/loadbearer-fleet/wiki/Troubleshooting).
+
 ## Getting started
 
 The dashboard reads a folder of result files, so the whole job is: get one
@@ -344,7 +354,9 @@ means an estate owner reads a thermal caveat as a failing asset:
 | **coverage** | about the data we hold, not about the machine | stale result, attributed by hostname only, no peer group |
 
 Every threshold lives in one struct with its reasoning attached, so tuning the
-engine is a config change rather than a code read.
+engine is a config change rather than a code read. All fourteen rules, what
+fires each one and every threshold with its default are in
+[Findings](https://github.com/issinoho/loadbearer-fleet/wiki/Findings).
 
 ## The dashboard
 
@@ -361,7 +373,10 @@ components, its findings in full, and every subtest of its latest run.
 
 `POST /api/rescan` — the Rescan button — re-reads the folder. `GET /api/snapshot`
 returns exactly what the dashboard draws, so any view can be scripted or
-diffed; `GET /api/machine/{key}` is the drilldown payload.
+diffed; `GET /api/machine/{key}` is the drilldown payload. Every endpoint, the
+filter parameters they share with the dashboard, and how authorization is
+applied are in
+[HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API).
 
 ### No build step, no CDN, one binary
 
@@ -744,6 +759,12 @@ Three of them are worth alerting on:
 A scan of a folder that can't be read fails loudly and increments
 `scan_failures_total` rather than reporting an empty folder, because "no
 machines need attention" is how an unreachable share would otherwise look.
+
+The full surface is in
+[Metrics](https://github.com/issinoho/loadbearer-fleet/wiki/Metrics), which
+also covers the one thing worth getting right in the alert rule: the `scan_*`
+detail metrics are **absent** until a scan has succeeded, so a rule written
+only on their age stays silent through exactly the outage it was written for.
 
 ## Releases
 
