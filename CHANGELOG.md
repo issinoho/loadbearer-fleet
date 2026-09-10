@@ -5,6 +5,55 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.3.1 - Thu, 10 Sep 2026
+
+**Security fix. Upgrade if anything other than you can write to your
+collection folder** — which, in the deployment this is built for, means every
+machine in the estate.
+
+Nothing about the analysis, the index, the dashboard or the configuration
+changed, so upgrading is replacing the binary. No index rebuild, no config
+edit.
+
+- **A result document is now refused above 16 MB, before it is read.** There
+  was no limit on either ingest path: a whole file went into memory, and a
+  gzipped one was decompressed with no bound. gzip reaches about 1030:1, so a
+  398 KB `.json.gz` on the collection folder took peak memory to **523 MB**,
+  and roughly 15 MB on the share would have exhausted 16 GB. The document was
+  rejected afterwards — for having no `schema` field — which is exactly too
+  late to be any use.
+
+  The startup scan pays the same cost, so one file could have stopped the
+  dashboard coming up at all. That is the failure mode this project describes
+  as the one that hides every other one: a dashboard that never loads, or an
+  index that never refreshes, looks like a quiet estate.
+
+  Now checked twice — on the file's size on disk *before* it is read, and on
+  what it decompresses to. The same file peaks at 43 MB and is reported as a
+  compression bomb, with the rest of the scan carrying on. A real result is
+  about 40 KB, so the limit leaves roughly 400× headroom and no legitimate
+  document comes near it. Both the plain and gzipped paths were re-checked
+  against real documents.
+- **Half-finished sign-ins are capped at 1024.** `/auth/login` needs no
+  session, and each call held a state, a nonce and a PKCE verifier for fifteen
+  minutes with nothing bounding the total. Past the cap a *new* sign-in is
+  refused with a 503 rather than an existing one being dropped — evicting to
+  make room would have turned a memory bound into a way to deny somebody
+  access halfway through signing in.
+- **The post-sign-in redirect rejects control characters**, so `?next=` cannot
+  smuggle anything past the existing `//` and `://` checks. Cosmetic in
+  practice — axum returns a 500 rather than doing anything with it — but the
+  check belongs there.
+
+All three came with a test that was watched failing with its guard removed.
+[SECURITY.md](https://github.com/issinoho/loadbearer-fleet/blob/main/SECURITY.md)
+states both limits.
+
+Found by auditing the codebase rather than from a report, and everything else
+examined held up: authorization was re-verified live against an
+OIDC-configured instance, and there is no string-built SQL, no HTML-injection
+sink in the dashboard, and no `unsafe` anywhere in the crate.
+
 ## 0.3.0 - Thu, 10 Sep 2026
 
 Answering "which build am I looking at", and making the documentation something
