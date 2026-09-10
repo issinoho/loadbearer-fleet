@@ -417,14 +417,33 @@ The dashboard does not terminate TLS. Put a reverse proxy in front of it and set
 
 ## Running it as a service
 
-```
-loadbearer-fleet init-config > C:\ProgramData\loadbearer-fleet\fleet.toml
-# fill it in, then:
-loadbearer-fleet --config C:\ProgramData\loadbearer-fleet\fleet.toml service install
-sc start loadbearer-fleet
+```powershell
+# The folder first: `>` will not create one, and fails with
+# "Could not find a part of the path".
+New-Item -ItemType Directory -Force C:\ProgramData\loadbearer-fleet | Out-Null
+$cfg = "C:\ProgramData\loadbearer-fleet\fleet.toml"
+.\loadbearer-fleet.exe init-config | Set-Content -Encoding utf8 $cfg
+# fill it in, then, from an elevated prompt:
+.\loadbearer-fleet.exe --config $cfg service install
+sc.exe start loadbearer-fleet
 ```
 
-On Linux, `service unit --config /etc/loadbearer-fleet/fleet.toml` prints a
+`Set-Content -Encoding utf8` rather than `>` because **Windows PowerShell 5.1
+redirects as UTF-16**, and it is still what `powershell.exe` runs on a Windows
+Server box. The config is read as UTF-8, so `>` there gets you `reading config
+from ...: stream did not contain valid UTF-8`. PowerShell 7 (`pwsh`) redirects
+as UTF-8 and `>` is fine. `Set-Content -Encoding utf8` works on both — it adds
+a byte-order mark on 5.1 and not on 7, and the parser accepts either.
+
+On Linux the same two traps apply, and `sudo` doesn't fix the second one,
+because the shell opens the file before `sudo` gets a say:
+
+```bash
+sudo mkdir -p /etc/loadbearer-fleet
+./loadbearer-fleet init-config | sudo tee /etc/loadbearer-fleet/fleet.toml > /dev/null
+```
+
+`service unit --config /etc/loadbearer-fleet/fleet.toml` then prints a
 systemd unit — hardened, because this process reads a share and writes one
 database and never needs a new privilege, an executable mapping or a raw socket.
 Review it, drop it in `/etc/systemd/system`, `systemctl enable --now`.
