@@ -115,7 +115,7 @@ the comparison that actually matters switches itself on.
 | --- | --- |
 | Listening on | `127.0.0.1:8787` — loopback only, and it [refuses](#it-will-not-put-the-estate-on-the-wire-in-the-clear) to listen wider without sign-in and TLS |
 | Sign-in | None. Everyone who can reach the port is an administrator, and the header says so |
-| The index | `fleet-index.db`, in whatever directory you started it from. Derived data — delete it and it rebuilds |
+| The index | `fleet-index.db`, in whatever directory you started it from. Derived data — delete it and it rebuilds from the folder ([one caveat](#what-an-index-format-change-does-to-your-history)) |
 | Refresh | Rescans the folder every 15 minutes, or when you press **Rescan folder** |
 
 Starting it before you have any results is fine — an empty folder serves an
@@ -161,10 +161,14 @@ a clean Windows install expect one of these:
 
 Three decisions shape everything else:
 
-**The folder is the source of truth.** The index is a derived read model and
-holds nothing that isn't in the files. Delete it and it rebuilds — which is why
-its schema can change freely, why there is nothing to migrate, and why it isn't
-something you need to back up.
+**The folder is the source of truth.** The index is a derived read model, so
+deleting it costs a rescan and nothing else — which is why its shape can change
+freely and why there is nothing to migrate. With one caveat that depends on
+your collector: the index keeps a row per *run*, so if each machine overwrites a
+single file, the index ends up holding history the folder no longer has, which
+is why a format change renames it rather than dropping it. See [what an
+index-format change does to your
+history](#what-an-index-format-change-does-to-your-history).
 
 **It reads the schema, not loadbearer's code.** loadbearer's `VERSIONING.md`
 makes the `schema`-tagged JSON a stability contract and says in the same breath
@@ -438,6 +442,91 @@ refused. **Nowhere to log**: a service has no console, so without `[log] file`
 there is no way to find out why it didn't start, and the installer says so
 rather than letting you find out later. Logs rotate daily and can be `json` for
 a collector.
+
+## Upgrading
+
+Stop it, replace the binary, start it. There is no migration step and nothing
+to back up: if a release ever changes the index's internal shape it keeps the
+old one for you rather than dropping it, which is [worth understanding
+once](#what-an-index-format-change-does-to-your-history) but needs nothing from
+you at the time.
+
+**Windows service:**
+
+```powershell
+sc stop loadbearer-fleet
+# replace loadbearer-fleet.exe with the new one, in the same place
+sc start loadbearer-fleet
+```
+
+Stopping it first is not optional: Windows locks a running executable, and the
+copy will fail with "access is denied" rather than doing anything clever.
+
+**Linux (systemd):**
+
+```bash
+sudo systemctl stop loadbearer-fleet
+sudo install -m755 loadbearer-fleet /usr/local/bin/loadbearer-fleet
+sudo systemctl start loadbearer-fleet
+```
+
+**Run by hand:** stop it, unpack the new archive over the old one, start it.
+The service registration and the unit file both point at a path, so replacing
+the file at that path is the whole job — there is nothing to re-install unless
+you move it.
+
+### What holds state, and what happens to it
+
+| | Survives an upgrade | |
+| --- | --- | --- |
+| The collection folder | **Yes** | The results themselves, and the source of truth. This tool only ever reads it — it has no code that writes there. |
+| The index | Rebuilt if it has to be, and the old one kept | Derived data. If a release changes its internal shape, the existing file is renamed to `…superseded-v1-<when>.db` and a fresh one is rebuilt from the folder — `serve` does that in its startup scan, so it is invisible, though a bare `report` straight afterwards would show an empty fleet until you `scan`. [What that means for history](#what-an-index-format-change-does-to-your-history). |
+| Your config file | **Yes** | New options arrive with defaults, so a file written for an older version keeps working untouched. |
+| Sessions | No | Held in memory, so everyone signs in again. Against an identity provider they are already signed in to, that is one redirect they will barely notice. |
+
+Downgrading is the direction that bites, and it fails loudly rather than
+quietly: the config rejects keys it doesn't know, so a file that has picked up
+a newer release's options will stop an older binary with
+``unknown field `x`, expected one of ...``. Delete the newer keys, or keep the
+old config alongside.
+
+### What an index-format change does to your history
+
+Rarely, a release changes the index's internal shape. [CHANGELOG.md](CHANGELOG.md)
+will say so when it happens, and there is nothing for you to do — but it is
+worth knowing what it does, because it depends on how your collector names its
+files.
+
+The old index is **renamed, not deleted**:
+
+```
+fleet-index.db                                  <- fresh, rebuilt from the folder
+fleet-index.superseded-v1-20260910T090735Z.db   <- everything it held before
+```
+
+Then the folder is rescanned into a clean index. If your collector writes **one
+file per run**, that rebuild is complete and the preserved file is just
+belt-and-braces.
+
+If it writes **one file per machine and overwrites it** — the
+`--output …\%COMPUTERNAME%.json` pattern in [Getting
+started](#1-collect-one-result) — the folder only ever holds each machine's
+*latest* result, so the index was the only record of the runs before it. The
+rebuild brings the current state back intact, and the dashboard's trend history
+restarts from there. Nothing is destroyed: the earlier runs are in the
+preserved file, which is an ordinary SQLite database that any tool can open.
+But the live "compare a machine with its own past" comparison will have less to
+work with until new runs accumulate.
+
+To avoid the reset altogether, **collect one file per run** —
+`--output …\%COMPUTERNAME%-2026-09-10.json`, or dated folders, since `scan`
+walks subdirectories. Then the folder genuinely holds everything and the index
+really is disposable, which is how it is meant to be. The trade-off:
+loadbearer's `--skip-if-newer-than` guard works off the mtime of a stable
+`--output` path, so it pairs with overwriting and not with this.
+
+Delete the preserved files whenever you have decided you don't want them. They
+are never read again.
 
 ## Metrics
 

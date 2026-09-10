@@ -417,7 +417,10 @@ public_url = "https://PUT-THE-HOSTNAME-USERS-REACH-THIS-ON-HERE"
 # The folder your deployment tool drops loadbearer result files into.
 collection_dir = 'PUT-THE-PATH-TO-YOUR-RESULTS-SHARE-HERE'
 
-# Derived data. Delete it and it rebuilds from the folder above.
+# Derived data: delete it and it rebuilds from the folder above. If an upgrade
+# ever changes its internal shape, the old file is renamed rather than dropped -
+# see "Upgrading" in the README, because what that costs you depends on whether
+# your collector keeps a file per run.
 index = "fleet-index.db"
 
 [auth]

@@ -1,9 +1,9 @@
 //! The SQLite index over a folder of result files.
 //!
-//! The **folder is the source of truth**; this index is a derived, disposable
-//! read model. Nothing is ever only in the database, so it can be deleted and
-//! rebuilt from the same files, which is what makes schema changes here cheap
-//! and means there is no data to migrate or back up separately.
+//! The **folder is the source of truth**; this index is a derived read model.
+//! It can be deleted and rebuilt from the same files, which is what makes
+//! schema changes here cheap and why a change to `INDEX_VERSION` rebuilds
+//! rather than migrating.
 //!
 //! Ingest is **idempotent by content**. A collection share gets rescanned
 //! constantly — on a timer, after a sweep, when someone hits refresh — and the
@@ -14,6 +14,19 @@
 //! History is kept: one row per run, not per machine. Trend, drift and
 //! regression questions all need the series, and the whole point of a fleet
 //! view is noticing that a machine got slower rather than that it is slow.
+//!
+//! **Which qualifies "disposable", and it took an experiment to notice.** A row
+//! per run plus a collector that overwrites one file per machine means the
+//! index accumulates runs whose files no longer exist. Rebuilding it then
+//! recovers the current state of the fleet and silently loses the trend — the
+//! comparison this exists to make. So the index is derived exactly when the
+//! collection folder keeps a file per run, and is the only copy of the history
+//! when it doesn't.
+//!
+//! Which is why a version change renames the old file rather than dropping its
+//! tables: the rebuild costs a rescan either way, and being wrong about which
+//! of those two situations an operator is in should not cost them their
+//! history. See `set_aside`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -21,12 +34,146 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 
 use crate::schema::ResultFile;
 
-/// Bumped when the derived tables change shape. Since the index is rebuildable
-/// from the folder, a mismatch drops and rebuilds rather than migrating.
+/// Bumped when the derived tables change shape. A mismatch rebuilds from the
+/// folder rather than migrating — see `set_aside` for what happens to the old
+/// file, which is not simply deleted.
 const INDEX_VERSION: i64 = 1;
+
+/// The version stamp on an existing index file, or `None` if there is no file
+/// yet. A file with no stamp reads as version 0, which is what a database this
+/// build has only just created looks like.
+///
+/// Any WAL is folded back into the main file on the way out, so that if the
+/// caller goes on to move it aside, the copy left behind isn't missing whatever
+/// was committed since the last checkpoint.
+fn stamped_version(path: &Path) -> Result<Option<i64>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open(path)
+        .with_context(|| format!("reading the index version from {}", path.display()))?;
+    let found: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if found != INDEX_VERSION {
+        // Best effort: a database that was never WAL has nothing to check
+        // point, and failing here would be a worse outcome than a slightly
+        // stale copy.
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+    drop(conn);
+    Ok(Some(found))
+}
+
+/// Move an index this build can't read out of the way, keeping it.
+///
+/// The obvious thing is to drop the tables and rescan, and for a long time
+/// that is what this did — the index is derived, after all. It is derived
+/// *only as long as the collection folder keeps a file per run*: the index
+/// holds a row per run, so a collector that overwrites one file per machine
+/// leaves the index as the sole record of every earlier run. Dropping it then
+/// recovers the current state of the fleet and quietly destroys the trend,
+/// which is the comparison this tool exists to make.
+///
+/// So the file is renamed instead. The rebuild costs a rescan either way; this
+/// way the history is still on disk if anyone wants it back.
+///
+/// A failure to rename is fatal rather than a fallback to deleting. This only
+/// happens during a deliberate upgrade, with somebody watching, and refusing
+/// to start with an explanation is a better outcome than starting successfully
+/// having thrown away the one copy of their history.
+fn set_aside(path: &Path, found: i64) -> Result<()> {
+    let target = free_name(path, found);
+    std::fs::rename(path, &target).with_context(|| {
+        format!(
+            "moving the old index {} aside to {}. This build reads index format {} and that file \
+             is format {}, so it cannot be used as it is — but it may hold run history that the \
+             collection folder no longer has, so it is not deleted. Move or delete it yourself to \
+             continue.",
+            path.display(),
+            target.display(),
+            INDEX_VERSION,
+            found
+        )
+    })?;
+
+    // The sidecars belong to the file that just moved. Leaving them next to the
+    // original path would hand a stale write-ahead log to the fresh database
+    // about to be created there, so they travel with it.
+    for suffix in ["-wal", "-shm"] {
+        let from = sidecar(path, suffix);
+        if from.exists() {
+            let to = sidecar(&target, suffix);
+            if let Err(e) = std::fs::rename(&from, &to) {
+                tracing::warn!(
+                    path = %from.display(),
+                    error = %e,
+                    "could not move this alongside the old index; removing it instead so it \
+                     cannot be mistaken for the new index's log"
+                );
+                std::fs::remove_file(&from)
+                    .with_context(|| format!("removing the stale {}", from.display()))?;
+            }
+        }
+    }
+
+    tracing::warn!(
+        found,
+        expected = INDEX_VERSION,
+        preserved = %target.display(),
+        "the index was built by another version; it has been kept under a new name and a fresh \
+         one will be rebuilt from the collection folder"
+    );
+    Ok(())
+}
+
+fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
+/// `fleet-index.superseded-v1-20260910T091500Z.db`, keeping the extension so
+/// the preserved file still opens in anything that reads SQLite. Counts up if
+/// that name is taken, so two upgrades in the same second can't collide.
+fn free_name(path: &Path, found: i64) -> std::path::PathBuf {
+    let now = OffsetDateTime::now_utc();
+    let stamp = format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "index".to_string());
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+
+    for attempt in 0.. {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{}", attempt + 1)
+        };
+        let candidate =
+            path.with_file_name(format!("{stem}.superseded-v{found}-{stamp}{suffix}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("0.. is unbounded")
+}
 
 pub struct Index {
     conn: Connection,
@@ -43,6 +190,14 @@ pub struct ScanReport {
 
 impl Index {
     pub fn open(path: &Path) -> Result<Self> {
+        // Checked before the file is opened for use, because a version this
+        // build doesn't know has to be moved out of the way rather than
+        // reused — see `set_aside`.
+        if let Some(found) = stamped_version(path)?
+            && found != INDEX_VERSION
+        {
+            set_aside(path, found)?;
+        }
         let conn = Connection::open(path)
             .with_context(|| format!("opening index at {}", path.display()))?;
         Self::init(conn)
@@ -60,23 +215,10 @@ impl Index {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        let found: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap_or(0);
-        if found != 0 && found != INDEX_VERSION {
-            tracing::info!(
-                found,
-                expected = INDEX_VERSION,
-                "index built by another version; dropping and rebuilding from the folder"
-            );
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS subtest;
-                 DROP TABLE IF EXISTS component;
-                 DROP TABLE IF EXISTS tag;
-                 DROP TABLE IF EXISTS run;",
-            )?;
-        }
-
+        // No version check here: a file-backed index of another version never
+        // reaches this point, because `open` moves it aside first, and an
+        // in-memory one is always empty. The tables are created
+        // `IF NOT EXISTS` so both cases land in the same place.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS run (
                  id             INTEGER PRIMARY KEY,
@@ -450,6 +592,139 @@ mod tests {
             idx.run_count().unwrap(),
             1,
             "one bad upload must not cost the good ones"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory of its own per test, since these ones touch real files.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lbf-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn runs_in(path: &Path) -> i64 {
+        let conn = Connection::open(path).expect("open");
+        conn.query_row("SELECT COUNT(*) FROM run", [], |r| r.get(0))
+            .expect("count")
+    }
+
+    /// The whole point of `set_aside`. An index this build can't read holds
+    /// history the collection folder may no longer have — a collector that
+    /// overwrites one file per machine leaves the index as the only record of
+    /// earlier runs — so it is renamed, not dropped.
+    #[test]
+    fn an_index_from_another_version_is_kept_rather_than_deleted() {
+        let dir = scratch("supersede");
+        let db = dir.join("fleet-index.db");
+        {
+            let mut idx = Index::open(&db).unwrap();
+            idx.ingest_file(&fixture("win-modern.json")).unwrap();
+            assert_eq!(idx.run_count().unwrap(), 1);
+        }
+        // Stamp it as something this build has never heard of.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "user_version", 99_i64).unwrap();
+        }
+
+        let reopened = Index::open(&db).unwrap();
+        assert_eq!(
+            reopened.run_count().unwrap(),
+            0,
+            "the working index starts empty and is rebuilt by the next scan"
+        );
+        drop(reopened);
+
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("superseded"))
+            .collect();
+        assert_eq!(kept.len(), 1, "exactly one preserved file: {kept:?}");
+        let name = &kept[0];
+        assert!(
+            name.contains("-v99-"),
+            "the old version is in the name: {name}"
+        );
+        assert!(name.ends_with(".db"), "still openable as SQLite: {name}");
+        assert_eq!(
+            runs_in(&dir.join(name)),
+            1,
+            "and the run it held is still there"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ordinary case must not touch anything: reopening an index of the
+    /// current version keeps its rows and leaves no debris behind.
+    #[test]
+    fn reopening_a_current_index_preserves_it_and_sets_nothing_aside() {
+        let dir = scratch("reopen");
+        let db = dir.join("fleet-index.db");
+        {
+            let mut idx = Index::open(&db).unwrap();
+            idx.ingest_file(&fixture("win-modern.json")).unwrap();
+        }
+        for _ in 0..3 {
+            let idx = Index::open(&db).unwrap();
+            assert_eq!(idx.run_count().unwrap(), 1);
+        }
+        let debris = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("superseded"))
+            .count();
+        assert_eq!(debris, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale write-ahead log left at the original path would be handed to the
+    /// fresh database created there, so the sidecars have to travel with the
+    /// file that owns them.
+    #[test]
+    fn nothing_of_the_old_index_is_left_at_the_original_path() {
+        let dir = scratch("sidecars");
+        let db = dir.join("fleet-index.db");
+        {
+            let mut idx = Index::open(&db).unwrap();
+            idx.ingest_file(&fixture("low-end.json")).unwrap();
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "user_version", 42_i64).unwrap();
+        }
+        let _ = Index::open(&db).unwrap();
+
+        for suffix in ["-wal", "-shm"] {
+            let orphan = sidecar(&db, suffix);
+            if orphan.exists() {
+                // It may exist because the *new* database made it; what matters
+                // is that it belongs to the new one, which holds no runs.
+                assert_eq!(
+                    runs_in(&db),
+                    0,
+                    "a sidecar at the original path must belong to the fresh index"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_preserved_name_does_not_collide_with_one_already_there() {
+        let dir = scratch("collide");
+        let db = dir.join("fleet-index.db");
+        std::fs::write(&db, b"").unwrap();
+        let first = free_name(&db, 7);
+        std::fs::write(&first, b"").unwrap();
+        let second = free_name(&db, 7);
+        assert_ne!(first, second, "the second must pick a different name");
+        assert!(
+            second.to_string_lossy().contains("-2"),
+            "counted up: {}",
+            second.display()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

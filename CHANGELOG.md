@@ -5,6 +5,23 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## Unreleased
+
+- **An index this build can't read is now kept, not dropped.** A change to the
+  index format renames the existing file to
+  `fleet-index.superseded-v1-<when>.db` and rebuilds a fresh one from the
+  collection folder. It used to drop the tables in place, which is only
+  harmless if the folder keeps a file per run: the index holds a row per run,
+  so a collector that overwrites one file per machine leaves the index as the
+  sole record of everything earlier. Renaming costs the same rescan and leaves
+  the history on disk. A rename that fails stops startup with an explanation
+  rather than falling back to deleting.
+- **Axis labels can no longer repeat.** A chart whose tallest bar was 2
+  machines drew ticks on halves and printed `0, 1, 1, 2, 2` through an integer
+  formatter — the normal case on a small estate. Counting axes now take a
+  minimum step of 1, and `scripts/check-ui.mjs` fails on a duplicated label.
+- A favicon and README branding, and upgrade instructions.
+
 ## 0.1.0 - Thu, 10 Sep 2026
 
 First release. A fleet dashboard over a folder of collected
