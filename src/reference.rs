@@ -370,9 +370,18 @@ mod tests {
     }
 
     /// The configuration half is only drift-proof because it embeds the starter
-    /// file. That holds only while the starter file itself covers every key, so
-    /// compare it against a serialised `Config::default()` — which is every
-    /// field there is, by construction.
+    /// file. That holds only while the starter file itself covers every key.
+    ///
+    /// The comparison is against a Config with **every field written out
+    /// explicitly** rather than `Config::default()`, and that is the whole
+    /// trick. TOML has no null, so the serializer omits a `None`, which meant
+    /// an `Option` field was invisible here — the guard silently covered only
+    /// the fields that happened to have a value, and `collection_dir`,
+    /// `archive_dir`, `log.file` and `ca_bundle` were all of that shape.
+    /// Listing the fields with no `..Default::default()` makes the *compiler*
+    /// enforce completeness: a new setting anywhere in the config will not
+    /// build until it is named here, and then this test asks whether
+    /// `init-config` mentions it.
     #[test]
     fn the_starter_file_covers_every_configuration_key() {
         fn keys(v: &toml::Value, prefix: &str, out: &mut Vec<String>) {
@@ -392,8 +401,46 @@ mod tests {
             }
         }
 
+        // No `..Default::default()` anywhere below, on purpose: that is what
+        // makes adding a config field a compile error here rather than a
+        // silently unguarded setting.
+        let everything = crate::config::Config {
+            server: crate::config::Server {
+                bind: "127.0.0.1:8787".parse().expect("literal"),
+                public_url: "https://fleet.example".into(),
+                collection_dir: Some("collection".into()),
+                index: "i.db".into(),
+                archive_dir: Some("archive".into()),
+                scan_interval_minutes: 15,
+            },
+            auth: crate::config::Auth {
+                mode: crate::config::AuthMode::Oidc,
+                issuer: "https://idp.example".into(),
+                client_id: "id".into(),
+                client_secret: "secret".into(),
+                groups_claim: "groups".into(),
+                session_hours: 8,
+                extra_scopes: vec!["groups".into()],
+                ca_bundle: Some("ca.pem".into()),
+                grants: vec![crate::config::Grant {
+                    group: "g".into(),
+                    role: crate::config::Role::Admin,
+                    tags: Default::default(),
+                }],
+            },
+            metrics: crate::config::Metrics {
+                enabled: true,
+                token: "t".into(),
+            },
+            log: crate::config::Log {
+                format: crate::config::LogFormat::Text,
+                level: "info".into(),
+                file: Some("fleet.log".into()),
+            },
+        };
+
         let defaults: toml::Value =
-            toml::from_str(&toml::to_string(&Config::default()).expect("Config serialises"))
+            toml::from_str(&toml::to_string(&everything).expect("Config serialises"))
                 .expect("valid TOML");
         let starter: toml::Value = toml::from_str(&Config::starter()).expect("starter is TOML");
 

@@ -258,12 +258,37 @@ impl Authenticator {
     }
 
     async fn discover(&self) -> Result<(reqwest::Client, OidcClient)> {
-        let http = reqwest::ClientBuilder::new()
+        let mut builder = reqwest::ClientBuilder::new()
             // Following redirects from an identity provider's discovery URL
             // turns this into an SSRF primitive.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("building the HTTP client")?;
+            .redirect(reqwest::redirect::Policy::none());
+
+        // The built-in roots will not include an internal CA, and this client
+        // deliberately does not read the machine's trust store — so for a
+        // self-hosted provider behind a private CA this is the only way in.
+        // Added to the built-in set rather than replacing it, so moving the
+        // provider onto a publicly-trusted certificate later doesn't break.
+        if let Some(path) = &self.config.ca_bundle {
+            let pem = std::fs::read(path).with_context(|| {
+                format!(
+                    "reading auth.ca_bundle {} — it should be a PEM file holding the \
+                     certificate authorities to trust for the identity provider",
+                    path.display()
+                )
+            })?;
+            let certs = reqwest::Certificate::from_pem_bundle(&pem)
+                .with_context(|| format!("{} is not a PEM certificate bundle", path.display()))?;
+            // An empty file would otherwise leave the provider untrusted while
+            // looking configured, which is the worst of both.
+            if certs.is_empty() {
+                anyhow::bail!("auth.ca_bundle {} held no certificates", path.display());
+            }
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+
+        let http = builder.build().context("building the HTTP client")?;
         let issuer = IssuerUrl::new(self.config.issuer.clone())
             .with_context(|| format!("auth.issuer {:?} is not a URL", self.config.issuer))?;
         let metadata = CoreProviderMetadata::discover_async(issuer, &http)
@@ -294,9 +319,13 @@ impl Authenticator {
         let (_http, _client) = self.discover().await?;
         Ok(format!(
             "discovery succeeded for {}\n  client_id:    {}\n  client type:  {}\n  \
-             redirect URI: {}\n  groups claim: {}\n  grants:       {}\n\nRegister that exact \
-             redirect URI on the app registration, and make sure the {:?} claim is emitted in \
-             the ID token — on Entra that is Token configuration, not a scope.",
+             redirect URI: {}\n  groups claim: {}\n  extra scopes: {}\n  CA trust:     {}\n  \
+             grants:       {}\n\nRegister that exact redirect URI with the provider, and make \
+             sure the {:?} claim reaches the **ID token** — this reads the ID token and never \
+             calls the userinfo endpoint, so a claim that only appears there is invisible. On \
+             Entra that is Token configuration rather than a scope; on a self-hosted provider \
+             it is usually a scope, and often a setting about which claims go in the ID token \
+             as well.",
             self.config.issuer,
             self.config.client_id,
             if self.config.client_secret.is_empty() {
@@ -306,6 +335,15 @@ impl Authenticator {
             },
             self.redirect_url,
             self.config.groups_claim,
+            if self.config.extra_scopes.is_empty() {
+                "none beyond openid profile email".to_string()
+            } else {
+                self.config.extra_scopes.join(" ")
+            },
+            match &self.config.ca_bundle {
+                Some(p) => format!("built-in roots + {}", p.display()),
+                None => "built-in roots only (not the machine's trust store)".to_string(),
+            },
             self.config.grants.len(),
             self.config.groups_claim,
         ))
@@ -862,6 +900,54 @@ mod tests {
             },
         );
         assert!(auth.take_pending("old").is_none());
+    }
+
+    /// A self-hosted provider behind an internal CA is the case `ca_bundle`
+    /// exists for, and the failures have to be legible: this client trusts a
+    /// built-in root set and never reads the machine's trust store, so an
+    /// admin who has already installed the CA on the server will not believe
+    /// the problem is here. Both mistakes name the setting and the file.
+    #[tokio::test]
+    async fn a_bad_ca_bundle_says_which_setting_and_which_file() {
+        let dir = std::env::temp_dir().join(format!("lbf-ca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let with_bundle = |path: std::path::PathBuf| {
+            let mut c = config_with_grants(vec![]);
+            c.auth.ca_bundle = Some(path);
+            Authenticator::new(&c)
+        };
+
+        // Missing.
+        let missing = dir.join("nope.pem");
+        let err = format!(
+            "{:#}",
+            with_bundle(missing.clone())
+                .discover()
+                .await
+                .expect_err("a ca_bundle that isn't there must fail")
+        );
+        assert!(err.contains("auth.ca_bundle"), "{err}");
+        assert!(err.contains("nope.pem"), "{err}");
+
+        // Present but holding no certificate. Silently trusting nothing extra
+        // would look configured and fail later at the handshake.
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, b"# nothing here\n").expect("write");
+        let err = format!(
+            "{:#}",
+            with_bundle(empty)
+                .discover()
+                .await
+                .expect_err("an empty bundle must fail")
+        );
+        assert!(
+            err.contains("no certificates") || err.contains("not a PEM"),
+            "an empty bundle should be refused for being empty: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `/auth/login` needs no session, and each call holds a state, a nonce and

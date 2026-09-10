@@ -57,6 +57,12 @@ It:
   runtime — which is what lets it send `default-src 'self'` and mean it;
 - makes **no outbound connections** except to the identity provider's discovery,
   JWKS and token endpoints during a sign-in, and only when `auth.mode = "oidc"`.
+  Those requests **do not follow redirects** — following one from a
+  discovery URL would make this an SSRF primitive — and they verify the
+  provider's certificate against a **built-in root set**, not the machine's
+  trust store. There is no option to skip verification; `auth.ca_bundle` adds
+  a private CA to the built-in roots for a self-hosted provider, and is the
+  only way to do it.
 
 It stores no credentials. `client_secret` exists in the config for providers
 that require one, but the intended shape is a public client with PKCE, so the

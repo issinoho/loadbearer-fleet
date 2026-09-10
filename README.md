@@ -507,6 +507,61 @@ server-side and keyed by the token's SHA-256 so a memory dump doesn't hand
 anyone a live session. They live in memory, so a restart signs everyone out;
 there are no refresh tokens stored anywhere.
 
+### Self-hosted providers — Authelia, Keycloak, Authentik
+
+Nothing here is Entra-specific: any provider with a discovery document, the
+authorization code flow and PKCE works. Two things catch people out, and both
+are visible in `check-auth` before a user ever tries to sign in.
+
+**Groups must reach the ID token.** This reads the ID token and **never calls
+the userinfo endpoint**, so a `groups` claim that only appears at userinfo is
+invisible — you sign in successfully and match no grant. That usually means two
+settings rather than one:
+
+```toml
+[auth]
+issuer = "https://auth.example.internal"
+client_id = "loadbearer-fleet"
+extra_scopes = ["groups"]      # Authelia emits groups only when asked
+groups_claim = "groups"
+```
+
+`extra_scopes` is the scope request; whether the claim then lands in the ID
+token rather than only at userinfo is a provider setting, and on Authelia in
+particular it is worth confirming for your version. Entra needs the opposite —
+no scope, a token-configuration change.
+
+**An internal CA needs pointing at.** The HTTP client trusts a built-in root set
+and does **not** read the machine's trust store, so installing your CA on the
+server changes nothing. Point at it:
+
+```toml
+[auth]
+ca_bundle = '/etc/loadbearer-fleet/internal-ca.pem'
+```
+
+It is added to the built-in roots rather than replacing them, so moving the
+provider to a publicly-trusted certificate later doesn't break anything. A
+publicly-trusted certificate — Let's Encrypt via DNS-01 works for an
+internal-only hostname — needs no setting at all.
+
+`check-auth` reports both, so you can see what it will look for:
+
+```
+discovery succeeded for https://auth.example.internal
+  client_id:    loadbearer-fleet
+  client type:  public (PKCE, no secret)
+  redirect URI: https://fleet.example.internal/auth/callback
+  groups claim: groups
+  extra scopes: groups
+  CA trust:     built-in roots + /etc/loadbearer-fleet/internal-ca.pem
+  grants:       2
+```
+
+What it does **not** test is the code exchange and the token verification, which
+need a real sign-in — see
+[SECURITY.md](SECURITY.md) on what is and isn't verified.
+
 ### It will not put the estate on the wire in the clear
 
 The index holds the hostname and firmware serial of every machine you own, so a

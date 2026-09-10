@@ -193,9 +193,24 @@ pub struct Auth {
     pub session_hours: u32,
     /// Scopes beyond `openid profile email`. Entra needs none of these for
     /// group claims — those come from the token configuration on the app
-    /// registration, not from a scope.
+    /// registration, not from a scope. A self-hosted provider usually does:
+    /// Authelia, for one, emits `groups` only when the `groups` scope is asked
+    /// for.
     #[serde(default)]
     pub extra_scopes: Vec<String>,
+    /// A PEM file of extra certificate authorities to trust when talking to
+    /// the identity provider.
+    ///
+    /// Only needed for a provider whose certificate is signed by a CA that
+    /// isn't publicly trusted — a self-hosted one behind an internal CA, most
+    /// often. The HTTP client here trusts a **built-in** root set and does not
+    /// read the operating system's trust store, so installing a CA on the
+    /// machine has no effect and this is the only way to add one.
+    ///
+    /// Added to the built-in roots rather than replacing them, so a provider
+    /// that later moves to a publicly-trusted certificate keeps working.
+    #[serde(default)]
+    pub ca_bundle: Option<PathBuf>,
     /// Group-to-role mapping. Order matters only as a tie-break; see
     /// `Auth::resolve`.
     #[serde(default)]
@@ -220,6 +235,7 @@ impl Default for Auth {
             groups_claim: groups_claim(),
             session_hours: session_hours(),
             extra_scopes: Vec::new(),
+            ca_bundle: None,
             grants: Vec::new(),
         }
     }
@@ -323,6 +339,7 @@ impl Config {
             .map(|p| beside(base, p));
         self.server.archive_dir = self.server.archive_dir.as_deref().map(|p| beside(base, p));
         self.log.file = self.log.file.as_deref().map(|p| beside(base, p));
+        self.auth.ca_bundle = self.auth.ca_bundle.as_deref().map(|p| beside(base, p));
     }
 
     /// Is the dashboard reachable over a channel that hides a session cookie?
@@ -360,6 +377,7 @@ impl Config {
         )?;
         check_placeholder_path("server.archive_dir", self.server.archive_dir.as_deref())?;
         check_placeholder_path("log.file", self.log.file.as_deref())?;
+        check_placeholder_path("auth.ca_bundle", self.auth.ca_bundle.as_deref())?;
 
         if self.auth.mode == AuthMode::None {
             if !self.auth.grants.is_empty() {
@@ -517,7 +535,20 @@ session_hours = 8
 # claims - those come from the token configuration on the app registration
 # rather than from a scope - so leave it empty unless your provider says
 # otherwise.
+#
+# A self-hosted provider usually does need one. Authelia emits `groups` only
+# when the groups scope is asked for:  extra_scopes = ["groups"]
 extra_scopes = []
+
+# Extra certificate authorities to trust when contacting the provider, as a PEM
+# file. Only needed where the provider's certificate is signed by a CA that is
+# not publicly trusted - a self-hosted one behind an internal CA, usually.
+#
+# This trusts a built-in root set and does not read the machine's trust store,
+# so installing the CA on the server has no effect and this is the only way to
+# add it. Added to the built-in roots, not instead of them.
+#
+# ca_bundle = 'PUT-THE-PATH-TO-YOUR-CA-BUNDLE-HERE'
 
 [log]
 # "text" for a console, "json" for a log collector.
