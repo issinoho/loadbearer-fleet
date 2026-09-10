@@ -146,10 +146,40 @@ empty dashboard, and results appear as they land.
   write each machine's `--output` there — see loadbearer's
   [Fleet Deployment](https://github.com/issinoho/loadbearer/wiki/Fleet-Deployment)
   wiki page for the unattended side, including the `--tag` labels this groups by.
+- **Label machines with whatever you group them by**, and it becomes a filter
+  and a sortable column without being configured here — see
+  [Labelling machines](#labelling-machines-and-a-word-about-owners).
 - **Run it as a service** so it survives a reboot and rescans on its own —
   see [Running it as a service](#running-it-as-a-service).
 - **Turn on single sign-on** before anyone but you can reach it — see
   [Sign-in](#sign-in).
+
+### Labelling machines, and a word about owners
+
+Whatever your deployment tool passes as `--tag key=value` is indexed, and the
+dashboard works it out from the data rather than from configuration: each key
+becomes a **filter** in the row above the views and a **sortable column** in the
+machine table, and any tag *value* is matched by the Search box. So
+`--tag site=glasgow --tag ring=canary` needs nothing here to become two filters
+and two columns. Tags are deliberately **not** part of a machine's peer group —
+relabelling an estate never changes a cohort.
+
+**Owners are the tempting case, and worth a thought first.** `--tag
+owner=jsmith` works exactly as above, and one person owning several machines
+is just a repeated value. But that value then lives in every result document on
+the share, in the index, in `archive_dir` — immutable, and kept — and in every
+`backup` snapshot and every file anyone attaches to a bug report. loadbearer's
+own `PRIVACY.md` says it plainly: *anything a `--tag` puts in the file is text
+you supplied, so don't put personal data in one.* It is also frozen at the
+moment of the run, so a reassigned machine keeps its old owner until it is
+measured again.
+
+If the assignment already lives somewhere authoritative — Intune's primary
+user, SCCM, an asset system — the cheaper answer is to join on it there. This
+indexes `serial` and `asset_tag`, which is what those systems key on, and
+`report --json` gives you the fleet side to join against. A team label
+(`team=finance`) or an asset reference carries most of the same benefit without
+putting a person's name in a thousand files.
 
 ### A note on the Windows binary
 

@@ -1101,6 +1101,11 @@ impl Filter {
             ]
             .into_iter()
             .flatten()
+            // Tag *values* as well, so whatever the deployment tool labels a
+            // machine with is findable by typing it. Values only, not keys: a
+            // search for "site" should not return the whole estate because
+            // every machine carries that key.
+            .chain(m.tags.values().map(String::as_str))
             .any(|f| f.to_lowercase().contains(&q));
             if !hit {
                 return false;
@@ -1849,6 +1854,53 @@ mod tests {
         );
         assert_eq!(stale.summary.machines, 1);
         assert_eq!(stale.machines[0].hostname.as_deref(), Some("OLD-1"));
+    }
+
+    /// Whatever the deployment tool labels a machine with has to be findable by
+    /// typing it. An estate that tags machines with their owner is the case
+    /// this exists for: an IT department asking "which are Jane's" should not
+    /// have to know that Search covered every identifier *except* the one they
+    /// put there themselves.
+    #[test]
+    fn search_finds_a_machine_by_a_tag_value() {
+        let mut e = Estate::new();
+        e.add_with("PC-1", 1000.0, "2026-09-09T10:00:00Z", |d| {
+            d["tags"] = json!({ "owner": "jsmith", "site": "glasgow" });
+        });
+        e.add_with("PC-2", 1000.0, "2026-09-09T10:00:00Z", |d| {
+            d["tags"] = json!({ "owner": "jsmith", "site": "edinburgh" });
+        });
+        e.add_with("PC-3", 1000.0, "2026-09-09T10:00:00Z", |d| {
+            d["tags"] = json!({ "owner": "akhan", "site": "glasgow" });
+        });
+        let all = e.snap();
+        let th = Thresholds::default();
+
+        let mine = all.filtered(
+            &Filter {
+                search: Some("JSmith".into()),
+                ..Default::default()
+            },
+            &th,
+        );
+        assert_eq!(
+            mine.summary.machines, 2,
+            "one person can own several machines, and searching them should return all of them"
+        );
+
+        // Keys are deliberately not matched: every machine carries `site`, so
+        // searching for it returning the whole estate would be useless.
+        let by_key = all.filtered(
+            &Filter {
+                search: Some("site".into()),
+                ..Default::default()
+            },
+            &th,
+        );
+        assert_eq!(
+            by_key.summary.machines, 0,
+            "a tag key is not a value and must not match every machine that has one"
+        );
     }
 
     /// The property tag-scoped authorization rests on. The viewer's own filter

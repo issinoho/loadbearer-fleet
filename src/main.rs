@@ -188,16 +188,24 @@ fn init_logging(log: &config::Log, cli_level: Option<&str>) -> Result<()> {
     // the formatter, and those are different types, so the arms cannot be
     // collapsed.
     match (&log.file, log.format) {
+        // stderr, not stdout. `report --json` writes a document to stdout that
+        // is meant to be piped into `jq` or diffed against another server's,
+        // and a log line in front of it makes that a parse error rather than a
+        // snapshot. Diagnostics belong on stderr for a command-line tool
+        // regardless; this became load-bearing the moment there was a line
+        // logged on every run.
         (None, LogFormat::Text) => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_target(false)
+                .with_writer(std::io::stderr)
                 .init();
         }
         (None, LogFormat::Json) => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .json()
+                .with_writer(std::io::stderr)
                 .init();
         }
         (Some(path), format) => {

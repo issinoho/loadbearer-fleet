@@ -1100,6 +1100,15 @@ export function renderMachines(main) {
     if (f.severity === 'info') continue;
     flagCount.set(f.machine_key, (flagCount.get(f.machine_key) || 0) + 1);
   }
+  // One column per tag key rather than one column holding all of them joined.
+  // The joined form could not be sorted usefully: "ring=canary site=glasgow
+  // user=jsmith" sorts by whichever key happens to come first alphabetically,
+  // so asking for the table by owner gave you it by ring. Same text on screen,
+  // one column each, each sortable on its own.
+  const tagKeys = [...new Set(
+    state.snap.machines.flatMap((m) => Object.keys(m.tags || {})),
+  )].sort();
+
   const rows = state.snap.machines.map((m) => ({
     key: m.key,
     cells: [
@@ -1111,10 +1120,14 @@ export function renderMachines(main) {
       deltaCell(m.trend_pct),
       flagCount.get(m.key) || 0,
       ago(m.age_days),
-      Object.entries(m.tags || {}).map(([k, v]) => `${k}=${v}`).join(' ') || '—',
+      ...tagKeys.map((k) => m.tags?.[k] ?? '—'),
     ],
+    // Machines with no value for a tag sort last either way: dataTable puts
+    // null after everything, ascending or descending, so "sort by owner" does
+    // not bury the assigned machines under the unassigned ones.
     sort: [m.hostname || m.key, m.cpu_model, m.score, m.grade, m.cohort_delta_pct, m.trend_pct,
-      flagCount.get(m.key) || 0, -(m.age_days ?? 1e9), null],
+      flagCount.get(m.key) || 0, -(m.age_days ?? 1e9),
+      ...tagKeys.map((k) => m.tags?.[k]?.toLowerCase() ?? null)],
   }));
 
   main.append(el('div', { class: 'grid' }, [el('div', { class: 'card col-12' }, [
@@ -1123,7 +1136,8 @@ export function renderMachines(main) {
     dataTable({
       columns: [{ label: 'Machine' }, { label: 'CPU' }, { label: 'Score', num: true }, { label: 'Grade' },
         { label: 'vs peers', num: true }, { label: 'vs own history', num: true },
-        { label: 'Findings', num: true }, { label: 'Measured' }, { label: 'Tags' }],
+        { label: 'Findings', num: true }, { label: 'Measured' },
+        ...tagKeys.map((k) => ({ label: k }))],
       rows,
       sortable: true,
     }),
