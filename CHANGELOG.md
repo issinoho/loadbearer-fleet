@@ -5,6 +5,36 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.5.5 - Fri, 11 Sep 2026
+
+One fix, to the comparison view's run picker. Worth upgrading for if you use
+**Compare** at all, because the failure is the misleading kind: the numbers
+were right and the control describing them was not.
+
+### Fixed
+
+- **The run picker named a different run from the one being compared.** With
+  two runs of one machine selected, both dropdowns could show the same
+  timestamp while the table correctly compared two different runs — and
+  changing a dropdown to the run it *appeared* to already show was refused with
+  `run X appears twice`, because it had never held what it displayed.
+
+  The comparison itself was correct throughout. The dashboard's element helper
+  wrote boolean attributes by value, so `{ selected: false }` became
+  `selected="false"` — and a boolean attribute is true by its *presence*, so
+  every option in the dropdown was marked selected, the browser showed the last
+  of them, and which run that was had nothing to do with the URL.
+
+  The helper now omits a `false` attribute and writes a `true` one as empty,
+  which is what the HTML means, and the picker sets `select.value` as a
+  property, which is what the browser actually reads.
+
+  `scripts/check-ui.mjs` gave every machine a single run, so the picker
+  rendered a date rather than a dropdown and the check never exercised the
+  control the bug lived in. It now gives one machine a second run and asserts
+  that at most one option is marked selected and that the control's value is
+  the run being compared — both of which fail against the previous release.
+
 ## 0.5.4 - Fri, 11 Sep 2026
 
 One papercut, met while following 0.5.3's own upgrade instructions.
