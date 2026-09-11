@@ -98,11 +98,17 @@ cd "loadbearer-fleet-$V-x86_64-pc-windows-msvc"
 
 ```bash
 V=0.5.0
-curl -LO "https://github.com/issinoho/loadbearer-fleet/releases/download/v$V/loadbearer-fleet-$V-x86_64-unknown-linux-gnu.tar.gz"
-tar xzf "loadbearer-fleet-$V-x86_64-unknown-linux-gnu.tar.gz"
-cd "loadbearer-fleet-$V-x86_64-unknown-linux-gnu"
+A=loadbearer-fleet-$V-x86_64-unknown-linux-gnu
+U=https://github.com/issinoho/loadbearer-fleet/releases/download/v$V
+curl -LO "$U/$A.tar.gz"
+tar xzf "$A.tar.gz"
+cd "$A"
 ./loadbearer-fleet serve ~/loadbearer/results
 ```
+
+Split across variables so that no line is long enough for a terminal to wrap
+it. A wrapped URL pastes as two commands, and the first of them downloads a
+truncated path — nine bytes of "Not Found" saved under a plausible filename.
 
 Or build it yourself:
 
@@ -593,9 +599,16 @@ The short path on Linux, once that is clean:
 
 ```bash
 sudo loadbearer-fleet --config /etc/loadbearer-fleet/fleet.toml service unit \
-  | sudo tee /etc/systemd/system/loadbearer-fleet.service
+  > /tmp/loadbearer-fleet.service \
+  && sudo install -m 644 /tmp/loadbearer-fleet.service \
+       /etc/systemd/system/loadbearer-fleet.service
 sudo systemctl daemon-reload && sudo systemctl enable --now loadbearer-fleet
 ```
+
+Written via a temporary file rather than `| sudo tee` on purpose: `tee`
+truncates its target before the left-hand command has produced anything, so a
+`service unit` that refuses leaves a zero-length unit behind — and systemd
+reads a zero-length unit as *masked*. The `&&` keeps a refusal harmless.
 
 and on Windows, from an elevated prompt:
 
