@@ -456,6 +456,11 @@ fn main() -> Result<()> {
             ServiceAction::Uninstall => service::uninstall(),
             ServiceAction::Unit { user } => {
                 let path = service::preflight(cli.config.as_deref(), &config)?;
+                service::systemd_preflight(&config)?;
+                // Whatever binary printed the unit is the one it will start, so
+                // generating it from an unpacked tarball in a home directory
+                // bakes that path into ExecStart — and then ProtectHome hides
+                // it. Worth saying, because the unit looks right either way.
                 let exe = std::env::current_exe().context("finding this executable")?;
                 print!("{}", service::systemd_unit(&exe, path, &config, user));
                 Ok(())

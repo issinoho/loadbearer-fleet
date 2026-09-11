@@ -656,6 +656,8 @@ The dashboard does not terminate TLS. Put a reverse proxy in front of it and set
 
 ## Running it as a service
 
+### On Windows
+
 ```powershell
 # The folder first: `>` will not create one, and fails with
 # "Could not find a part of the path".
@@ -674,18 +676,56 @@ from ...: stream did not contain valid UTF-8`. PowerShell 7 (`pwsh`) redirects
 as UTF-8 and `>` is fine. `Set-Content -Encoding utf8` works on both — it adds
 a byte-order mark on 5.1 and not on 7, and the parser accepts either.
 
-On Linux the same two traps apply, and `sudo` doesn't fix the second one,
-because the shell opens the file before `sudo` gets a say:
+### On Linux, with systemd
+
+The unit is hardened, which means it will not start unless the things it
+mentions already exist. All of it, in order:
 
 ```bash
-sudo mkdir -p /etc/loadbearer-fleet
-./loadbearer-fleet init-config | sudo tee /etc/loadbearer-fleet/fleet.toml > /dev/null
+# The binary where the service will run it from. ExecStart is whichever binary
+# prints the unit, so install it first or the unit points into your download.
+sudo install -m 755 ./loadbearer-fleet /usr/local/bin/loadbearer-fleet
+
+# The account the unit runs as. `--user` defaults to this name, and systemd
+# fails the unit with 217/USER if it does not exist.
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin loadbearer-fleet
+
+# The directories it writes. ReadWritePaths cannot create them, and a missing
+# one fails the unit with 226/NAMESPACE — which says nothing about the cause.
+sudo mkdir -p /etc/loadbearer-fleet /var/lib/loadbearer-fleet /var/log/loadbearer-fleet
+sudo chown loadbearer-fleet: /var/lib/loadbearer-fleet /var/log/loadbearer-fleet
+
+# `sudo` does not help a redirect — the shell opens the file before sudo runs.
+loadbearer-fleet init-config | sudo tee /etc/loadbearer-fleet/fleet.toml > /dev/null
+sudo nano /etc/loadbearer-fleet/fleet.toml
 ```
 
-`service unit --config /etc/loadbearer-fleet/fleet.toml` then prints a
-systemd unit — hardened, because this process reads a share and writes one
-database and never needs a new privilege, an executable mapping or a raw socket.
-Review it, drop it in `/etc/systemd/system`, `systemctl enable --now`.
+Point `index`, `archive_dir` and `[log] file` at `/var/lib/loadbearer-fleet`
+and `/var/log/loadbearer-fleet`. **Not at your home directory** — the unit sets
+`ProtectHome=yes`, which makes `/home`, `/root` and `/run/user` *invisible* to
+the service rather than merely unreadable, so a path there fails as though it
+were never created. `service unit` refuses to print a unit for a config like
+that rather than letting you find out from systemd.
+
+```bash
+sudo loadbearer-fleet --config /etc/loadbearer-fleet/fleet.toml service unit \
+  | sudo tee /etc/systemd/system/loadbearer-fleet.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now loadbearer-fleet
+systemctl status loadbearer-fleet --no-pager
+```
+
+Two lines worth reading in the unit before you enable it: `ExecStart=` should
+say `/usr/local/bin/loadbearer-fleet`, and `ReadWritePaths=` should name every
+directory it writes — the index's, the log's, and the archive's. Everything
+else is read-only under `ProtectSystem=strict`.
+
+The log rotates daily with the date appended, so it is
+`/var/log/loadbearer-fleet/fleet.log.2026-09-11`, not `fleet.log`.
+
+`--user <account>` overrides the service account if you would rather it ran as
+an existing one.
 
 It stops when it is told to. systemd's SIGTERM, Ctrl+C and the Windows service
 controller's stop request all land in the same shutdown path, so a restart is

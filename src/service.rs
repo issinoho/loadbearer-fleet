@@ -37,20 +37,25 @@ pub const DISPLAY_NAME: &str = "loadbearer fleet dashboard";
 /// writes one database; it never needs a new privilege, an executable mapping,
 /// or a raw socket, so saying so limits what a bug in it can reach.
 pub fn systemd_unit(exe: &Path, config_path: &Path, config: &Config, user: &str) -> String {
+    // Everything the service writes. `ProtectSystem=strict` makes the rest of
+    // the filesystem read-only, so anything missed here fails at runtime — and
+    // `archive_dir` was missed for a while, which shows up months later as an
+    // archive that is mysteriously empty rather than as a startup failure.
     let mut writable = vec![];
-    if let Some(dir) = config.server.index.parent()
-        && !dir.as_os_str().is_empty()
-    {
-        writable.push(dir.display().to_string());
-    }
-    if let Some(dir) = config.log.file.as_ref().and_then(|f| f.parent())
-        && !dir.as_os_str().is_empty()
-    {
-        let dir = dir.display().to_string();
-        if !writable.contains(&dir) {
-            writable.push(dir);
+    let mut want = |dir: Option<&Path>| {
+        if let Some(dir) = dir
+            && !dir.as_os_str().is_empty()
+        {
+            let dir = dir.display().to_string();
+            if !writable.contains(&dir) {
+                writable.push(dir);
+            }
         }
-    }
+    };
+    want(config.server.index.parent());
+    want(config.log.file.as_ref().and_then(|f| f.parent()));
+    // The archive is a directory in its own right, not a file in one.
+    want(config.server.archive_dir.as_deref());
     let read_write = if writable.is_empty() {
         String::new()
     } else {
@@ -123,6 +128,65 @@ pub fn preflight<'a>(config_path: Option<&'a Path>, config: &Config) -> Result<&
         );
     }
     Ok(path)
+}
+
+/// Paths a systemd unit cannot reach, however the permissions look.
+///
+/// The generated unit sets `ProtectHome=yes`, which makes `/home`, `/root` and
+/// `/run/user` **invisible** to the service rather than merely unreadable. A
+/// path there does not fail with a permission error, it fails as though it were
+/// never there — so this is refused at generation time for the same reason a
+/// relative `--config` and a missing `[log] file` already are: all three are
+/// knowable now and produce a confusing failure later.
+fn unreachable_under_protect_home(config: &Config) -> Vec<(&'static str, String)> {
+    const HIDDEN: [&str; 3] = ["/home/", "/root/", "/run/user/"];
+
+    let mut found = Vec::new();
+    let mut check = |name: &'static str, path: Option<&Path>| {
+        if let Some(p) = path {
+            let shown = p.display().to_string();
+            // `/home` exactly, as well as anything beneath it.
+            if HIDDEN
+                .iter()
+                .any(|h| shown.starts_with(h) || shown == h.trim_end_matches('/'))
+            {
+                found.push((name, shown));
+            }
+        }
+    };
+
+    check("server.index", Some(&config.server.index));
+    check(
+        "server.collection_dir",
+        config.server.collection_dir.as_deref(),
+    );
+    check("server.archive_dir", config.server.archive_dir.as_deref());
+    check("log.file", config.log.file.as_deref());
+    found
+}
+
+/// The systemd-specific check, on top of [`preflight`].
+///
+/// Separate from `preflight` because a Windows service has no equivalent of
+/// `ProtectHome`, so this would be refusing something that works there.
+pub fn systemd_preflight(config: &Config) -> Result<()> {
+    let hidden = unreachable_under_protect_home(config);
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    let list = hidden
+        .iter()
+        .map(|(field, path)| format!("\n  {field} = {path}"))
+        .collect::<String>();
+    anyhow::bail!(
+        "these paths are under a home directory, and the unit this would print sets \
+         ProtectHome=yes — which makes /home, /root and /run/user *invisible* to the service, \
+         not merely unreadable, so it would fail as though the paths did not exist:{list}\n\n\
+         Move them somewhere a system service can reach — /var/lib/loadbearer-fleet for the \
+         index and the archive, /var/log/loadbearer-fleet for the log — or pass \
+         --user <your-own-account> and edit ProtectHome out of the unit yourself, knowing why \
+         it was there."
+    )
 }
 
 #[cfg(windows)]
@@ -459,6 +523,62 @@ mod tests {
             .expect("a ReadWritePaths line");
         assert!(line.contains("/var/lib/loadbearer-fleet"), "{line}");
         assert!(line.contains("/var/log/loadbearer-fleet"), "{line}");
+    }
+
+    /// The archive is a third writable place and was missing from the unit for
+    /// several releases. It fails in the worst available way: everything starts,
+    /// the dashboard works, and only the archive writes are refused — so the
+    /// symptom is an empty archive noticed months later, not a failure to boot.
+    #[test]
+    fn the_unit_grants_write_access_to_the_archive_too() {
+        let mut c = config();
+        c.server.archive_dir = Some(PathBuf::from("/srv/loadbearer-archive"));
+        let unit = systemd_unit(
+            Path::new("/usr/local/bin/loadbearer-fleet"),
+            Path::new("/etc/loadbearer-fleet/fleet.toml"),
+            &c,
+            "loadbearer",
+        );
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("ReadWritePaths="))
+            .expect("a ReadWritePaths line");
+        assert!(
+            line.contains("/srv/loadbearer-archive"),
+            "archive_dir is writable at runtime and must be named: {line}"
+        );
+    }
+
+    /// `ProtectHome=yes` makes a home directory *invisible*, so a path there
+    /// fails as though it were never created. Refusing at generation time is
+    /// the same bargain as refusing a relative `--config`: both are knowable
+    /// now and both produce a baffling failure later.
+    #[test]
+    fn a_config_under_a_home_directory_is_refused_for_systemd() {
+        for (field, path) in [
+            ("server.index", "/home/iain/loadbearer/fleet-index.db"),
+            ("log.file", "/home/iain/loadbearer/fleet.log"),
+            ("server.archive_dir", "/root/archive"),
+        ] {
+            let mut c = config();
+            match field {
+                "server.index" => c.server.index = PathBuf::from(path),
+                "log.file" => c.log.file = Some(PathBuf::from(path)),
+                _ => c.server.archive_dir = Some(PathBuf::from(path)),
+            }
+            let err = format!(
+                "{:#}",
+                systemd_preflight(&c).expect_err("a home-directory path must be refused")
+            );
+            assert!(err.contains("ProtectHome"), "{err}");
+            assert!(err.contains(path), "the message must name the path: {err}");
+            assert!(err.contains(field), "and the setting: {err}");
+        }
+
+        // And the layout the docs recommend is accepted.
+        let mut ok = config();
+        ok.server.archive_dir = Some(PathBuf::from("/var/lib/loadbearer-fleet/archive"));
+        assert!(systemd_preflight(&ok).is_ok());
     }
 
     #[test]
