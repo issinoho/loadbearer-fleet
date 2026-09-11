@@ -5,6 +5,95 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.5.0 - Fri, 11 Sep 2026
+
+Two commands that now do the diagnosis rather than describe it, a dashboard
+that works on a phone, and a Sign out button that works at all. **If you run
+this behind an identity provider, two of the fixes matter to you**, and one of
+them needs a change on the provider as well.
+
+### New
+
+- **`service preflight` checks what the generated unit will depend on, before
+  you install it.** The hardened unit refuses to start unless what it names
+  already exists, and systemd reports those refusals as `217/USER` and
+  `226/NAMESPACE` — codes that say nothing about the cause, arriving while you
+  are reading journal output rather than a sentence. So it checks, while the
+  answer is still readable: an absolute `--config`, `[log] file` set, the
+  binary not under a home directory (it becomes `ExecStart`, and
+  `ProtectHome=yes` would hide it), no config path under one either, the
+  service account existing, every `ReadWritePaths` directory existing *and*
+  writable by that account, the collection folder present, and the bind
+  address actually free. Each failure carries its own fix.
+
+  Two deliberate calls: writability is judged from ownership and mode rather
+  than by attempting a write as the target account, which would mean being that
+  account — a heuristic, and it says so. And a missing collection folder is a
+  note rather than a failure, because the startup scan reports it and carries
+  on.
+
+### Changed
+
+- **`check-auth` sends the authorization request a real sign-in sends, and
+  reads the answer.** It used to prove discovery and then print your settings
+  back at you. It now settles in one command what took three rounds of `curl`:
+  whether the client is registered, whether the redirect URI matches byte for
+  byte, and whether the scopes and PKCE are accepted. Checked against a live
+  provider along with each failure it claims to diagnose — an unknown
+  `client_id`, an unregistered redirect URI, and a scope the client is not
+  allowed. It exits non-zero, so it can gate a deploy rather than being
+  something somebody has to read carefully. What it cannot know it lists,
+  because the group claim only appears in a real ID token.
+- **Three runbooks in the wiki**, and a README that links to them instead of
+  restating them: [deploying as a
+  service](https://github.com/issinoho/loadbearer-fleet/wiki/Deploying-as-a-Service),
+  [adding an identity
+  provider](https://github.com/issinoho/loadbearer-fleet/wiki/Adding-an-Identity-Provider),
+  and [Authelia](https://github.com/issinoho/loadbearer-fleet/wiki/Identity-Provider-Authelia)
+  specifically, which has been run end to end. Ordered steps that each end in
+  a command, rather than prose with the sequence left to infer, plus a table
+  mapping every `FAIL` line `check-auth` can print to the one setting that
+  fixes it.
+- **The dashboard is checked in a real browser.** `scripts/check-mobile.mjs`
+  starts the binary and lays the page out in headless Chrome at 390, 320, 768
+  and 1440 pixels wide, failing if anything scrolls sideways, is painted past
+  the right edge, clips instead of scrolling, or is too small to tap. It found
+  a 320px fault on its first CI run that this machine's font metrics had
+  hidden.
+
+### Fixed
+
+- **Sign out did nothing.** It ended the session correctly and then redirected
+  to `/`, which needs a session — so the browser was sent on to `/auth/login`,
+  the identity provider still had a session of its own, handed back a fresh
+  one, and you arrived back on the dashboard. The session really had ended;
+  none of that was visible. It now lands on `/auth/signed-out`, a page that
+  needs no session, starts none, and explains the part that surprises people:
+  this ends the dashboard's session and deliberately not the provider's, so
+  signing back in may not ask for a password.
+- **The banner labelled people with a UUID.** The display name came from
+  `name`, then `preferred_username`, then the subject — and this reads the ID
+  token and never calls userinfo, so on a provider that sends those claims to
+  userinfo only, which is Authelia's default, the subject was all that was
+  left. `email` is now tried before giving up, and giving up logs a warning
+  naming the fix. **The real fix is on the provider:** put `name`,
+  `preferred_username` and `email` in the ID token — the Authelia page has the
+  exact block, and now also sets `consent_mode`, so you are not asked to
+  consent on every sign-in. Nothing was broken meanwhile: the role and the
+  scopes come from the group claim, not from the name.
+- **The dashboard was unusable on a phone.** The topbar was a single
+  non-wrapping row, so at 390px it laid out 685px of content: the last tab
+  clipped, Rescan and Sign out and the theme toggle sat off-screen entirely,
+  and the whole page dragged sideways. It is now two rows at phone widths —
+  the mark and a full-width tab strip, with the actions beneath — with the
+  filters in two columns, a 40px floor on every control wherever the pointer
+  is coarse, and a tab strip that scrolls inside itself rather than widening
+  the page. The `indexed N run(s) · read …` line moves to the footer beside
+  the build: the same class of answer, and it was what made the header wrap.
+- **A long value in the machine drilldown dragged the page sideways on a 320px
+  screen.** A grid column that would not shrink below its content, so a CPU
+  model took the document 17px wider than the window.
+
 ## 0.4.1 - Fri, 11 Sep 2026
 
 Four fixes to running as a service on Linux, all found by following this
