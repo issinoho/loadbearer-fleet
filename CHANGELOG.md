@@ -5,6 +5,70 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.5.1 - Fri, 11 Sep 2026
+
+Everything in this release came out of deploying 0.5.0 to a real host and
+watching where the time went. No behaviour changes: it is three things the
+tool already knew and did not say, and one piece of documentation that was
+actively dangerous.
+
+### Fixed
+
+- **`service preflight` gave advice that would have made things worse.** A
+  relative `index` resolves beside the config file — so with the config in
+  `/etc/loadbearer-fleet`, the index lands there too, and the report said
+  `/etc/loadbearer-fleet is owned by 0:0 … sudo chown loadbearer-fleet: <dir>`.
+  Following that hands the service write access to its own configuration. It
+  now recognises the case and names the *setting* instead: which keys resolved
+  there, why a relative path does that, and to give them absolute paths under
+  `/var/lib`. All the offending keys are reported in one failure, rather than
+  one per run as each is fixed.
+- **The log file the configuration names does not exist.** `[log] file` is a
+  stem — the rotation appends the UTC date — so `tail -f` on the configured
+  path fails with `No such file or directory`, which is a poor way to find out
+  how rotation works. The binary now announces the file it is actually writing
+  when it starts, on **stderr**, so `journalctl -u loadbearer-fleet` answers
+  the question for a service; and `service preflight` reports the dated name
+  rather than the stem. Stdout is untouched, so piping `report --json` is
+  unaffected — and there is now a test that runs the binary *with* a log file
+  configured to hold that line, which the existing ones structurally could
+  not.
+- **Advice with a placeholder in it.** The generic unwritable-directory
+  failure said `sudo chown loadbearer-fleet: <dir>` whatever the account and
+  whatever the directory. It names both now, so the line can be pasted.
+- **`check-auth` listed only the group claim** under what it cannot know from
+  outside a real sign-in. `name`, `preferred_username` and `email` follow the
+  same rule, and a provider that sends them to userinfo only — Authelia's
+  default — leaves the dashboard labelling your session with a UUID. It says
+  so before the sign-in rather than after.
+
+### Documentation
+
+- **The unit is no longer installed with `service unit | sudo tee`.** `tee`
+  truncates its target before the command on the left has produced anything,
+  so a generate that *refuses* — a missing `[log] file`, a config path it will
+  not accept — leaves a zero-length unit file behind. systemd reads that as
+  **masked**, so the next `systemctl start` answers
+  `Unit loadbearer-fleet.service is masked` and the unit that was there is
+  gone. The README and both places in the runbook now write a temporary file
+  and `&&` the install, so a refusal changes nothing, and there is a
+  Troubleshooting entry under the message you would actually search for.
+- **Moving a by-hand setup into place** is written up, because it is how most
+  people will arrive: an unpacked tarball in a home directory, a config beside
+  it, results wherever was convenient. Four things move and the order matters
+  — binary before the unit is generated, config out of `$HOME` with its paths
+  made absolute, the index carried across rather than rebuilt, and the
+  collection folder kept out of the service's own data directory.
+- **Three Authelia corrections**, all from a live 4.39.25: the consent
+  duration is `1M` and not `'1 month'` (which fails as a YAML error, not as a
+  bad value); `docker compose up -d` does not pick up an edit to a
+  bind-mounted config and `restart` is the command; and `validate-config` line
+  numbers are post-template-expansion, so a 75-line file can report an error
+  at line 110.
+- The Linux download in the README is split across variables, because a URL
+  long enough to wrap pastes as two commands — the first of which downloads a
+  truncated path and saves nine bytes of "Not Found" under a plausible name.
+
 ## 0.5.0 - Fri, 11 Sep 2026
 
 Two commands that now do the diagnosis rather than describe it, a dashboard
