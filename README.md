@@ -525,25 +525,79 @@ are visible in `check-auth` before a user ever tries to sign in.
 
 **Groups must reach the ID token.** This reads the ID token and **never calls
 the userinfo endpoint**, so a `groups` claim that only appears at userinfo is
-invisible — you sign in successfully and match no grant. That usually means two
-settings rather than one:
+invisible — you sign in successfully and match no grant. On a self-hosted
+provider that is usually two settings rather than one: a scope to *request* the
+claim, and something that decides which claims go in the ID token rather than
+only at userinfo. Entra needs the opposite — no scope, a token-configuration
+change.
+
+#### Authelia — a configuration that has been run
+
+Verified end to end against **Authelia 4.39.25** on 2026-09-11: discovery,
+sign-in, the code exchange, and a group claim read out of the ID token and
+mapped to a role.
+
+On the Authelia side, the client and the claims policy that puts `groups`
+where this can see it:
+
+```yaml
+identity_providers:
+  oidc:
+    claims_policies:
+      fleet:
+        id_token:
+          - 'groups'
+    clients:
+      - client_id: 'loadbearer-fleet'
+        client_name: 'loadbearer-fleet'
+        public: true
+        require_pkce: true
+        pkce_challenge_method: 'S256'
+        token_endpoint_auth_method: 'none'
+        authorization_policy: 'two_factor'
+        claims_policy: 'fleet'
+        redirect_uris:
+          - 'https://fleet.example.com/auth/callback'
+        scopes: ['openid', 'profile', 'email', 'groups']
+```
+
+`claims_policies` is the part that matters and the part without an equivalent
+before 4.39 — without it `groups` goes to userinfo only, and this cannot read
+it. `token_endpoint_auth_method: 'none'` matters too: the exchange arrives
+with no client secret, and getting it wrong fails *after* the user has
+authenticated, which is a confusing place to land.
+
+And on this side:
 
 ```toml
 [auth]
-issuer = "https://auth.example.internal"
+mode = "oidc"
+issuer = "https://auth.example.com"     # bare origin, no trailing slash
 client_id = "loadbearer-fleet"
-extra_scopes = ["groups"]      # Authelia emits groups only when asked
+client_secret = ""
 groups_claim = "groups"
+extra_scopes = ["groups"]
+
+[[auth.grants]]
+group = "fleet-admins"     # the group *name* from users_database.yml
+role = "admin"
 ```
 
-`extra_scopes` is the scope request; whether the claim then lands in the ID
-token rather than only at userinfo is a provider setting, and on Authelia in
-particular it is worth confirming for your version. Entra needs the opposite —
-no scope, a token-configuration change.
+Two things about the reverse proxy in front of Authelia, both of which look
+like problems here and are not:
 
-**An internal CA needs pointing at.** The HTTP client trusts a built-in root set
-and does **not** read the machine's trust store, so installing your CA on the
-server changes nothing. Point at it:
+- **Authelia derives its issuer from the request**, so the proxy must pass the
+  original `Host` and set `X-Forwarded-Proto: https`. With `http` there,
+  Authelia refuses discovery outright — and the error surfaces as a failed
+  discovery from this side.
+- **Do not put this dashboard behind Authelia's forward-auth.** It is an OIDC
+  *client*, not a protected app; `auth_request` in front of it would intercept
+  the callback. Authelia protects nothing here, it issues tokens.
+
+#### An internal CA needs pointing at
+
+The HTTP client trusts a built-in root set and does **not** read the machine's
+trust store, so installing your CA on the server changes nothing. Point at it:
 
 ```toml
 [auth]
@@ -568,9 +622,24 @@ discovery succeeded for https://auth.example.internal
   grants:       2
 ```
 
-What it does **not** test is the code exchange and the token verification, which
-need a real sign-in — see
-[SECURITY.md](SECURITY.md) on what is and isn't verified.
+What it does **not** test is the code exchange or whether the group claim
+actually reaches the ID token — both need a real sign-in. When one fails, the
+refusal is the diagnostic: it counts the groups it decoded, so `0 group(s)`
+means the claim never arrived and any other number means it did and your
+grants don't match it.
+
+#### If the sign-in fails, in the order things break
+
+| Symptom | Where to look |
+| --- | --- |
+| `check-auth` fails on the certificate | `ca_bundle`, or give the provider a publicly-trusted certificate |
+| `check-auth` fails on the issuer not matching | the proxy is not passing `Host` / `X-Forwarded-Proto: https`, so the provider is advertising the wrong issuer |
+| `invalid_scope` at the provider | the client is missing one of `openid profile email groups` |
+| `invalid_client` at the exchange | the client is not registered as public — `token_endpoint_auth_method: none` |
+| Signed in, refused, `0 group(s)` | the claim is not in the ID token — a provider setting, not a setting here |
+| Signed in, refused, `N group(s)` | the claim arrived; `[[auth.grants]] group` does not match what is in it |
+
+See [SECURITY.md](SECURITY.md) for what has and hasn't been verified.
 
 ### It will not put the estate on the wire in the clear
 

@@ -118,10 +118,18 @@ been audited":
   document is refused on its size alone, and that half-finished sign-ins cannot
   grow without limit. Each of those three was watched failing with its guard
   removed before being kept.
-- **Not verified end to end:** the authorization-code exchange and ID-token
-  verification, which need a live identity provider. Those rest on the
-  [`openidconnect`](https://crates.io/crates/openidconnect) crate. Discovery,
-  issuer validation and TLS *were* checked against a real Entra endpoint.
+- **Exercised against a live provider**, on 2026-09-11, against a self-hosted
+  **Authelia 4.39.25**: discovery, issuer validation, TLS against the public
+  certificate, the authorization request with PKCE `S256`, the
+  authorization-code exchange as a public client with no secret, ID-token
+  verification, and a group claim read out of that token and mapped to a role.
+  A full sign-in reached the dashboard with the role its grant specified.
+
+  That closes what this file previously listed as unverified. It was one run
+  through one provider, so read it as "the path has been walked" rather than
+  "the path has been tested" — there is no automated coverage of the exchange,
+  because there is no provider to run it against in CI. Discovery, issuer
+  validation and TLS were separately checked against a real Entra endpoint.
 - **No penetration test, and no third-party review.**
 
 ## Other measures already in place
