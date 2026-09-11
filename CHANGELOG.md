@@ -5,6 +5,73 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.5.3 - Fri, 11 Sep 2026
+
+**Compare runs head to head** — a new tab, a new command and a new endpoint —
+plus the two columns in the index that make it possible.
+
+**If you have existing results, run `scan --reindex` once after upgrading.**
+Ingest skips a document whose bytes it has already seen, which is what keeps a
+large share cheap to rescan and also means a new column stays empty for every
+run already indexed. Comparisons will decline those runs by name until they are
+re-read. It is safe to repeat and changes nothing else about them.
+
+### New
+
+- **Compare, on the dashboard.** Pick two to four runs and every subtest they
+  share gets a ratio to the first, adjusted for which way the metric runs,
+  rolled up by geometric mean per component and overall. The picker offers any
+  machine in the current filter and defaults to its latest run, with an earlier
+  one a selector away — **including the same machine twice**, which is the
+  comparison with the fewest other things changing in it: this laptop before
+  the firmware update, and now.
+- **`loadbearer-fleet compare <machine|run> <machine|run> [--json]`** is the
+  same thing at a prompt, for scripting or for diffing two servers. A bare
+  number is a run id; anything else is a machine, meaning its latest run.
+- **`GET /api/compare?runs=4,2`**, or `?keys=a,b` for the latest run of each.
+  Documented in full on the
+  [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API#comparing-runs)
+  page.
+- **`scan --reindex`** re-reads every document, including the ones already
+  indexed.
+
+The verdict is built from **raw metrics rather than scores**, so it does not
+depend on the baseline or curve anything was graded against — two machines
+measured eight months apart still compare, and recalibrating the baseline does
+not move the answer. Most of the care is in what it refuses, because each of
+these produces a confident number that means nothing:
+
+| | |
+| --- | --- |
+| A subtest with no recorded direction | A ratio has no sign without one. This is what `--reindex` fixes. |
+| A peak against a median | loadbearer 1.5.0 added peak reporting, so an estate can hold both. Mixing them measures the statistic rather than the machine. An *absent* statistic is a median — everything before 1.5.0 was one — so a 1.2.4-era run still compares. |
+| A subtest not in every run | Different loadbearer versions measure different things. |
+| Network and GPU in the verdict | Shown with their own ratios and kept out of the overall, the same rule a grade follows: they depend on the host, its drivers and whatever the network is doing. A verdict that counted them would contradict the scores beside it. |
+
+Everything dropped is named in `warnings`, and `coverage` reports how much the
+verdict rests on — a comparison can honestly end up using two of thirty
+measurements, and that should not read like one built on all thirty.
+
+### Changed
+
+- **The index gained `direction` and `label` on subtests, and `label` on
+  components** — added in place rather than as a format change, so an existing
+  index is migrated on open and keeps all its history. Verified in both
+  directions against 0.5.2: it writes an index this version migrates, and it
+  reads a migrated one afterwards without noticing.
+
+### Fixed
+
+- **The filter row's `hidden` had never worked.** `.filters { display: flex }`
+  beats the user agent's `[hidden] { display: none }`, so the machine drilldown
+  has been showing the fleet filter row since the day it was written. The
+  comparison keeps its filter on purpose — the picker is built from the
+  filtered snapshot, so the filter is what decides which machines are on offer.
+- **A pipe in a command's value name broke the generated reference.**
+  `MACHINE|RUN` is an ordinary clap value name and a mangled markdown table;
+  the wiki page had a four-column row in a three-column table. Escaped now, and
+  a test counts the columns of every row.
+
 ## 0.5.2 - Fri, 11 Sep 2026
 
 Three fixes from one session on a real host, all of them the tool being
