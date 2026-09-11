@@ -5,6 +5,48 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.5.2 - Fri, 11 Sep 2026
+
+Three fixes from one session on a real host, all of them the tool being
+confidently unhelpful about *which index* it was looking at. **One behaviour
+change**, noted below, matters if you script `report`, `status` or `backup`.
+
+### Fixed
+
+- **A command that only reads no longer invents an index.** SQLite's `open`
+  creates the file, so `loadbearer-fleet forget <machine>` without `--config`
+  made a `fleet-index.db` in the current directory and reported that no
+  machine matched — while the service's index held that machine the whole
+  time. `report`, `status`, `backup` and `forget` now refuse on a missing
+  index, naming the path they looked at and pointing at `--config`. `scan` and
+  `serve` still create one; populating is their job.
+- **`forget` says how much the index holds.** "No machine in the index
+  matches" is a true statement about an empty index and a useless one: the
+  reader's question is whether they are looking at the right database. The
+  message now names the index file and the number of machines in it, and an
+  index with none gets its own wording.
+- **The dashboard notices a change made by another process.** The fleet-wide
+  analysis is cached in memory and was rebuilt only by a scan, so a `forget`
+  run from a terminal left the machine on screen until the next scan tick —
+  up to fifteen minutes, which reads as `forget` not having worked. It now
+  checks SQLite's `data_version`, which by design does not move for the
+  serving process's own writes, so it answers exactly the right question: has
+  somebody else committed? One pragma against an already-open connection per
+  request, and the rebuild happens only when something changed.
+
+  **Rescan folder** was the workaround, and still works — it rebuilds the same
+  cache.
+
+### Changed
+
+- **`report`, `status`, `backup` and `forget` now exit non-zero when the index
+  does not exist**, where they used to succeed against an empty one they had
+  just created. Anything scripted around "empty snapshot means empty fleet"
+  should be checked: an empty snapshot from a database the command invented a
+  moment earlier reads as *the fleet is empty* when the truth is *you are
+  looking at the wrong file*. To get the old shape, `scan` first — which is
+  what creates the index in the first place.
+
 ## 0.5.1 - Fri, 11 Sep 2026
 
 Everything in this release came out of deploying 0.5.0 to a real host and
