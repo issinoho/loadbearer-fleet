@@ -849,13 +849,30 @@ pub async fn callback(
     })?;
 
     let mut principal = Principal::new(claims.subject().as_str(), role, scopes);
+    principal.email = claims.email().map(|e| e.to_string());
+    // Best human-readable thing the ID token offered, in descending order of
+    // how much it looks like a person. An email address is a poor label but a
+    // far better one than an opaque subject, which on most providers is a UUID.
     principal.name = claims
         .name()
         .and_then(|n| n.get(None).or_else(|| n.iter().next().map(|(_, v)| v)))
         .map(|n| n.as_str().to_string())
         .or_else(|| claims.preferred_username().map(|u| u.to_string()))
-        .unwrap_or_else(|| claims.subject().to_string());
-    principal.email = claims.email().map(|e| e.to_string());
+        .or_else(|| principal.email.clone())
+        .unwrap_or_else(|| {
+            // Worth a warning rather than silence: the dashboard is about to
+            // label the session with a UUID, and the fix is one setting on the
+            // provider. This tool reads the ID token and never calls userinfo,
+            // so a claim that only appears there is invisible here.
+            tracing::warn!(
+                subject = claims.subject().as_str(),
+                "the ID token carried no name, preferred_username or email claim, so the \
+                 dashboard can only label this session with the subject. Add those claims to \
+                 the ID token at the provider — on Authelia that is a claims policy, on \
+                 Keycloak a mapper with `Add to ID token` set."
+            );
+            claims.subject().to_string()
+        });
     tracing::info!(
         subject = %principal.subject,
         role = principal.role.as_str(),
@@ -892,14 +909,61 @@ pub async fn logout(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Res
     // Only this dashboard's session ends. Signing the user out of the identity
     // provider as well would sign them out of everything else in the tenant,
     // which is not this tool's decision to make.
+    //
+    // **Not `/`.** The dashboard needs a session, so redirecting there sends
+    // the browser on to `/auth/login`; the provider still has a session of its
+    // own, and the user is signed straight back in — which looks exactly like a
+    // Sign out button that does nothing. This lands somewhere that needs no
+    // session and says what did and did not just happen.
     (
         [(
             header::SET_COOKIE,
             clear_cookie(SESSION_COOKIE, auth.secure_cookies),
         )],
-        Redirect::to("/"),
+        Redirect::to("/auth/signed-out"),
     )
         .into_response()
+}
+
+/// Where `logout` lands: needs no session, and starts no new one.
+///
+/// It is also the only place the single-sign-on consequence is explained. A
+/// user who signs out, signs back in and is never asked for a password has not
+/// found a bug, and this is where they can read why.
+pub async fn signed_out(State(app): State<Arc<AppState>>) -> Response {
+    let auth = app.auth();
+    let host = auth
+        .enabled()
+        .then(|| provider_host(&auth.config.issuer))
+        .flatten();
+    let still_open = match host {
+        Some(host) => format!(
+            "You are still signed in to <b>{}</b>, so signing back in here may not ask for a \
+             password. Sign out there, or close the browser, to end that session too.",
+            html_escape(&host)
+        ),
+        None => "Your identity provider may still hold a session of its own, so signing back in \
+                 here may not ask for a password."
+            .to_string(),
+    };
+    let body = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>Signed out</title><link rel=\"stylesheet\" href=\"/app.css\">\
+         <link rel=\"icon\" type=\"image/svg+xml\" href=\"/logo-mark.svg\"></head>\
+         <body><main><div class=\"banner\"><h2>Signed out</h2>\
+         <p>This dashboard has forgotten your session.</p><p>{still_open}</p>\
+         <p><a href=\"/auth/login\">Sign in again</a></p></div></main></body></html>"
+    );
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+}
+
+/// The provider's hostname, for naming it in a sentence. A malformed issuer
+/// simply goes unnamed — this is prose on a page, not a security decision.
+fn provider_host(issuer: &str) -> Option<String> {
+    let rest = issuer.split_once("://")?.1;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// What the dashboard needs to know about the current caller.
@@ -1050,6 +1114,22 @@ fn html_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Grant;
+
+    #[test]
+    fn the_provider_is_named_by_host_or_not_at_all() {
+        assert_eq!(
+            provider_host("https://auth.example.com").as_deref(),
+            Some("auth.example.com")
+        );
+        assert_eq!(
+            provider_host("https://login.microsoftonline.com/tenant/v2.0").as_deref(),
+            Some("login.microsoftonline.com")
+        );
+        // Nothing usable rather than something wrong: the sentence just omits
+        // the provider's name.
+        assert_eq!(provider_host("auth.example.com"), None);
+        assert_eq!(provider_host("https://"), None);
+    }
 
     fn config_with_grants(grants: Vec<Grant>) -> Config {
         Config {

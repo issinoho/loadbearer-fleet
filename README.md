@@ -533,10 +533,12 @@ and Keycloak and Authentik follow the same shape.
 
 Two things catch people out, both covered in the runbook:
 
-- **Groups must reach the ID token.** This reads the ID token and never calls
-  the userinfo endpoint, so a claim that only appears at userinfo is invisible
-  — you sign in successfully and match no grant. On a self-hosted provider that
-  is usually a scope *plus* a setting about which claims go in the ID token.
+- **Claims must reach the ID token.** This reads the ID token and never calls
+  the userinfo endpoint, so a claim that only appears at userinfo is invisible.
+  Without `groups` you sign in successfully and match no grant; without `name`,
+  `preferred_username` and `email` it works, but labels the session with your
+  subject — a UUID on most providers. On a self-hosted provider the fix is
+  usually a scope *plus* a setting about which claims go in the ID token.
 - **An internal CA has to be pointed at** with `auth.ca_bundle`. The HTTP
   client trusts a built-in root set and does not read the machine's trust
   store, so installing the CA on the server changes nothing.

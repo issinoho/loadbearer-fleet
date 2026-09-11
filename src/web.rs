@@ -443,6 +443,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         .route("/auth/logout", post(auth::logout))
+        // Outside the session check by necessity: this is where signing out
+        // lands, and needing a session there would bounce the user through the
+        // provider and straight back in.
+        .route("/auth/signed-out", get(auth::signed_out))
         .route("/api/me", get(auth::me))
         .route("/api/snapshot", get(get_snapshot))
         .route("/api/machine/{key}", get(get_machine))
@@ -676,7 +680,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use axum::body::Body;
-    use axum::http::{Method, Request};
+    use axum::http::{HeaderMap, Method, Request};
     use tower::ServiceExt;
 
     use super::*;
@@ -721,12 +725,17 @@ mod tests {
 
     struct Reply {
         status: StatusCode,
+        headers: HeaderMap,
         body: String,
     }
 
     impl Reply {
         fn json(&self) -> serde_json::Value {
             serde_json::from_str(&self.body).expect("a JSON body")
+        }
+
+        fn header(&self, name: HeaderName) -> Option<String> {
+            Some(self.headers.get(name)?.to_str().expect("ASCII").to_string())
         }
     }
 
@@ -745,11 +754,13 @@ mod tests {
             .await
             .expect("response");
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
             .await
             .expect("body");
         Reply {
             status,
+            headers,
             body: String::from_utf8_lossy(&bytes).to_string(),
         }
     }
@@ -857,6 +868,55 @@ mod tests {
         assert_eq!(
             get(&state, "/api/me", Some(&cookie)).await.json()["may_rescan"],
             false
+        );
+    }
+
+    /// Signing out used to be a no-op, and this is the shape of why.
+    ///
+    /// The redirect went to `/`, which needs a session, so the browser was
+    /// sent on to `/auth/login`; the provider still had a session of its own
+    /// and handed back a fresh one immediately. The user saw a button that did
+    /// nothing. So: the landing page must need no session, and must be
+    /// reachable without one.
+    #[tokio::test]
+    async fn signing_out_does_not_land_where_it_will_be_signed_back_in() {
+        let state = state_for(&oidc_config());
+        let cookie = session(&state, Role::Admin, &[]);
+
+        let out = request(&state, Method::POST, "/auth/logout", Some(&cookie)).await;
+        let landing = out.header(header::LOCATION).expect("a redirect");
+        assert_eq!(landing, "/auth/signed-out");
+        assert!(
+            out.header(header::SET_COOKIE)
+                .expect("the cookie is cleared")
+                .contains("Max-Age=0")
+        );
+
+        // Server-side too, not just the cookie: a copy of it is now worthless.
+        assert_eq!(
+            get(&state, "/api/snapshot", Some(&cookie)).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let page = get(&state, &landing, None).await;
+        assert_eq!(
+            page.status,
+            StatusCode::OK,
+            "the landing page must not itself need a session"
+        );
+        assert!(page.body.contains("Signed out"));
+        assert!(
+            page.body.contains("issuer.example"),
+            "it should name the provider whose session is still open: {}",
+            page.body
+        );
+
+        // The trap it avoids: `/` does need one, and would start a sign-in.
+        let root = get(&state, "/", None).await;
+        assert!(
+            root.header(header::LOCATION)
+                .is_some_and(|l| l.starts_with("/auth/login")),
+            "if this ever stops redirecting, the reason for the landing page is gone"
         );
     }
 
