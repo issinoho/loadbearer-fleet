@@ -580,8 +580,12 @@ renderView('machines', (h) => mod.renderMachines(h));
 {
   const [a, b] = snapshot.machines;
   const comparison = realCompare([a.hostname || a.key, b.hostname || b.key]);
+  // The first machine gets a *second* run, so the picker renders a dropdown
+  // rather than a date. With one run each it never did, and the bug that
+  // shipped lived entirely inside that dropdown.
+  const earlier = { run_id: a.run_id + 1000, taken_at: '2026-01-01T09:00:00Z' };
   const histories = new Map([
-    [a.key, { history: [{ run_id: a.run_id, taken_at: a.taken_at }] }],
+    [a.key, { history: [earlier, { run_id: a.run_id, taken_at: a.taken_at }] }],
     [b.key, { history: [{ run_id: b.run_id, taken_at: b.taken_at }] }],
   ]);
   globalThis.fetch = (url) => {
@@ -605,6 +609,33 @@ renderView('machines', (h) => mod.renderMachines(h));
     // comparison is the failure this view could have while still looking fine.
     for (const c of comparison.components) {
       check('compare', text.includes(c.label), `component ${c.id} is missing from the table`);
+    }
+
+    // The run picker has to agree with what is being compared. It did not:
+    // `{ selected: false }` was written out as `selected="false"`, which is a
+    // *present* boolean attribute, so every option was selected, the browser
+    // showed the last one, and the dropdown named a different run from the one
+    // in the table. Exactly one option may carry it.
+    const selects = [];
+    walk(h, (n) => {
+      // The run pickers, not the "Add a machine…" one beside them.
+      if (n.tagName === 'select' && String(n.attrs['aria-label']).startsWith('Which run')) {
+        selects.push(n);
+      }
+    });
+    check('compare', selects.length > 0, 'no run picker was rendered to check');
+    for (const s of selects) {
+      const marked = s.children.filter((o) => o.attrs.selected !== undefined);
+      check(
+        'compare',
+        marked.length <= 1,
+        `a run picker marks ${marked.length} of its ${s.children.length} options selected`,
+      );
+      check(
+        'compare',
+        String(s.value) === String(a.run_id),
+        `a run picker shows ${s.value} while ${a.run_id} is being compared`,
+      );
     }
     notes.push(
       `compare: ${comparison.components.length} component(s), `

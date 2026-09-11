@@ -32,6 +32,13 @@ function el(tag, props = {}, kids = []) {
     else if (k === 'class') node.className = v;
     else if (k === 'dataset') Object.assign(node.dataset, v);
     else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
+    // A boolean attribute is true by its *presence*, so `selected="false"`
+    // selects the option. `{ selected: false }` therefore has to mean no
+    // attribute at all — otherwise every option in a run picker is marked
+    // selected, the browser shows the last of them, and the control disagrees
+    // with what is actually being compared.
+    else if (v === false) continue;
+    else if (v === true) node.setAttribute(k, '');
     else node.setAttribute(k, v);
   }
   for (const kid of [].concat(kids)) {
@@ -1355,8 +1362,9 @@ function comparePicker(runs, histories) {
     const name = m ? (m.hostname || m.key) : `run ${id}`;
     const history = found ? histories.get(found.key) : null;
 
-    const chooser = history && history.length > 1
-      ? el('select', {
+    let chooser;
+    if (history && history.length > 1) {
+      chooser = el('select', {
         'aria-label': `Which run of ${name}`,
         onchange: (e) => {
           const next = runs.slice();
@@ -1364,9 +1372,18 @@ function comparePicker(runs, histories) {
           writeHash({ view: 'compare', runs: next });
         },
       }, history.slice().reverse().map((p) => el('option', {
-        value: String(p.run_id), text: when(p.taken_at), selected: p.run_id === id,
-      })))
-      : el('span', { class: 'meta', text: found ? when(found.point.taken_at) : 'run not found' });
+        value: String(p.run_id), text: when(p.taken_at),
+      })));
+      // Set as a property, not an attribute: this is what the browser actually
+      // reads, and it cannot drift from the run id in the URL the way a
+      // per-option flag can.
+      chooser.value = String(id);
+    } else {
+      chooser = el('span', {
+        class: 'meta',
+        text: found ? when(found.point.taken_at) : 'run not found',
+      });
+    }
 
     return el('div', { class: 'compare-slot' }, [
       el('span', { class: 'compare-slot-name', text: `${i === 0 ? 'Baseline: ' : ''}${name}` }),
