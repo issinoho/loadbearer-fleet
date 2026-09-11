@@ -5,6 +5,95 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.6.0 - Fri, 11 Sep 2026
+
+**Results can now be submitted to the dashboard** — by a person through the
+browser, or over the API by a machine with nobody at it. If something already
+drops files into your collection folder, nothing here changes for you:
+uploading is off entirely until `[server] upload_dir` is set, whatever
+anybody's role says.
+
+**If you do turn it on, regenerate the systemd unit.** The generated unit
+names every directory it writes in `ReadWritePaths`, and an installed unit
+keeps whatever it was written with — so an `upload_dir` added to the config
+without regenerating fails at the moment somebody first submits a result, long
+after a clean start. `service preflight` checks the directory exists and is
+writable by the service account while the answer is still easy to read;
+[Deploying as a service](https://github.com/issinoho/loadbearer-fleet/wiki/Deploying-as-a-Service)
+has both steps.
+
+### New
+
+- **Add results**, in the dashboard header. Takes one or more `.json` files and
+  reports each: added, already indexed, or the reason it was refused. One
+  request per file, because the interesting answer *is* per file — a batch
+  would have to choose between failing everything on one bad file and telling
+  you nothing useful. The button is hidden unless `/api/me` says the caller may
+  upload, and the server refuses regardless: the hiding is courtesy, the
+  refusal is the control.
+- **`POST /api/upload`** is the same thing for a script, documented in full on
+  the
+  [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API#submitting-a-result)
+  page.
+- **`contributor`, a third role**, between `viewer` and `admin` — submitting a
+  result is a write to the source of truth, so it is more than reading and less
+  than administering. The three nest as the other two did.
+- **`[server] upload_dir`**, where a submitted result is written, and **it has
+  to sit inside `collection_dir`** — refused at load if it does not. An upload
+  stored anywhere else would exist only in the index, and this documentation
+  tells you the index is safe to delete, so that advice would quietly destroy
+  it. Inside the folder it is an ordinary result file that any rebuild finds
+  again.
+- **`[[ingest.tokens]]`** — a bearer credential for a machine that submits its
+  own result and has nobody to sign in. **A token may write and may not read:**
+  it is accepted on the upload endpoint and nowhere else, so one leaking out of
+  a deployment script leaks a write path rather than the estate. Optional
+  `tags` scope it exactly as they scope a person, through the same function.
+  Configuration refuses the weak cases at load rather than warning about them:
+  nameless tokens, anything under 32 characters, two of one name, and tokens on
+  a server with no `upload_dir` to put a result in.
+- **`[server] upload_limit_per_minute`**, 120 by default and zero for no limit
+  — the most one credential may submit per minute. Over it the answer is `429`
+  with a `Retry-After`, which is safe to act on because ingest is idempotent by
+  content: a resend of something that did land is answered `already indexed`
+  rather than stored twice. A safety valve rather than a defence — what it
+  stops is a script retrying on a timer somebody misread, or a leaked token
+  filling a disk 40 KB at a time.
+- **`loadbearer_fleet_uploads_total` and
+  `loadbearer_fleet_uploads_rate_limited_total`.** The second should be flat at
+  zero; anything else is a client in a loop or a credential worth revoking.
+
+Five things have to be true before a byte is kept, checked cheapest and least
+revealing first:
+
+| | |
+| --- | --- |
+| The server has an `upload_dir` | Unset means uploading is off, whatever anybody's role says. A server that was never given somewhere to put a result cannot be talked into accepting one. |
+| The caller may upload | A `contributor` or an `admin`, or an ingest token — which is a contributor by definition and cannot be configured into anything else. An unrecognised token stops here with `401`, rather than falling back to whatever session happened to be alongside it. |
+| The body is `application/json` | A cross-origin form can only send urlencoded, multipart or plain text, so this is the second lock after `SameSite=Lax`. |
+| It is not going too fast | The cap above, per credential. Idle time banks up to a minute's worth, so a rollout for two thousand machines at nine o'clock takes the first minute at once and the rest at the sustained rate. |
+| It parses, and it is in scope | Refused in the parser's own words before a byte reaches the disk. A contributor scoped to one site may not submit a result claiming to be from another — decided by the same rule that decides what they may *read*, called from both places, so the two cannot drift apart. |
+
+**The filename is built from the document, never from the request.** A folder
+somebody has to read gets `FLEET-WIN-01-20260911T180000-de1af510.json` rather
+than sixty-four hex characters — hostname, the document's own timestamp, and
+eight characters of the content hash. A hostname is attacker-controlled text,
+so everything that is not plainly a filename character becomes a hyphen and the
+whole thing is capped: `../../etc/cron.d/x` produces a hyphenated string that
+stays exactly where it was put.
+
+**`uploaded_by` and `uploaded_at` are recorded against the run** and shown on
+the drilldown. They do not survive an index rebuild and cannot — afterwards the
+run arrived as a file like any other — so the durable record is the log line
+written at the time, which names the submitter and the machine.
+
+### Changed
+
+- **Both header actions now carry an icon and a word**, and below 440px only
+  the icon shows, with the `aria-label` as the accessible name at every width.
+  A fifth control had pushed the header onto two rows on a phone; the layout
+  check caught it at 163px against a 130px ceiling.
+
 ## 0.5.5 - Fri, 11 Sep 2026
 
 One fix, to the comparison view's run picker. Worth upgrading for if you use
