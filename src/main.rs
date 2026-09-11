@@ -59,8 +59,11 @@ enum Command {
     /// Index a folder of result files, then report what it found.
     Scan {
         /// Folder to walk. A local path or a UNC share.
+        ///
+        /// Optional when the configuration names a `collection_dir`, which is
+        /// the folder this would be scanning anyway.
         #[arg(value_name = "DIR")]
-        dir: PathBuf,
+        dir: Option<PathBuf>,
         /// Re-read every document, including the ones already indexed.
         ///
         /// A scan skips a file whose contents it has seen before, which is what
@@ -378,12 +381,23 @@ fn main() -> Result<()> {
     match &cli.command {
         Command::InitConfig | Command::Reference => unreachable!("handled above"),
         Command::Scan { dir, reindex } => {
+            // The config names the folder this serves, and a `scan` that has
+            // just read that config should not have to be told it again —
+            // least of all `--reindex`, whose whole job is to re-read the
+            // folder it already knows about.
+            let dir = match dir.as_ref().or(config.server.collection_dir.as_ref()) {
+                Some(dir) => dir.clone(),
+                None => anyhow::bail!(
+                    "no folder to scan: pass one as an argument, or set [server] collection_dir \
+                     in the configuration and pass --config"
+                ),
+            };
             let mut idx = index::Index::open(&config.server.index)?
                 .with_archive(config.server.archive_dir.as_deref())?;
             let report = if *reindex {
-                idx.rescan_all(dir)?
+                idx.rescan_all(&dir)?
             } else {
-                idx.scan(dir)?
+                idx.scan(&dir)?
             };
             println!(
                 "{} {}: {} file(s), {} {}, {} already indexed",

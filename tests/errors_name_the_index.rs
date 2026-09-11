@@ -70,6 +70,48 @@ fn a_missing_index_is_said_out_loud_and_not_invented() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `scan` takes its folder from the configuration when it is not given one.
+///
+/// It used to insist on being told, having just read a config that named the
+/// folder — worst of all for `--reindex`, whose whole job is to re-read the
+/// folder it already knows about. The failure when there is genuinely nowhere
+/// to look has to name both ways of supplying it.
+#[test]
+fn scan_falls_back_to_the_configured_collection_folder() {
+    let dir = scratch("scanfolder");
+    let unixish = |p: PathBuf| p.display().to_string().replace('\\', "/");
+    let config = dir.join("fleet.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:8787\"\npublic_url = \"http://127.0.0.1:8787\"\n\
+             index = '{}'\ncollection_dir = '{}'\n",
+            unixish(dir.join("i.db")),
+            unixish(fixtures()),
+        ),
+    )
+    .expect("write a config");
+
+    let cfg = config.to_str().expect("path");
+    let (ok, err) = run(&dir, &["--config", cfg, "scan"]);
+    assert!(ok, "a configured folder should be enough:\n{err}");
+
+    // And the same for the flag that most needs it.
+    let (ok, err) = run(&dir, &["--config", cfg, "scan", "--reindex"]);
+    assert!(ok, "--reindex should not need the folder repeating:\n{err}");
+
+    // Nowhere to look at all: both ways out, named.
+    let (ok, err) = run(
+        &dir,
+        &["--index", unixish(dir.join("x.db")).as_str(), "scan"],
+    );
+    assert!(!ok, "this cannot succeed");
+    assert!(err.contains("collection_dir"), "{err}");
+    assert!(err.contains("as an argument"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// With a real index, the failure has to distinguish "wrong name" from "wrong
 /// database" — which is what the count is for.
 #[test]
