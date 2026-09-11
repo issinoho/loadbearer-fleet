@@ -167,6 +167,9 @@ empty dashboard, and results appear as they land.
   see [Running it as a service](#running-it-as-a-service).
 - **Turn on single sign-on** before anyone but you can reach it — see
   [Sign-in](#sign-in).
+- **Let people submit results through the dashboard** when a machine cannot
+  reach the collection folder — see
+  [When a machine cannot reach the share](#when-a-machine-cannot-reach-the-share).
 
 ### Labelling machines, and a word about owners
 
@@ -221,6 +224,42 @@ a clean Windows install expect one of these:
 ```
 
 Three decisions shape everything else:
+
+### When a machine cannot reach the share
+
+That middle arrow is not free, and for some estates it does not exist. Intune
+has no pull-file step; a laptop off the corporate network has no line of sight
+to a file server; somebody emails you a result from a machine you do not
+manage. For those, a result can be submitted **through the dashboard**:
+
+```toml
+[server]
+collection_dir = '/srv/loadbearer/collection'
+upload_dir = '/srv/loadbearer/collection/uploaded'   # must be inside it
+
+[[auth.grants]]
+group = "fleet-contributors"
+role = "contributor"
+```
+
+**Add results** then appears in the header for anyone whose grant allows it,
+takes one or more `.json` files, and reports each one: added, already indexed,
+or the reason it was refused. Sending the same file twice is safe — ingest is
+idempotent by content, so the second answer is "already indexed" rather than a
+duplicate.
+
+`upload_dir` has to sit inside the collection folder, and the server refuses to
+start otherwise. That is the same decision as everything below: an upload
+stored anywhere else would exist only in the index, and this documentation
+tells you the index is safe to delete. Inside the folder it is an ordinary
+result file that a rebuild finds again.
+
+Anything submitted is checked before it is kept — it must parse as a
+`loadbearer.result/1`, it must be under 16 MB, and a contributor whose grant is
+scoped to a site may only submit results tagged for that site. The file is
+named from the *document*, never from the request. The
+[HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API#submitting-a-result)
+page has the whole of it, including `POST /api/upload` for scripting.
 
 **The folder is the source of truth.** The index is a derived read model, so
 deleting it costs a rescan and nothing else — which is why its shape can change
