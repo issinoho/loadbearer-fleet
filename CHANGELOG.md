@@ -5,6 +5,71 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.6.1 - Fri, 11 Sep 2026
+
+A security pass over the upload path that 0.6.0 added, and four fixes from it.
+
+**If you have not set `[server] upload_dir`, none of this reaches you** —
+uploading is off, the endpoint refuses everything, and there is nothing here
+to be exposed to. **If you have, this is worth taking.** All four were found
+by review rather than in the wild, and each was watched failing before its fix
+was written.
+
+### Fixed
+
+- **The rate limit could not bound memory.** An extractor that takes the
+  request body runs *before* the handler does, so a limit checked inside the
+  handler bounded the parse and the write and nothing else. Any signed-in
+  caller — including a `viewer` with no upload rights at all, because the role
+  check is also in the handler — could make the server buffer a 16 MB body per
+  request, as often as it had connections, and be told `403` afterwards. The
+  check now runs where the caller is identified, while only the headers have
+  been read, so a refusal costs the headers. Anonymous callers were never able
+  to do this; a viewer was.
+
+- **`upload_dir` containment was checked lexically.** `Path::starts_with`
+  compares path components, so `/srv/collection/../../etc/cron.d` does begin
+  with `/srv/collection` and satisfied a rule this documentation describes as
+  containment. The configuration is the administrator's own, so this was a
+  mistake that could be made rather than an escalation that could be reached —
+  but it was written down as a rule. A `..` in `upload_dir` or
+  `collection_dir` is now refused at load, by name.
+
+- **The temporary file was opened rather than created.** An upload is written
+  under a temporary name and renamed into place; the write followed a symlink
+  if one was sitting at that name, and the name was derived from the content
+  hash, which the submitter chooses. The upload directory has to live inside
+  the collection folder, which
+  [SECURITY.md](https://github.com/issinoho/loadbearer-fleet/blob/main/SECURITY.md)
+  describes as untrusted — in the documented deployment every machine in the
+  estate can write to it. The file is now **created**, which fails on an
+  existing path rather than following it, and its name carries the process and
+  a counter so two identical submissions arriving together cannot write to one
+  file and then race to rename it.
+
+- **A submitted document could forge a line in the log.** A machine's serial
+  or hostname arrives as JSON text and is trimmed at the ends, not examined;
+  the default `text` log format writes one record per line. A newline inside
+  one of those fields ended the record and began something that read like a
+  second one. Control characters are now replaced where the value meets the
+  log, and the field is capped in length. The `json` format always escaped
+  correctly and was never affected.
+
+### Changed
+
+- **The order the upload endpoint checks things in.** Who the caller is, and
+  whether they are inside their rate limit, are now answered before the body
+  is read; everything else is unchanged and in the same order after it. A
+  caller over their limit gets `429` where a malformed request might
+  previously have been told what was wrong with its body first.
+
+- **`SECURITY.md` describes the write path**, which it had not caught up with:
+  that the collection folder is written to when `upload_dir` is set, that the
+  configuration file stores bearer tokens in plain text when ingest tokens or
+  a metrics token are configured, that submission scoping is containment
+  rather than prevention, and that the rate limit counts submissions rather
+  than bytes.
+
 ## 0.6.0 - Fri, 11 Sep 2026
 
 **Results can now be submitted to the dashboard** — by a person through the
