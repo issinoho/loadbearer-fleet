@@ -89,7 +89,7 @@ dependencies.
 **Windows** — take the `-x86_64-pc-windows-msvc.zip`, unzip it anywhere, then:
 
 ```powershell
-$V = "0.5.2"
+$V = "0.5.3"
 cd "loadbearer-fleet-$V-x86_64-pc-windows-msvc"
 .\loadbearer-fleet.exe serve C:\loadbearer\results
 ```
@@ -97,7 +97,7 @@ cd "loadbearer-fleet-$V-x86_64-pc-windows-msvc"
 **Linux** — take the `-x86_64-unknown-linux-gnu.tar.gz`:
 
 ```bash
-V=0.5.2
+V=0.5.3
 A=loadbearer-fleet-$V-x86_64-unknown-linux-gnu
 U=https://github.com/issinoho/loadbearer-fleet/releases/download/v$V
 curl -LO "$U/$A.tar.gz"
@@ -401,6 +401,41 @@ Every threshold lives in one struct with its reasoning attached, so tuning the
 engine is a config change rather than a code read. All fourteen rules, what
 fires each one and every threshold with its default are in
 [Findings](https://github.com/issinoho/loadbearer-fleet/wiki/Findings).
+
+### Head to head, when the estate view isn't the question
+
+Cohorts answer "is this machine normal for its kind". Sometimes the question is
+narrower — *this* laptop against *that* one, or against itself before a
+firmware update — and that is the **Compare** tab, or at a prompt:
+
+```bash
+loadbearer-fleet compare FLEET-WIN-01 FLEET-LNX-01
+```
+
+Every subtest the runs share gets a ratio to the first, adjusted for which way
+the metric runs, rolled up by geometric mean per component and overall. It
+reads **raw metrics rather than scores**, so it does not depend on the baseline
+or the curve anything was graded against: two machines measured eight months
+apart still compare, and recalibrating the baseline does not move the answer.
+
+Most of the care is in what it declines to do, because each of these would
+produce a confident number that means nothing:
+
+- **No direction, no ratio.** A metric only has a better and a worse if you
+  know which way it runs. Runs indexed before 0.5.3 have no direction recorded;
+  `scan --reindex` fills them in from the documents you already hold.
+- **A peak is not a median.** loadbearer 1.5.0 added peak reporting, so an
+  estate can hold both. Comparing one against the other measures the statistic
+  rather than the machine.
+- **Network and GPU are shown and not counted.** They depend on the host, its
+  drivers and whatever the network is doing — the same reason they stay out of
+  a grade. A verdict that counted them would contradict the scores beside it.
+
+And it says how much it rests on. A comparison can honestly end up using two of
+thirty measurements, and that should not read like one built on all thirty — so
+the count travels with the result and the verdict leads with the caveat when
+the basis is thin. The full shape, JSON included, is in
+[HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API#comparing-runs).
 
 ## The dashboard
 

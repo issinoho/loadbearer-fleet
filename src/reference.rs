@@ -120,7 +120,9 @@ fn command_section(s: &mut String, path: &str, cmd: &Command, depth: usize) {
             let _ = writeln!(
                 s,
                 "| `{}` | {} | {} |",
-                value_name(a),
+                // Escaped like any other cell. `MACHINE|RUN` is an ordinary
+                // clap value name and a broken markdown table.
+                value_name(a).replace('|', r"\|"),
                 if a.is_required_set() { "yes" } else { "no" },
                 help_of(a)
             );
@@ -488,5 +490,35 @@ mod tests {
             broken.is_empty(),
             "dead anchors in the reference: {broken:?}"
         );
+    }
+
+    /// Every table row has to have the columns its header promised.
+    ///
+    /// A pipe inside a cell silently splits it into two, and `MACHINE|RUN` —
+    /// an ordinary clap value name — did exactly that: the published page had
+    /// a row with four columns in a three-column table, which renders as a
+    /// mangled row rather than as an error.
+    #[test]
+    fn no_cell_smuggles_a_pipe_into_the_table() {
+        let page = markdown(root());
+        let mut width = 0;
+        for (n, line) in page.lines().enumerate() {
+            if !line.starts_with('|') {
+                width = 0;
+                continue;
+            }
+            // `\|` is an escaped pipe and not a column boundary.
+            let columns = line.replace(r"\|", "").matches('|').count();
+            if line.contains("---") || width == 0 {
+                width = columns;
+                continue;
+            }
+            assert_eq!(
+                columns,
+                width,
+                "line {} has {columns} column boundaries in a {width}-boundary table:\n{line}",
+                n + 1
+            );
+        }
     }
 }
