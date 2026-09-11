@@ -373,14 +373,27 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Forget { machine, dry_run } => {
-            let mut idx = index::Index::open(&config.server.index)?
+            let mut idx = index::Index::open_existing(&config.server.index)?
                 .with_archive(config.server.archive_dir.as_deref())?;
 
             let found = idx.machines_matching(machine)?;
             let target = match found.as_slice() {
+                // Which index, and how much is in it. "No machine matches" is
+                // a true statement about an empty index and a useless one: the
+                // question the reader actually has is whether they are looking
+                // at the right database.
+                [] if idx.machine_count()? == 0 => anyhow::bail!(
+                    "the index at {} holds no machines at all, so nothing could match \
+                     {machine:?}. A service keeps its index where its configuration says — \
+                     pass --config <file> to work on that one.",
+                    config.server.index.display()
+                ),
                 [] => anyhow::bail!(
-                    "no machine in the index matches {machine:?}. Try the hostname, or the \
-                     machine key the dashboard shows on the drilldown."
+                    "no machine in the index at {} matches {machine:?}, out of the {} it \
+                     holds. Try the hostname, or the machine key the dashboard shows on the \
+                     drilldown.",
+                    config.server.index.display(),
+                    idx.machine_count()?
                 ),
                 [one] => one.clone(),
                 // Hostnames get reissued, so two machines can share one. Which
@@ -438,7 +451,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Backup { file } => {
-            let idx = index::Index::open(&config.server.index)?;
+            let idx = index::Index::open_existing(&config.server.index)?;
             let bytes = idx.backup_to(file)?;
             println!(
                 "wrote {} ({:.1} MB) from {} run(s)",
@@ -456,7 +469,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Status => {
-            let idx = index::Index::open(&config.server.index)?;
+            let idx = index::Index::open_existing(&config.server.index)?;
             println!(
                 "{} run(s), {} machine(s)",
                 idx.run_count()?,
@@ -468,7 +481,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Report { json, all } => {
-            let idx = index::Index::open(&config.server.index)?;
+            let idx = index::Index::open_existing(&config.server.index)?;
             let th = Thresholds::default();
             let snap = analytics::snapshot(idx.conn(), &th, OffsetDateTime::now_utc())?;
             if *json {

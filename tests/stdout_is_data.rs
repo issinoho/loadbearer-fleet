@@ -92,6 +92,15 @@ fn a_configured_log_file_does_not_put_its_name_on_stdout() {
     )
     .expect("write a config");
 
+    // The index has to exist: a command that only reads refuses to invent one,
+    // rather than answering out of an empty database it made itself.
+    stdout_of(&[
+        "--config",
+        config.to_str().expect("path"),
+        "scan",
+        fixtures().to_str().expect("path"),
+    ]);
+
     let out = Command::new(EXE)
         .args([
             "--config",

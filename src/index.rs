@@ -298,6 +298,26 @@ impl Index {
         Self::init(conn)
     }
 
+    /// Open an index that has to exist already.
+    ///
+    /// `Connection::open` creates the file, which is right for `scan` and
+    /// `serve` and wrong for everything else: a command pointed at the wrong
+    /// path otherwise answers confidently out of an empty database it has just
+    /// invented. That is not a hypothetical — `forget <machine>` run without
+    /// `--config` created `/tmp/fleet-index.db` and reported that the machine
+    /// did not exist, while the service's index held it all along.
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            anyhow::bail!(
+                "there is no index at {}, so there is nothing to read. A service keeps its \
+                 index where its configuration says — pass --config <file> to work on that \
+                 one. For a new setup, `scan <folder>` creates it.",
+                path.display()
+            );
+        }
+        Self::open(path)
+    }
+
     /// Keep a copy of every document ingested from here on, content-addressed
     /// under `dir`. See `Server::archive_dir` for when that is worth doing.
     pub fn with_archive(mut self, dir: Option<&Path>) -> Result<Self> {
@@ -783,6 +803,20 @@ impl Index {
     /// layer reads through this rather than growing a method per view.
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// A number that changes whenever **another connection** commits.
+    ///
+    /// SQLite's `data_version` is per-connection and deliberately does not move
+    /// for this connection's own writes, which makes it exactly the question
+    /// worth asking: has somebody else changed the database under us? A
+    /// `forget` run from a terminal is another process, so the dashboard's
+    /// in-memory snapshot would otherwise keep showing a machine that no longer
+    /// exists until the next scan.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))?)
     }
 }
 

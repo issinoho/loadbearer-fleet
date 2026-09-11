@@ -59,6 +59,10 @@ pub struct AppState {
     /// The fleet-wide analysis. Replaced wholesale on rescan; readers never
     /// block on a scan because they hold the previous `Arc` until it is.
     cache: RwLock<Arc<Snapshot>>,
+    /// The `data_version` the cache was computed at, so a commit by another
+    /// process — `forget` from a terminal, most obviously — is noticed rather
+    /// than waited out.
+    data_version: Mutex<i64>,
     thresholds: Thresholds,
     /// The collection folder, if this instance was told about one. Absent means
     /// the index is read-only from here and `rescan` has nothing to walk.
@@ -72,9 +76,11 @@ pub struct AppState {
 impl AppState {
     pub fn new(index: Index, config: &Config, thresholds: Thresholds) -> Result<Arc<Self>> {
         let snap = analytics::snapshot(index.conn(), &thresholds, OffsetDateTime::now_utc())?;
+        let version = index.data_version().unwrap_or(0);
         Ok(Arc::new(Self {
             index: Mutex::new(index),
             cache: RwLock::new(Arc::new(snap)),
+            data_version: Mutex::new(version),
             thresholds,
             root: config.server.collection_dir.clone(),
             authenticator: Authenticator::new(config),
@@ -87,14 +93,53 @@ impl AppState {
         &self.authenticator
     }
 
+    /// The current fleet-wide analysis, rebuilt first if another process has
+    /// changed the index since it was computed.
+    ///
+    /// Without this, the snapshot only moved when *this* process scanned — so
+    /// `loadbearer-fleet forget <machine>` in a terminal removed the machine
+    /// from the database and the dashboard went on showing it until the next
+    /// scan tick, fifteen minutes later, or a restart. The check is one pragma
+    /// against an already-open connection, and the rebuild only happens when
+    /// the answer has actually changed.
     fn snapshot(&self) -> Arc<Snapshot> {
+        if self.index_changed_elsewhere() {
+            // A failure here is not worth refusing the request over: the
+            // previous snapshot is still a true answer, just an older one.
+            if let Err(e) = self.recompute() {
+                tracing::warn!(error = %e, "could not rebuild the snapshot after an external change");
+            }
+        }
         Arc::clone(&self.cache.read().expect("cache lock"))
+    }
+
+    /// Whether another connection has committed since the last time this asked.
+    fn index_changed_elsewhere(&self) -> bool {
+        let Ok(idx) = self.index.try_lock() else {
+            // A scan is in flight and holds the lock; it will refresh the
+            // snapshot itself when it finishes.
+            return false;
+        };
+        let Ok(version) = idx.data_version() else {
+            return false;
+        };
+        drop(idx);
+        let mut seen = self.data_version.lock().expect("data version lock");
+        if *seen == version {
+            return false;
+        }
+        *seen = version;
+        true
     }
 
     fn recompute(&self) -> Result<()> {
         let idx = self.index.lock().expect("index lock");
         let snap = analytics::snapshot(idx.conn(), &self.thresholds, OffsetDateTime::now_utc())?;
+        // Taken *before* publishing, so a commit that lands during the analysis
+        // is noticed next time rather than being taken as already included.
+        let version = idx.data_version().unwrap_or(0);
         *self.cache.write().expect("cache lock") = Arc::new(snap);
+        *self.data_version.lock().expect("data version lock") = version;
         Ok(())
     }
 
@@ -918,6 +963,53 @@ mod tests {
                 .is_some_and(|l| l.starts_with("/auth/login")),
             "if this ever stops redirecting, the reason for the landing page is gone"
         );
+    }
+
+    /// A change made by another process has to reach the dashboard without
+    /// waiting for a scan.
+    ///
+    /// `forget` is a separate command, so it commits on a connection this
+    /// process does not own. The snapshot is cached in memory and used to be
+    /// rebuilt only by a scan, which meant a forgotten machine stayed on the
+    /// dashboard for up to fifteen minutes — long enough to look like `forget`
+    /// had not worked, which is how it was reported.
+    #[tokio::test]
+    async fn a_change_by_another_process_is_noticed_without_a_rescan() {
+        let dir = std::env::temp_dir().join(format!("lbf-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let db = dir.join("i.db");
+
+        // File-backed, because the point is a *second* connection to it.
+        let mut index = Index::open(&db).expect("index");
+        for f in ["win-modern.json", "linux-throttled.json"] {
+            index.ingest_file(&fixtures().join(f)).expect("fixture");
+        }
+        let mut config = oidc_config();
+        // No collection folder: nothing here may quietly rescan and mask the
+        // mechanism under test.
+        config.server.collection_dir = None;
+        let state = AppState::new(index, &config, Thresholds::default()).expect("state");
+
+        let cookie = session(&state, Role::Admin, &[]);
+        let before = get(&state, "/api/snapshot", Some(&cookie)).await.json();
+        assert_eq!(before["summary"]["machines"], 2);
+
+        // Another process entirely, as far as SQLite is concerned.
+        let mut other = Index::open(&db).expect("second connection");
+        let key = other.machines_matching("FLEET-LNX-01").expect("match")[0]
+            .key
+            .clone();
+        other.forget(&key).expect("forget");
+        drop(other);
+
+        let after = get(&state, "/api/snapshot", Some(&cookie)).await.json();
+        assert_eq!(
+            after["summary"]["machines"], 1,
+            "the dashboard should have noticed the external change without a scan"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
