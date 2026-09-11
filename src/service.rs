@@ -23,6 +23,8 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::report::Report;
+
 use crate::config::Config;
 
 /// The service name, and the name the unit file gets.
@@ -163,6 +165,255 @@ fn unreachable_under_protect_home(config: &Config) -> Vec<(&'static str, String)
     check("server.archive_dir", config.server.archive_dir.as_deref());
     check("log.file", config.log.file.as_deref());
     found
+}
+
+/// Everything a service needs, checked while the answer is still readable.
+///
+/// The generated unit is hardened, and hardening means it refuses to start
+/// unless what it names already exists: `User=` must be a real account
+/// (`217/USER`), and every `ReadWritePaths=` directory must exist
+/// (`226/NAMESPACE`). Neither code says anything about the cause, and by the
+/// time systemd reports one the operator is reading journal output rather than
+/// a sentence. So all of it is checked here instead.
+///
+/// Writability is judged from ownership and mode rather than by trying a write
+/// as the target account, which would need to be that account. That is a
+/// heuristic and says so.
+pub fn service_preflight(config_path: Option<&Path>, config: &Config, user: &str) -> Report {
+    let mut r = Report::default();
+
+    match config_path {
+        Some(p) if p.is_absolute() => r.pass("config", p.display().to_string()),
+        Some(p) => r.fail(
+            "config",
+            format!("{} is a relative path", p.display()),
+            "A service does not start in this directory. Pass an absolute --config.",
+        ),
+        None => r.fail(
+            "config",
+            "not given".to_string(),
+            "Every path a service uses has to come from a file it can find. Run `init-config` \
+             and pass --config.",
+        ),
+    }
+
+    match &config.log.file {
+        Some(f) => r.pass("log file", f.display().to_string()),
+        None => r.fail(
+            "log file",
+            "not set".to_string(),
+            "A service has no console. Without [log] file there is no way to find out why it \
+             failed to start.",
+        ),
+    }
+
+    match std::env::current_exe() {
+        Ok(exe) => {
+            let shown = exe.display().to_string();
+            if under_home(&shown) {
+                r.fail(
+                    "binary",
+                    shown,
+                    "ExecStart is whichever binary prints the unit, and the unit sets \
+                     ProtectHome=yes — so a binary here is one the service cannot execute. \
+                     Install it somewhere like /usr/local/bin and generate the unit from there.",
+                );
+            } else {
+                r.pass("binary", shown);
+            }
+        }
+        Err(e) => r.note("binary", format!("could not determine: {e}")),
+    }
+
+    for (field, path) in unreachable_under_protect_home(config) {
+        r.fail(
+            field,
+            path,
+            "Under a home directory, which ProtectHome=yes makes invisible to the service — not \
+             merely unreadable. Use /var/lib/loadbearer-fleet and /var/log/loadbearer-fleet.",
+        );
+    }
+
+    check_account(&mut r, user);
+
+    // The directories the unit will name as writable.
+    let mut writable: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = config.server.index.parent() {
+        writable.push(d.to_path_buf());
+    }
+    if let Some(d) = config.log.file.as_ref().and_then(|f| f.parent()) {
+        writable.push(d.to_path_buf());
+    }
+    if let Some(d) = &config.server.archive_dir {
+        writable.push(d.clone());
+    }
+    writable.sort();
+    writable.dedup();
+    for dir in &writable {
+        check_writable_dir(&mut r, dir, user);
+    }
+
+    // Read-only, and a missing one is survivable — the startup scan reports it
+    // and carries on — so this is a note rather than a failure.
+    match &config.server.collection_dir {
+        Some(d) if d.exists() => r.pass("collection folder", d.display().to_string()),
+        Some(d) => r.note(
+            "collection folder",
+            format!("{} does not exist yet", d.display()),
+        ),
+        None => r.note(
+            "collection folder",
+            "not set — it will serve whatever the index already holds".to_string(),
+        ),
+    }
+
+    match std::net::TcpListener::bind(config.server.bind) {
+        Ok(l) => {
+            drop(l);
+            r.pass("bind", config.server.bind.to_string());
+        }
+        Err(e) => r.fail(
+            "bind",
+            format!("{} is not available: {e}", config.server.bind),
+            "Something already holds that address — often an earlier copy of this service still \
+             running.",
+        ),
+    }
+
+    r.unknown = vec![
+        "Whether the account can actually read the collection folder, which for a network share \
+         depends on the share's own permissions rather than on anything here."
+            .to_string(),
+        "Sign-in, if configured: run `check-auth` for that.".to_string(),
+    ];
+    r
+}
+
+fn under_home(path: &str) -> bool {
+    ["/home/", "/root/", "/run/user/"]
+        .iter()
+        .any(|h| path.starts_with(h))
+}
+
+/// Does the account the unit names exist, and what are its ids?
+#[cfg(unix)]
+fn account(user: &str) -> Option<(u32, u32)> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let mut f = line.split(':');
+        if f.next() == Some(user) {
+            let _ = f.next();
+            let uid = f.next()?.parse().ok()?;
+            let gid = f.next()?.parse().ok()?;
+            return Some((uid, gid));
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn check_account(r: &mut Report, user: &str) {
+    match account(user) {
+        Some((uid, gid)) => r.pass(
+            "service account",
+            format!("{user} exists (uid {uid}, gid {gid})"),
+        ),
+        None => r.fail(
+            "service account",
+            format!("{user} does not exist"),
+            "systemd fails the unit with 217/USER. Create it:  sudo useradd --system \
+             --no-create-home --shell /usr/sbin/nologin loadbearer-fleet",
+        ),
+    }
+}
+
+/// Does the directory exist at all? Platform-independent, because the answer
+/// is and because the unit being previewed is systemd's wherever it was
+/// printed — so the code it will die with is worth naming either way.
+fn check_dir_exists(r: &mut Report, dir: &Path) -> bool {
+    match std::fs::metadata(dir) {
+        Err(_) => {
+            r.fail(
+                "writable dir",
+                format!("{} does not exist", dir.display()),
+                "ReadWritePaths cannot create a directory, and a missing one fails the unit with \
+                 226/NAMESPACE, which says nothing about the cause. Create it and chown it to \
+                 the service account.",
+            );
+            false
+        }
+        Ok(m) if !m.is_dir() => {
+            r.fail(
+                "writable dir",
+                format!("{} is not a directory", dir.display()),
+                "The unit mounts it read-write; it has to be a directory.",
+            );
+            false
+        }
+        Ok(_) => true,
+    }
+}
+
+#[cfg(unix)]
+fn check_writable_dir(r: &mut Report, dir: &Path, user: &str) {
+    use std::os::unix::fs::MetadataExt;
+
+    if !check_dir_exists(r, dir) {
+        return;
+    }
+    let meta = match std::fs::metadata(dir) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    let Some((uid, gid)) = account(user) else {
+        // No account to compare against; its own check already failed.
+        r.note(
+            "writable dir",
+            format!(
+                "{} exists; cannot judge access without the account",
+                dir.display()
+            ),
+        );
+        return;
+    };
+
+    let mode = meta.mode();
+    let writable = (meta.uid() == uid && mode & 0o200 != 0)
+        || (meta.gid() == gid && mode & 0o020 != 0)
+        || mode & 0o002 != 0;
+    if writable {
+        r.pass("writable dir", dir.display().to_string());
+    } else {
+        r.fail(
+            "writable dir",
+            format!(
+                "{} is owned by {}:{} with mode {:o} — {user} cannot write it",
+                dir.display(),
+                meta.uid(),
+                meta.gid(),
+                mode & 0o777
+            ),
+            "sudo chown loadbearer-fleet: <dir>",
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn check_account(r: &mut Report, user: &str) {
+    r.note(
+        "service account",
+        format!("{user} is only meaningful for the systemd unit; not checked here"),
+    );
+}
+
+#[cfg(not(unix))]
+fn check_writable_dir(r: &mut Report, dir: &Path, _user: &str) {
+    // Existence is checkable here; which account may write it is not, without
+    // reading Windows ACLs for an account that is only meaningful to systemd.
+    if check_dir_exists(r, dir) {
+        r.pass("writable dir", dir.display().to_string());
+    }
 }
 
 /// The systemd-specific check, on top of [`preflight`].
@@ -479,6 +730,78 @@ mod tests {
         c.server.index = PathBuf::from("/var/lib/loadbearer-fleet/fleet-index.db");
         c.log.file = Some(PathBuf::from("/var/log/loadbearer-fleet/fleet.log"));
         c
+    }
+
+    /// The point of the command: every one of these cost real time on a real
+    /// host, and systemd reported each as a numbered code that says nothing
+    /// about the cause. If a check stops naming its own fix, the command has
+    /// stopped being worth running.
+    #[test]
+    fn preflight_names_what_is_missing_and_how_to_fix_it() {
+        let dir = std::env::temp_dir().join(format!("lbf-pf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let cfg = dir.join("fleet.toml");
+
+        // A missing directory must fail: ReadWritePaths cannot create one, and
+        // the unit dies at 226/NAMESPACE without saying why.
+        let mut c = config();
+        c.server.index = dir.join("nowhere/fleet-index.db");
+        c.log.file = Some(dir.join("nowhere/fleet.log"));
+        let r = service_preflight(Some(&cfg), &c, "a-user-that-does-not-exist");
+        let shown = r.to_string();
+        assert!(!r.ok(), "a missing directory must fail:\n{shown}");
+        assert!(shown.contains("226/NAMESPACE"), "{shown}");
+
+        // A relative --config, which a service cannot resolve.
+        let r = service_preflight(Some(Path::new("fleet.toml")), &config(), "root");
+        assert!(!r.ok());
+        assert!(r.to_string().contains("relative"), "{}", r.to_string());
+
+        // None at all.
+        assert!(!service_preflight(None, &config(), "root").ok());
+
+        // No log file — the one that makes every later failure undiagnosable.
+        let mut c = config();
+        c.log.file = None;
+        let r = service_preflight(Some(&cfg), &c, "root");
+        assert!(!r.ok());
+        assert!(r.to_string().contains("no console"), "{}", r.to_string());
+
+        // A home-directory path, which ProtectHome makes invisible.
+        let mut c = config();
+        c.server.archive_dir = Some(PathBuf::from("/home/someone/archive"));
+        let r = service_preflight(Some(&cfg), &c, "root");
+        assert!(!r.ok());
+        assert!(r.to_string().contains("ProtectHome"), "{}", r.to_string());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one failure here that is about the machine rather than the
+    /// configuration, and worth catching because the usual cause is an earlier
+    /// copy of this service still running.
+    #[test]
+    fn preflight_notices_the_port_is_taken() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
+        let addr = held.local_addr().expect("addr");
+
+        let dir = std::env::temp_dir().join(format!("lbf-pf-port-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut c = config();
+        c.server.bind = addr;
+        c.server.index = dir.join("fleet-index.db");
+        c.log.file = Some(dir.join("fleet.log"));
+
+        let r = service_preflight(Some(&dir.join("fleet.toml")), &c, "root");
+        let shown = r.to_string();
+        assert!(!r.ok(), "a held port must fail:\n{shown}");
+        assert!(shown.contains("not available"), "{shown}");
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -16,6 +16,7 @@ mod config;
 mod index;
 mod metrics;
 mod reference;
+mod report;
 mod schema;
 mod service;
 mod web;
@@ -165,6 +166,17 @@ enum ServiceAction {
     },
     /// Remove the Windows service. Leaves the index and the config alone.
     Uninstall,
+    /// Check everything a service needs before installing one.
+    ///
+    /// The hardened unit will not start unless the account and the directories
+    /// it names already exist, and systemd reports those as `217/USER` and
+    /// `226/NAMESPACE` — codes that say nothing about the cause. This checks
+    /// them while you can still read the answer.
+    Preflight {
+        /// The user the unit will run as. Must match `service unit --user`.
+        #[arg(long, default_value = "loadbearer-fleet", value_name = "USER")]
+        user: String,
+    },
     /// Print a systemd unit for this configuration.
     Unit {
         /// The user to run as.
@@ -275,24 +287,38 @@ fn main() -> Result<()> {
         config.server.index = index.clone();
     }
 
-    // `service unit` prints a document too, but it needs the config to build
-    // one — so it goes after the load and before logging. Setting logging up
-    // *creates the log directory*, which turns previewing a unit as an ordinary
-    // user into "creating the log directory /var/log/loadbearer-fleet" instead
-    // of a unit. Printing a file for review should not need write access to
-    // somewhere the service will later run.
-    if let Command::Service {
-        action: ServiceAction::Unit { user },
-    } = &cli.command
-    {
-        let path = service::preflight(cli.config.as_deref(), &config)?;
-        service::systemd_preflight(&config)?;
-        // Whatever binary prints the unit is the one it will start, so
-        // generating it from an unpacked tarball in a home directory bakes that
-        // path into ExecStart — and then ProtectHome hides it.
-        let exe = std::env::current_exe().context("finding this executable")?;
-        print!("{}", service::systemd_unit(&exe, path, &config, user));
-        return Ok(());
+    // **A command that only reports must not set logging up**, because doing so
+    // *creates the log directory* — so an ordinary user asking a question about
+    // the configuration gets "creating the log directory
+    // /var/log/loadbearer-fleet: Permission denied" instead of an answer.
+    // `init-config` and `reference` avoid it by running before the config is
+    // even loaded; these two need the config, so they go after the load and
+    // before logging. Both have been caught by this in turn.
+    match &cli.command {
+        Command::Service {
+            action: ServiceAction::Unit { user },
+        } => {
+            let path = service::preflight(cli.config.as_deref(), &config)?;
+            service::systemd_preflight(&config)?;
+            // Whatever binary prints the unit is the one it will start, so
+            // generating it from an unpacked tarball in a home directory bakes
+            // that path into ExecStart — and then ProtectHome hides it.
+            let exe = std::env::current_exe().context("finding this executable")?;
+            print!("{}", service::systemd_unit(&exe, path, &config, user));
+            return Ok(());
+        }
+        Command::Service {
+            action: ServiceAction::Preflight { user },
+        } => {
+            let report = service::service_preflight(cli.config.as_deref(), &config, user);
+            print!("{report}");
+            return if report.ok() {
+                Ok(())
+            } else {
+                anyhow::bail!("not ready to install a service yet — see the FAIL lines above")
+            };
+        }
+        _ => {}
     }
 
     init_logging(&config.log, cli.log_level.as_deref())?;
@@ -482,6 +508,7 @@ fn main() -> Result<()> {
                 )
             }
             ServiceAction::Uninstall => service::uninstall(),
+            ServiceAction::Preflight { .. } => unreachable!("handled before logging"),
             ServiceAction::Unit { .. } => unreachable!("handled before logging"),
         },
         Command::Serve {

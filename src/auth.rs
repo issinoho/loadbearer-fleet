@@ -57,6 +57,7 @@ use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 
 use crate::config::{Auth as AuthConfig, AuthMode, Config, Entitlement, Role};
+use crate::report::Report;
 use crate::web::AppState;
 
 const SESSION_COOKIE: &str = "lbf_session";
@@ -566,89 +567,6 @@ fn classify_authorization(
     }
 
     Ok("client registered, redirect URI matched, scopes and PKCE accepted")
-}
-
-/// One `check-auth` run: what was proved, what was not, and what cannot be.
-#[derive(Default)]
-pub struct Report {
-    checks: Vec<(Outcome, &'static str, String, Option<&'static str>)>,
-    unknown: Vec<String>,
-}
-
-#[derive(PartialEq)]
-enum Outcome {
-    Pass,
-    Fail,
-    Note,
-}
-
-impl Report {
-    fn pass(&mut self, what: &'static str, detail: String) {
-        self.checks.push((Outcome::Pass, what, detail, None));
-    }
-    fn note(&mut self, what: &'static str, detail: String) {
-        self.checks.push((Outcome::Note, what, detail, None));
-    }
-    fn fail(&mut self, what: &'static str, detail: String, advice: &'static str) {
-        self.checks
-            .push((Outcome::Fail, what, detail, Some(advice)));
-    }
-
-    /// Whether anything failed, so the command can exit non-zero and a deploy
-    /// script can stop rather than press on to a sign-in that will not work.
-    pub fn ok(&self) -> bool {
-        !self.checks.iter().any(|(o, ..)| *o == Outcome::Fail)
-    }
-}
-
-impl std::fmt::Display for Report {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (outcome, what, detail, advice) in &self.checks {
-            let mark = match outcome {
-                Outcome::Pass => "ok  ",
-                Outcome::Fail => "FAIL",
-                Outcome::Note => "note",
-            };
-            writeln!(f, "  {mark}  {what:<18} {detail}")?;
-            if let Some(advice) = advice {
-                for line in wrap(advice, 68) {
-                    writeln!(f, "                           {line}")?;
-                }
-            }
-        }
-        if !self.unknown.is_empty() {
-            writeln!(f, "\nNot knowable without a real sign-in:")?;
-            for item in &self.unknown {
-                let mut lines = wrap(item, 72).into_iter();
-                if let Some(first) = lines.next() {
-                    writeln!(f, "  - {first}")?;
-                }
-                for line in lines {
-                    writeln!(f, "    {line}")?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Greedy wrap. The advice is prose and a terminal is not always wide.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.len() + 1 + word.len() > width {
-            out.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        out.push(line);
-    }
-    out
 }
 
 /// One query parameter out of a redirect's `Location`, percent-decoded enough
