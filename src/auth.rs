@@ -37,6 +37,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result, anyhow};
 use axum::extract::{FromRequestParts, Query, State};
@@ -786,6 +787,8 @@ pub struct Submitter(pub Principal);
 pub enum NotASubmitter {
     BadToken,
     NoSession(NotSignedIn),
+    /// Over the per-credential rate limit, with how long until it is not.
+    TooFast(StdDuration),
 }
 
 impl IntoResponse for NotASubmitter {
@@ -801,6 +804,19 @@ impl IntoResponse for NotASubmitter {
             )
                 .into_response(),
             Self::NoSession(no) => no.into_response(),
+            // The wait is a header as well as prose: the thing being refused
+            // is usually a script, and a script reads headers.
+            Self::TooFast(wait) => {
+                let seconds = wait.as_secs().max(1);
+                let body = format!(
+                    "too many submissions from this credential; try again in {seconds}                      second(s). Resending is safe — ingest is idempotent by content, so a                      document that did land is answered as already indexed rather than                      stored twice."
+                );
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+                if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                    response.headers_mut().insert(header::RETRY_AFTER, value);
+                }
+                response
+            }
         }
     }
 }
@@ -812,15 +828,24 @@ impl FromRequestParts<Arc<AppState>> for Submitter {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(presented) = bearer(&parts.headers) {
-            return match state.ingest().lookup(presented) {
-                Some(principal) => Ok(Submitter(principal)),
-                None => Err(NotASubmitter::BadToken),
-            };
-        }
-        let Caller(principal) = Caller::from_request_parts(parts, state)
-            .await
-            .map_err(NotASubmitter::NoSession)?;
+        let principal = match bearer(&parts.headers) {
+            Some(presented) => state
+                .ingest()
+                .lookup(presented)
+                .ok_or(NotASubmitter::BadToken)?,
+            None => {
+                Caller::from_request_parts(parts, state)
+                    .await
+                    .map_err(NotASubmitter::NoSession)?
+                    .0
+            }
+        };
+        // Before the body, which is the whole point of doing it here: this
+        // runs while only the headers have been read, so a caller in a loop
+        // cannot make the server buffer a document per attempt.
+        state
+            .allow_upload(&principal.subject)
+            .map_err(NotASubmitter::TooFast)?;
         Ok(Submitter(principal))
     }
 }

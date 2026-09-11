@@ -30,7 +30,9 @@
 //! operator is in should not cost them their history. See `set_aside`.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -99,6 +101,38 @@ fn stamped_version(path: &Path) -> Result<Option<i64>> {
 /// the same shape this project recommends for collected copies generally. The
 /// hash suffix makes it unique — two runs of one machine in the same second
 /// would otherwise collide — and ties the name to the contents.
+/// Distinguishes temporary files written by this process from each other.
+static PARTIAL: AtomicU64 = AtomicU64::new(0);
+
+/// Write a new file, refusing to write *through* anything already at that path.
+///
+/// `create_new` is the whole point of not using `fs::write` here. `fs::write`
+/// opens the path and truncates whatever it finds, following a symlink to
+/// wherever it points; `create_new` fails if the path exists at all, symlink
+/// included, because the underlying open is exclusive.
+///
+/// That matters more here than it would elsewhere. The upload directory has to
+/// live inside the collection folder, and this project's own threat model says
+/// anything that can write to that folder controls it — in the documented
+/// deployment, every machine in the estate. A planted symlink is a way to make
+/// the service write a chosen file to a chosen place as its own account, and
+/// refusing to open an existing path removes it.
+fn write_new(path: &Path, text: &str) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    // The rename that follows is atomic, but only with respect to a reader —
+    // a crash between the two would otherwise leave a file whose name claims
+    // contents it does not have.
+    file.sync_all()
+        .with_context(|| format!("flushing {}", path.display()))?;
+    Ok(())
+}
+
 fn upload_name(doc: &ResultFile, hash: &str) -> String {
     let host = doc
         .machine
@@ -671,9 +705,18 @@ impl Index {
                 .with_context(|| format!("creating the upload directory {}", dir.display()))?;
             // Temporary name, then rename: a failed write cannot leave a
             // truncated file behind whose name is a claim about its contents.
-            let partial = dir.join(format!("{hash}.json.partial"));
-            std::fs::write(&partial, text)
-                .with_context(|| format!("writing {}", partial.display()))?;
+            //
+            // The name carries the process and a counter as well as the hash,
+            // so two callers submitting the same document at the same moment
+            // do not write to one file and then race to rename it. It keeps
+            // the `.partial` suffix, which a scan ignores — it takes `.json`
+            // and `.json.gz` and nothing else.
+            let partial = dir.join(format!(
+                "{hash}.{}-{}.partial",
+                std::process::id(),
+                PARTIAL.fetch_add(1, Ordering::Relaxed)
+            ));
+            write_new(&partial, text)?;
             std::fs::rename(&partial, &target)
                 .with_context(|| format!("moving {} into place", partial.display()))?;
         }
@@ -1194,6 +1237,53 @@ mod tests {
     /// submitted result could reach outside the directory it belongs in. It
     /// cannot: every character that is not plainly a filename becomes a
     /// hyphen, which leaves a name that is readable and inert.
+    /// The temporary file is *created*, never opened. Anything already at
+    /// that path is somebody else's, and writing through it is how a service
+    /// account gets used to put a chosen file somewhere it did not choose.
+    #[test]
+    fn a_temporary_file_is_never_written_through_something_already_there() {
+        let dir = std::env::temp_dir().join(format!("lbf-writenew-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let taken = dir.join("taken");
+        std::fs::write(&taken, "not yours").expect("plant");
+        assert!(
+            write_new(&taken, "mine").is_err(),
+            "an existing file is not a place to write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&taken).expect("read"),
+            "not yours",
+            "and it is left exactly as it was"
+        );
+
+        // The case that matters: a symlink. `fs::write` follows one and lands
+        // on whatever it points at; this must not.
+        #[cfg(unix)]
+        {
+            let elsewhere = dir.join("elsewhere");
+            std::fs::write(&elsewhere, "untouched").expect("target");
+            let planted = dir.join("planted");
+            std::os::unix::fs::symlink(&elsewhere, &planted).expect("symlink");
+            assert!(
+                write_new(&planted, "mine").is_err(),
+                "a symlink is not ours"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&elsewhere).expect("read"),
+                "untouched",
+                "nothing was written through it"
+            );
+        }
+
+        let fresh = dir.join("fresh");
+        write_new(&fresh, "mine").expect("a new path is fine");
+        assert_eq!(std::fs::read_to_string(&fresh).expect("read"), "mine");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_uploaded_file_is_named_from_the_document_and_cannot_escape_its_directory() {
         let mut doc =

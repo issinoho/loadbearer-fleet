@@ -504,6 +504,30 @@ impl Config {
         // safe to delete. Refusing here is the difference between a rule and a
         // hope.
         if let Some(upload) = &self.server.upload_dir {
+            // Before the comparison below, which is on the paths as written.
+            // `Path::starts_with` is component-wise, so
+            // `/srv/collection/../../etc` does begin with `/srv/collection`
+            // and would pass a rule this file documents as containment.
+            // Refusing `..` outright is the honest version: the alternative is
+            // resolving a path that need not exist yet.
+            for (field, path) in [
+                ("server.upload_dir", Some(upload)),
+                ("server.collection_dir", self.server.collection_dir.as_ref()),
+            ] {
+                if let Some(path) = path
+                    && path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    bail!(
+                        "{field} ({}) contains `..`. Uploading requires the upload directory \
+                         to be inside the collection folder, and that is checked on the path \
+                         as written — a path that climbs back out would satisfy the check and \
+                         not the rule. Write the destination out in full.",
+                        path.display()
+                    );
+                }
+            }
             match &self.server.collection_dir {
                 None => bail!(
                     "server.upload_dir is set to {} but there is no server.collection_dir. An \
@@ -1230,6 +1254,19 @@ mod tests {
             .expect_err("refused")
             .to_string();
         assert!(err.contains("no server.collection_dir"), "{err}");
+
+        // `Path::starts_with` compares components, so a path that climbs back
+        // out satisfies it: ["/", "srv", "collection", "..", "..", "etc"]
+        // does begin with ["/", "srv", "collection"]. The rule is documented
+        // as containment, so it has to mean containment.
+        let err = with(
+            Some("/srv/collection"),
+            Some("/srv/collection/../../etc/cron.d"),
+        )
+        .validate()
+        .expect_err("a path that climbs out is not inside")
+        .to_string();
+        assert!(err.contains(".."), "{err}");
     }
 
     /// A bearer credential every machine in the estate holds is worth being

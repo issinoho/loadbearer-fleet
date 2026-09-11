@@ -42,13 +42,18 @@ It:
   index, and the document archive if `archive_dir` is set. Nothing here ever
   deletes from the collection folder;
 - **accepts submitted results only through one route.** `POST /api/upload`,
-  from a signed-in `contributor` or an ingest token, with five things checked
-  before a byte is kept: that an `upload_dir` exists, that the caller may
-  upload, that the body is `application/json` (which no cross-origin form can
-  send, on top of `SameSite=Lax`), that the caller is inside a per-credential
-  rate limit, and that the document parses and falls within their tag scope.
-  The stored filename is built from the *document* and sanitised, never from
-  anything the request chose;
+  from a signed-in `contributor` or an ingest token. Five things are checked
+  before a byte is kept, and the first two — who the caller is, and whether
+  they are inside their per-credential rate limit — are answered **before the
+  request body is read at all**, so an unauthenticated or over-limit caller
+  cannot make the server buffer a 16 MB document. Then: that an `upload_dir`
+  exists, that the caller may upload, that the body is `application/json`
+  (which no cross-origin form can send, on top of `SameSite=Lax`), and that
+  the document parses and falls within their tag scope. The stored filename is
+  built from the *document* and sanitised, never from anything the request
+  chose, and the file is **created** rather than opened — so a symlink planted
+  in the upload directory is an error rather than a way to have the service
+  write somewhere it did not choose;
 - **treats the collection folder as untrusted input**, because anything that
   can write there controls it — in the documented deployment, every machine in
   the estate. A document is refused above **16 MB**, on its size on disk before
@@ -124,6 +129,11 @@ deleting the entry and restarting.
   and never looks at an `Authorization` header — so a token leaking out of a
   deployment script leaks a write path rather than the estate. It is also,
   deliberately, always a `contributor` and never more.
+- **The rate limit counts submissions, not bytes.** At the default of 120 a
+  minute, a credential submitting *maximum-sized* documents rather than the
+  usual 40 KB ones can still write faster than the "40 KB at a time" framing
+  suggests. Lower it, or set a filesystem quota, if the upload directory
+  shares a volume with something that matters.
 - **The upload rate limit is a safety valve, not DoS protection.** It bounds
   what one credential can write, which is the runaway-script and leaked-token
   case. Absorbing a flood is the reverse proxy's job; unauthenticated requests

@@ -111,6 +111,24 @@ impl AppState {
         &self.ingest
     }
 
+    /// Take one submission's worth of allowance for this caller, or say how
+    /// long until there is some.
+    ///
+    /// Called from the extractor rather than from the handler, because an
+    /// extractor that takes the body runs before the handler does: checking
+    /// here is what makes a refusal cost the headers rather than 16 MB of
+    /// buffered body per attempt.
+    pub fn allow_upload(&self, subject: &str) -> Result<(), Duration> {
+        let outcome = self.uploads.check(subject);
+        if outcome.is_err() {
+            self.runtime
+                .lock()
+                .expect("runtime lock")
+                .uploads_limited_total += 1;
+        }
+        outcome
+    }
+
     /// The current fleet-wide analysis, rebuilt first if another process has
     /// changed the index since it was computed.
     ///
@@ -209,9 +227,6 @@ impl AppState {
 struct AppError {
     status: StatusCode,
     source: anyhow::Error,
-    /// Only on a 429, where the answer is "later" and the caller deserves to
-    /// be told how much later rather than made to guess.
-    retry_after: Option<Duration>,
 }
 
 impl AppError {
@@ -232,20 +247,10 @@ impl AppError {
         Self::at(StatusCode::FORBIDDEN, what)
     }
 
-    /// Too fast, and when to try again. The wait is a header as well as
-    /// prose, because the thing being refused is usually a script.
-    fn too_many(wait: Duration, what: impl std::fmt::Display) -> Self {
-        Self {
-            retry_after: Some(wait),
-            ..Self::at(StatusCode::TOO_MANY_REQUESTS, what)
-        }
-    }
-
     fn at(status: StatusCode, what: impl std::fmt::Display) -> Self {
         Self {
             status,
             source: anyhow::anyhow!("{what}"),
-            retry_after: None,
         }
     }
 }
@@ -258,14 +263,7 @@ impl IntoResponse for AppError {
         } else {
             tracing::debug!(status = %self.status, error = %message, "request refused");
         }
-        let mut response = (self.status, message).into_response();
-        if let Some(wait) = self.retry_after {
-            let seconds = wait.as_secs().max(1);
-            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
-                response.headers_mut().insert(header::RETRY_AFTER, value);
-            }
-        }
-        response
+        (self.status, message).into_response()
     }
 }
 
@@ -274,7 +272,6 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             source: e.into(),
-            retry_after: None,
         }
     }
 }
@@ -359,6 +356,11 @@ struct UploadOutcome {
 /// Four things have to be true before a byte of it is kept, and they are
 /// checked in this order deliberately — cheapest and least revealing first:
 ///
+/// 0. **Not too fast.** Applied by the [`Submitter`] extractor rather than
+///    here, because an extractor that takes the body runs before this
+///    function does — a limit checked at this point would bound the parse and
+///    the write while still letting a caller in a loop make the server buffer
+///    a 16 MB body for every attempt.
 /// 1. **The server was given somewhere to put it.** No `upload_dir`, no
 ///    uploading, whatever anybody's role says.
 /// 2. **The caller may upload.** `contributor` or better — either a person
@@ -368,14 +370,32 @@ struct UploadOutcome {
 ///    multipart or plain text, so insisting on `application/json` means no
 ///    HTML page on another site can post here with the user's cookie — on top
 ///    of `SameSite=Lax`, which already withholds it.
-/// 4. **Not too fast.** A cap per credential, so a script in a loop cannot
-///    fill the disk. Idle time banks, and the refusal says when to come back.
-/// 5. **It parses, and it is in scope.** A contributor scoped to one site may
+/// 4. **It parses, and it is in scope.** A contributor scoped to one site may
 ///    not submit a result claiming to be from another; the same
 ///    `scopes_allow` that decides what they may *read* decides this.
 ///
 /// The body size is capped at the route, at the same limit the scanner
 /// applies to a file on disk.
+/// A value out of a submitted document, made safe to put in a log line.
+///
+/// The text log writes fields with `Display` and puts one record on one line,
+/// so a control character inside a value ends the record early and whatever
+/// follows reads as a line somebody else wrote. A hostname or a serial is
+/// whatever the machine said it was — for an upload, whatever the *submitter*
+/// said it was — so it is not a thing to hand to a line-oriented format
+/// unexamined. The JSON format escapes it properly; this is for the other one,
+/// which is the default.
+///
+/// Capped as well as filtered: a field has no length limit, and a log line is
+/// not the place to discover that.
+fn loggable(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .take(120)
+        .collect()
+}
+
 async fn post_upload(
     State(state): State<Arc<AppState>>,
     Submitter(who): Submitter,
@@ -402,25 +422,6 @@ async fn post_upload(
             "send the document as application/json",
         ));
     }
-    // Last of the cheap checks, and the first that costs anything to answer:
-    // the limit is per principal, so it needs a caller, and it goes before the
-    // parse and the write so that a client in a loop costs neither.
-    if let Err(wait) = state.uploads.check(&who.subject) {
-        state
-            .runtime
-            .lock()
-            .expect("runtime lock")
-            .uploads_limited_total += 1;
-        return Err(AppError::too_many(
-            wait,
-            format!(
-                "too many submissions from this credential; try again in {} second(s). \
-                 Resending is safe — ingest is idempotent by content, so a document that \
-                 did land is answered as already indexed rather than stored twice.",
-                wait.as_secs().max(1)
-            ),
-        ));
-    }
 
     // Parsed here as well as in the index, because the scope check needs the
     // tags before anything is written, and a document that is not a result
@@ -444,8 +445,8 @@ async fn post_upload(
     };
     state.runtime.lock().expect("runtime lock").uploads_total += 1;
     tracing::info!(
-        by = %who.subject,
-        machine = %doc.machine_key().value,
+        by = %loggable(&who.subject),
+        machine = %loggable(&doc.machine_key().value),
         fresh,
         "result uploaded"
     );
@@ -1788,6 +1789,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The limit has to be applied before the body is read, not after.
+    ///
+    /// An extractor that takes the body runs *before* the handler does, so a
+    /// check inside the handler bounds the parse and the write and nothing
+    /// else — a credential over its limit could still make the server buffer
+    /// 16 MB per request, as many times over as it had connections. The probe
+    /// is a body that cannot be read at all: if the answer describes the body,
+    /// the body was read; if it says 429, nothing was.
+    #[tokio::test]
+    async fn a_rate_limited_caller_is_refused_before_the_body_is_read() {
+        let dir = std::env::temp_dir().join(format!("lbf-ratebody-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.server.upload_limit_per_minute = 1;
+        config.ingest.tokens = vec![token("deploy", "s3cret", &[])];
+        let state = state_for(&config);
+
+        let first = post_token(&state, &a_later_run(serde_json::json!({})), "s3cret").await;
+        assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+
+        // Not UTF-8, so reading it as a body is itself an error. Reaching that
+        // error means the bytes were taken in.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/upload")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer s3cret")
+            .body(Body::from(vec![0xff, 0xfe, 0xff]))
+            .expect("request");
+        let response = router(Arc::clone(&state))
+            .oneshot(request)
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the limit must be answered without reading the body"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A credential in a loop is the failure this exists for: it costs disk
     /// rather than secrecy, so the answer is "later", with a header saying how
     /// much later and prose saying that coming back is safe.
@@ -1860,6 +1906,49 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A submitted document is attacker-controlled text all the way down, and
+    /// the default log format puts one record on one line. Nothing upstream
+    /// strips control characters — `machine_key` only trims the ends — so the
+    /// filtering has to happen where the value meets the log.
+    #[test]
+    fn a_submitted_document_cannot_forge_a_log_line() {
+        let text = std::fs::read_to_string(fixtures().join("win-modern.json")).expect("fixture");
+        let mut doc: serde_json::Value = serde_json::from_str(&text).expect("json");
+        doc["machine"]["identity"]["serial"] =
+            serde_json::json!("SN-1\n2026-09-11T00:00:00Z  INFO forged line");
+        let parsed =
+            crate::schema::ResultFile::from_json(&doc.to_string()).expect("still a result");
+
+        let raw = parsed.machine_key().value;
+        assert!(
+            raw.contains('\n'),
+            "the premise: the document carries it through to the key"
+        );
+
+        let safe = loggable(&raw);
+        assert!(!safe.contains('\n'), "{safe:?}");
+        assert!(!safe.chars().any(char::is_control), "{safe:?}");
+        assert!(
+            safe.starts_with("SN-1?"),
+            "and says something happened: {safe:?}"
+        );
+
+        // Length, too: a field has no limit and a log line should have one.
+        assert_eq!(loggable(&"a".repeat(500)).chars().count(), 120);
+    }
+
+    /// A stack overflow is not a refused request — it is the process, and
+    /// every session in it, gone. `serde_json` has a recursion limit on by
+    /// default; this is here so that losing it, whether by enabling
+    /// `unbounded_depth` or by moving to a parser without one, shows up as a
+    /// failing test rather than as a restart loop.
+    #[test]
+    fn a_deeply_nested_document_is_refused_rather_than_overflowing_the_stack() {
+        let deep = format!("{}1{}", "[".repeat(50_000), "]".repeat(50_000));
+        let body = format!("{{\"schema\":\"loadbearer.result/1\",\"machine\":{deep}}}");
+        assert!(crate::schema::ResultFile::from_json(&body).is_err());
     }
 
     #[tokio::test]
