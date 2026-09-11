@@ -60,6 +60,14 @@ enum Command {
         /// Folder to walk. A local path or a UNC share.
         #[arg(value_name = "DIR")]
         dir: PathBuf,
+        /// Re-read every document, including the ones already indexed.
+        ///
+        /// A scan skips a file whose contents it has seen before, which is what
+        /// keeps a large share cheap to rescan — and what stops a field this
+        /// version records from ever appearing for an older run. This rebuilds
+        /// those runs from the same documents. Slower, and safe to repeat.
+        #[arg(long)]
+        reindex: bool,
     },
     /// What's in the index right now.
     Status,
@@ -349,15 +357,21 @@ fn main() -> Result<()> {
 
     match &cli.command {
         Command::InitConfig | Command::Reference => unreachable!("handled above"),
-        Command::Scan { dir } => {
+        Command::Scan { dir, reindex } => {
             let mut idx = index::Index::open(&config.server.index)?
                 .with_archive(config.server.archive_dir.as_deref())?;
-            let report = idx.scan(dir)?;
+            let report = if *reindex {
+                idx.rescan_all(dir)?
+            } else {
+                idx.scan(dir)?
+            };
             println!(
-                "scanned {}: {} file(s), {} new, {} already indexed",
+                "{} {}: {} file(s), {} {}, {} already indexed",
+                if *reindex { "re-indexed" } else { "scanned" },
                 dir.display(),
                 report.seen,
                 report.ingested,
+                if *reindex { "rebuilt" } else { "new" },
                 report.unchanged
             );
             for (path, why) in &report.rejected {

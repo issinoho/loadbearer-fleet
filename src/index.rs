@@ -87,6 +87,44 @@ fn stamped_version(path: &Path) -> Result<Option<i64>> {
 /// happens during a deliberate upgrade, with somebody watching, and refusing
 /// to start with an explanation is a better outcome than starting successfully
 /// having thrown away the one copy of their history.
+/// Columns added to an existing index in place.
+///
+/// Deliberately *not* an `INDEX_VERSION` bump. A version change moves the old
+/// file aside and rebuilds from the collection folder, which is right when the
+/// derived shape changes meaning — and wrong for a column that is simply new,
+/// because a collector that overwrites one file per machine leaves history in
+/// the index that the folder no longer has. An added column costs nothing to
+/// an older build either: every query names its columns, so one it has never
+/// heard of is invisible to it.
+///
+/// Rows written before the column existed keep `NULL`, which is the honest
+/// answer — see `scan --reindex` for filling them in from the documents.
+/// A document's identity. sha2 0.11 returns a hybrid-array `Array`, which has
+/// no `LowerHex`, hence the hand-rolled hex.
+fn content_hash(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    let mut have: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(subtest)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        for name in rows {
+            have.push(name?);
+        }
+    }
+    for (name, decl) in [("label", "TEXT"), ("direction", "TEXT")] {
+        if !have.iter().any(|h| h == name) {
+            conn.execute_batch(&format!("ALTER TABLE subtest ADD COLUMN {name} {decl}"))?;
+        }
+    }
+    Ok(())
+}
+
 fn set_aside(path: &Path, found: i64) -> Result<()> {
     let target = free_name(path, found);
     std::fs::rename(path, &target).with_context(|| {
@@ -433,6 +471,9 @@ impl Index {
                  confidence TEXT NOT NULL,
                  representative TEXT,
                  scored     INTEGER NOT NULL,
+                 -- Both added after the fact; see `add_missing_columns`.
+                 label      TEXT,
+                 direction  TEXT,
                  PRIMARY KEY (run_id, component, id)
              );
 
@@ -444,6 +485,7 @@ impl Index {
              );
              CREATE INDEX IF NOT EXISTS tag_lookup ON tag(key, value);",
         )?;
+        add_missing_columns(&conn)?;
         conn.pragma_update(None, "user_version", INDEX_VERSION)?;
         Ok(Self { conn, archive })
     }
@@ -454,6 +496,20 @@ impl Index {
     /// corrupt or truncated upload on a share of ten thousand must not stop the
     /// other 9 999 being indexed.
     pub fn scan(&mut self, root: &Path) -> Result<ScanReport> {
+        self.scan_inner(root, false)
+    }
+
+    /// Scan, re-reading even the documents already indexed.
+    ///
+    /// For picking up a field this build records and the one that indexed these
+    /// runs did not. Ordinary scanning skips an unchanged file by design, so
+    /// without this a new column stays `NULL` until every machine happens to
+    /// produce a new result.
+    pub fn rescan_all(&mut self, root: &Path) -> Result<ScanReport> {
+        self.scan_inner(root, true)
+    }
+
+    fn scan_inner(&mut self, root: &Path, reindex: bool) -> Result<ScanReport> {
         // A share that is down must not look like a folder that is empty.
         // That is the failure which hides every other one, because "no
         // machines need attention" reads as good news, so the root is checked
@@ -492,7 +548,12 @@ impl Index {
                 continue;
             }
             report.seen += 1;
-            match self.ingest_file(path) {
+            let outcome = if reindex {
+                self.reingest_file(path)
+            } else {
+                self.ingest_file(path)
+            };
+            match outcome {
                 Ok(true) => report.ingested += 1,
                 Ok(false) => report.unchanged += 1,
                 Err(e) => report
@@ -509,15 +570,28 @@ impl Index {
         self.ingest_text(&text, path)
     }
 
+    /// Ingest a file that may already be indexed, replacing what is there.
+    ///
+    /// The ordinary path short-circuits on the content hash, which is what
+    /// makes a rescan of ten thousand files cheap — and also means a *new
+    /// column* is never filled in for a document that has not changed. This is
+    /// the way to pick up one: the run is deleted and rebuilt from the same
+    /// bytes, so nothing about it changes except what this build now records.
+    pub fn reingest_file(&mut self, path: &Path) -> Result<bool> {
+        let text = read_document(path)?;
+        let hash = content_hash(&text);
+        // Children go with it: `run` is the parent of component, subtest and
+        // tag, all with ON DELETE CASCADE.
+        self.conn
+            .execute("DELETE FROM run WHERE content_hash = ?1", params![hash])?;
+        self.ingest_text(&text, path)
+    }
+
     /// Ingest a document already in memory, recording `source` as where it came
     /// from. Splitting this out from `ingest_file` keeps the identity of a run
     /// tied to its *content* rather than to having been read off a disk.
     pub fn ingest_text(&mut self, text: &str, source: &Path) -> Result<bool> {
-        // sha2 0.11 returns a hybrid-array `Array`, which has no `LowerHex`.
-        let hash: String = Sha256::digest(text.as_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let hash = content_hash(text);
 
         let existing: Option<i64> = self
             .conn
@@ -658,12 +732,14 @@ impl Index {
                 tx.execute(
                     "INSERT INTO subtest
                        (run_id, component, id, value, unit, score, ratio, cv, confidence,
-                        representative, scored)
-                     VALUES (?1,?2,?3,?4,?5,NULL,NULL,?6,?7,?8,?9)
+                        representative, scored, label, direction)
+                     VALUES (?1,?2,?3,?4,?5,NULL,NULL,?6,?7,?8,?9,?10,?11)
                      ON CONFLICT(run_id, component, id) DO UPDATE SET
                        cv = excluded.cv,
                        representative = excluded.representative,
-                       scored = excluded.scored",
+                       scored = excluded.scored,
+                       label = excluded.label,
+                       direction = excluded.direction",
                     params![
                         run_id,
                         c.id,
@@ -674,6 +750,10 @@ impl Index {
                         s.confidence,
                         s.representative,
                         s.scored,
+                        // Empty is not a label; a missing one should read as
+                        // missing rather than as a subtest called "".
+                        Some(s.label.as_str()).filter(|l| !l.is_empty()),
+                        s.direction.as_deref(),
                     ],
                 )?;
             }
@@ -977,6 +1057,107 @@ mod tests {
         let conn = Connection::open(path).expect("open");
         conn.query_row("SELECT COUNT(*) FROM run", [], |r| r.get(0))
             .expect("count")
+    }
+
+    /// `direction` is what makes two measurements comparable — without it a
+    /// lower-is-better latency reads as a loss when it improves. It is in the
+    /// document's `raw` block, so the only question is whether ingest keeps it.
+    #[test]
+    fn direction_and_label_survive_ingest() {
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.ingest_file(&fixture("win-modern.json")).unwrap();
+
+        let (dir, label): (Option<String>, Option<String>) = idx
+            .conn
+            .query_row(
+                "SELECT direction, label FROM subtest WHERE id = 'int_single'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dir.as_deref(), Some("higher_is_better"));
+        assert_eq!(label.as_deref(), Some("Integer, single-core"));
+
+        // And a lower-is-better one, since that is the case the column exists
+        // for: without it, an improvement in latency looks like a regression.
+        let lower: i64 = idx
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM subtest WHERE direction = 'lower_is_better'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(lower > 0, "no lower-is-better subtest was recorded");
+    }
+
+    /// The migration, and the reason `--reindex` has to exist.
+    ///
+    /// An index written before these columns existed keeps its rows, gains the
+    /// columns as `NULL`, and — because ingest short-circuits on the content
+    /// hash — stays `NULL` through any number of ordinary rescans. Only a
+    /// re-read fills it in.
+    #[test]
+    fn an_older_index_gains_the_columns_but_only_a_reindex_fills_them() {
+        let dir = std::env::temp_dir().join(format!("lbf-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("i.db");
+        let collection = dir.join("collection");
+        std::fs::create_dir_all(&collection).unwrap();
+        std::fs::copy(fixture("win-modern.json"), collection.join("win.json")).unwrap();
+
+        // Build an index, then take the new columns away again: this is what a
+        // database written by 0.5.2 or earlier looks like.
+        {
+            let mut idx = Index::open(&db).unwrap();
+            idx.scan(&collection).unwrap();
+            idx.conn
+                .execute_batch("ALTER TABLE subtest DROP COLUMN direction")
+                .unwrap();
+        }
+
+        let mut idx = Index::open(&db).unwrap();
+        let nulls: i64 = idx
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM subtest WHERE direction IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(nulls > 0, "the column should be back, and empty");
+
+        // An ordinary rescan sees nothing to do — the bytes have not changed.
+        let report = idx.scan(&collection).unwrap();
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.ingested, 0);
+        let still: i64 = idx
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM subtest WHERE direction IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still, nulls, "a plain rescan cannot fill a new column");
+
+        // A reindex rebuilds the run from the same document.
+        let report = idx.rescan_all(&collection).unwrap();
+        assert_eq!(report.ingested, 1, "the document should be re-read");
+        let left: i64 = idx
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM subtest WHERE direction IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "every subtest should now carry its direction");
+        assert_eq!(idx.run_count().unwrap(), 1, "and not be duplicated");
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A scan only ever adds, so removing a machine has to be asked for. This

@@ -228,6 +228,15 @@ pub struct RawSubtest {
     pub label: String,
     #[serde(default)]
     pub unit: String,
+    /// `higher_is_better` or `lower_is_better`, straight from the document.
+    ///
+    /// A string rather than an enum: this is somebody else's schema, and a
+    /// value we do not recognise should be carried through and declined by
+    /// whatever needs it, not refuse the whole document at parse time. Only
+    /// the `raw` block carries it — the scored block leaves direction implicit
+    /// in a `ratio` that has already been adjusted for it.
+    #[serde(default)]
+    pub direction: Option<String>,
     #[serde(default)]
     pub value: f64,
     /// Which statistic `value` is — `"median"` or `"peak"`. 1.5.0+; absent on
