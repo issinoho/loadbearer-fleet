@@ -755,6 +755,50 @@ function applyIdentity() {
   who.title = me.email || (me.authenticated ? me.subject : 'No sign-in configured');
   signout.hidden = !me.sign_in_enabled;
   rescan.hidden = !me.may_rescan;
+  $('#upload').hidden = !me.may_upload;
+}
+
+/**
+ * Submit result documents, one request each.
+ *
+ * One at a time rather than a batch, because the interesting answer is per
+ * file: this one was added, that one we already had, this third is not a
+ * result at all. A single request for all of them would have to choose between
+ * failing everything on one bad file and reporting nothing useful.
+ *
+ * The server refuses whatever it should refuse — role, scope, size, content —
+ * so this reports rather than judges.
+ */
+export async function uploadAll(files) {
+  const btn = $('#upload');
+  const label = btn.querySelector('.btn-label') || btn;
+  const note = $('#footer-note');
+  btn.disabled = true;
+  const results = [];
+  try {
+    for (const [i, file] of files.entries()) {
+      label.textContent = files.length > 1 ? `${i + 1} of ${files.length}…` : 'Sending…';
+      try {
+        const text = await file.text();
+        const r = await fetchJson('/api/upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: text,
+        });
+        results.push(`${file.name}: ${r.outcome}${r.hostname ? ` (${r.hostname})` : ''}`);
+      } catch (err) {
+        results.push(`${file.name}: ${err.message}`);
+      }
+    }
+  } finally {
+    btn.disabled = false;
+    label.textContent = 'Add results';
+  }
+  note.textContent = results.join(' · ');
+  // Deliberately does not redraw: sending files and refreshing the page are
+  // two jobs, and keeping them apart is what lets this be tested without a
+  // whole dashboard around it. The caller refreshes.
+  return results;
 }
 
 /** Say so when a viewer is only seeing part of the estate. */
@@ -842,8 +886,9 @@ function wireFilters() {
 
   $('#rescan').addEventListener('click', async () => {
     const btn = $('#rescan');
+    const label = btn.querySelector('.btn-label') || btn;
     btn.disabled = true;
-    btn.textContent = 'Scanning…';
+    label.textContent = 'Scanning…';
     try {
       const r = await fetchJson('/api/rescan', { method: 'POST' });
       await route();
@@ -854,8 +899,23 @@ function wireFilters() {
       $('#footer-note').textContent = `Rescan failed: ${err.message}`;
     } finally {
       btn.disabled = false;
-      btn.textContent = 'Rescan folder';
+      label.textContent = 'Rescan folder';
     }
+  });
+
+  // A real file input behind the button rather than a drop zone alone, so it
+  // is reachable by keyboard and by a screen reader, and so the browser's own
+  // file picker does the work.
+  $('#upload').addEventListener('click', () => $('#upload-input').click());
+  $('#upload-input').addEventListener('change', async (e) => {
+    const files = [...e.target.files];
+    // Cleared immediately, so choosing the same file twice still fires.
+    e.target.value = '';
+    if (!files.length) return;
+    await uploadAll(files);
+    // The server notices its own index changed on the next request anyway;
+    // this is asking for that now rather than at the next click.
+    await route();
   });
 
   const themeBtn = $('#theme');

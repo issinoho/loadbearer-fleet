@@ -647,3 +647,14 @@ table.compare .compare-component th { font-weight: 600; }
   .compare-slot-name { flex: 1 1 auto; }
   .compare-slot select { max-width: none; flex: 0 1 auto; min-width: 0; }
 }
+
+/* The icon half of a labelled button. Hidden until the label goes. */
+.btn-icon { display: none; }
+
+@media (max-width: 440px) {
+  /* Five controls with full labels do not fit a 320px row, and a header that
+     wraps to three rows costs more than the words are worth. The aria-label
+     on the button is the accessible name either way. */
+  .topbar-actions .btn-label { display: none; }
+  .topbar-actions .btn-icon { display: inline; font-size: 15px; line-height: 1; }
+}

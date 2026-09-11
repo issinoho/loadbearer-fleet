@@ -35,7 +35,22 @@
 
   <div class="topbar-actions">
     <span class="chip" id="who" hidden></span>
-    <button type="button" class="btn" id="rescan">Rescan folder</button>
+    <!-- Hidden until /api/me says the caller may, and refused by the server
+         regardless — the same pairing as Rescan.
+
+         Both of these carry an icon and a word, and a phone shows only the
+         icon: five controls with full labels do not fit 320px, and a header
+         that wraps to three rows costs more than a word is worth. The
+         aria-label is the accessible name either way. -->
+    <button type="button" class="btn" id="upload" aria-label="Add results" hidden>
+      <span class="btn-icon" aria-hidden="true">&plus;</span>
+      <span class="btn-label">Add results</span>
+    </button>
+    <input type="file" id="upload-input" accept=".json,application/json" multiple hidden>
+    <button type="button" class="btn" id="rescan" aria-label="Rescan folder">
+      <span class="btn-icon" aria-hidden="true">&#10227;</span>
+      <span class="btn-label">Rescan folder</span>
+    </button>
     <!-- A POST, so a link someone is tricked into following cannot sign them
          out. No JavaScript needed, and it satisfies form-action 'self'. -->
     <form method="post" action="/auth/logout" id="signout" hidden>

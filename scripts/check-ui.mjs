@@ -667,6 +667,64 @@ renderView('machines', (h) => mod.renderMachines(h));
   }
 }
 
+// Submitting results: one request per file, and each answer reported as
+// itself. A single bad file must not swallow the others, which is the whole
+// reason it is one request each rather than a batch.
+{
+  const seen = [];
+  globalThis.document.querySelector = (sel) =>
+    (sel === '#upload' || sel === '#footer-note' ? new FakeNode('button') : null);
+  globalThis.fetch = (url, opts) => {
+    seen.push({ url: String(url), type: opts?.headers?.['Content-Type'], body: opts?.body });
+    const body = String(opts?.body ?? '');
+    if (body.includes('"bad"')) {
+      return Promise.resolve({
+        ok: false, text: () => Promise.resolve('this is not a loadbearer result file'),
+      });
+    }
+    return Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        outcome: body.includes('"dup"') ? 'already indexed' : 'added',
+        hostname: 'FLEET-WIN-01',
+      }),
+      text: () => Promise.resolve(''),
+    });
+  };
+  const file = (name, text) => ({ name, text: () => Promise.resolve(text) });
+  try {
+    const results = await mod.uploadAll([
+      file('new.json', '{"ok":1}'),
+      file('same.json', '{"dup":1}'),
+      file('notes.txt', '{"bad":1}'),
+    ]);
+    check('upload', results.length === 3, `reported ${results.length} of 3 files`);
+    check('upload', results[0].includes('added'), `first file: ${results[0]}`);
+    check('upload', results[1].includes('already indexed'), `second file: ${results[1]}`);
+    check(
+      'upload',
+      results[2].includes('not a loadbearer result file'),
+      `a refusal has to be reported as itself: ${results[2]}`,
+    );
+    check(
+      'upload',
+      results.every((r, i) => r.startsWith(['new.json', 'same.json', 'notes.txt'][i])),
+      `each line names its own file: ${results.join(' | ')}`,
+    );
+    const posts = seen.filter((s) => s.url === '/api/upload');
+    check('upload', posts.length === 3, `sent ${posts.length} requests for 3 files`);
+    check(
+      'upload',
+      posts.every((p) => p.type === 'application/json'),
+      'every upload declares application/json, which is half the CSRF defence',
+    );
+    notes.push(`upload: ${posts.length} request(s), ${results.length} result(s) reported`);
+  } catch (err) {
+    failures.push(`upload: threw ${err.message}`);
+  }
+  globalThis.document.querySelector = () => null;
+}
+
 /* ------------------------------------------------------------------ report */
 
 for (const n of notes) console.log(`  note  ${n}`);
