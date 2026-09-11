@@ -407,6 +407,9 @@ table.data td.wrap { white-space: normal; }
 }
 
 .footer { padding: 16px 20px 32px; color: var(--text-muted); font-size: 12px; text-align: center; }
+/* One line each, in the order they answer "what am I looking at": what the
+   rescan did, which read of the folder, which build. */
+.footer .meta { display: block; margin-top: 4px; }
 /* Own line, so it doesn't shift when the rescan note above it appears and
    goes. Same muted colour and size as the note: discreet by position, not by
    being made hard to read. */
@@ -414,4 +417,101 @@ table.data td.wrap { white-space: normal; }
 
 @media (prefers-reduced-motion: reduce) {
   main.loading { transition: none; }
+}
+
+/* ---------- narrow screens ---------- */
+
+/* The topbar was a single non-wrapping flex row, which on a phone is wider
+   than the screen — so the *document* scrolled sideways, the last tab clipped,
+   and Rescan, Sign out and the theme toggle sat past the right edge where
+   nothing but a horizontal drag could reach them. Each row is allowed to wrap
+   here, and the one thing that must not wrap — the tab strip — scrolls inside
+   itself rather than widening the page. */
+@media (max-width: 720px) {
+  .topbar {
+    flex-wrap: wrap;
+    row-gap: 8px;
+    padding: 10px 14px;
+    /* Not sticky at this width. A hundred pixels of permanent chrome out of
+       eight hundred costs more than scrolling back up to change view. */
+    position: static;
+  }
+
+  .brand { flex: 0 0 auto; }
+
+  /* A whole row of its own, rather than whatever is left over: on the row
+     above, these buttons would take the width the tabs need and leave the
+     strip 28px wide with 240px of tabs inside it. */
+  .topbar-actions {
+    flex: 1 0 100%;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    min-width: 0;
+  }
+
+  /* Row one is the navigation — brand and tabs — with the actions beneath. The
+     strip takes what is left of the row and scrolls inside itself if the tabs
+     ever outgrow it, which is what stops the page widening. */
+  /* `flex-basis: 0` rather than `auto`: a wrapping flex container breaks the
+     line on an item's *content* width and only shrinks what is already on the
+     line, so with `auto` the strip claimed its full 259px and wrapped instead
+     of sharing the row. */
+  .tabs {
+    flex: 1 1 0;
+    min-width: 0;
+    margin-left: 4px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { flex: 1 1 auto; }
+
+  /* Wrapping cannot save this one: the chip is `white-space: nowrap` and may
+     hold an email address, so it needs an explicit ceiling. */
+  .chip { max-width: 60vw; overflow: hidden; text-overflow: ellipsis; }
+
+  /* Two columns rather than one, because five stacked full-width fields put
+     the data most of a screen further down. `display: contents` lets the
+     dynamically-built tag filters take part in the same grid. */
+  .filters {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 12px;
+    padding: 10px 14px;
+    align-items: end;
+  }
+
+  .tag-filters { display: contents; }
+  .field-grow { grid-column: 1 / -1; }
+
+  /* Explicit columns: the number of tag filters is whatever the fleet has, so
+     without these two the footer of the row lands wherever the flow leaves it. */
+  .filters .btn-quiet { grid-column: 1; justify-self: start; }
+  .filter-count { grid-column: 2; margin-left: 0; text-align: right; }
+
+  main { padding: 14px; }
+  .footer { padding: 14px 14px 28px; }
+}
+
+/* Below this the wordmark and the tab strip cannot share a row without the tab
+   text wrapping — the strip needs 259px and a 390px phone has 320px to give
+   once the mark and the gaps are paid for. The mark stays, so the page is
+   still identifiable, and the row it saves is worth more than the word. */
+@media (max-width: 440px) {
+  .brand-name { display: none; }
+}
+
+/* Touch, whatever the width: a 30px-tall control is a miss waiting to happen.
+   Keyed on the pointer rather than the viewport, so a tablet gets it too. */
+@media (pointer: coarse) {
+  .btn, .tab {
+    min-height: 40px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .btn-square { min-width: 40px; }
+  .field select, .field input { min-height: 40px; }
 }

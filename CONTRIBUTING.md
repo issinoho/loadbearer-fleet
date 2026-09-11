@@ -39,6 +39,7 @@ cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 cargo build --locked && node scripts/check-ui.mjs
+cargo build --locked && node scripts/check-mobile.mjs
 ```
 
 Plus `cargo check --all-targets --locked` on Rust **1.88**, the declared MSRV,
@@ -62,6 +63,11 @@ All of it must pass. Some notes on why it's shaped like that:
   targets big enough to hit, axis labels that fit their band and never repeat.
   It builds its snapshot by running the binary over the fixtures, so it can't
   drift from the API.
+- **`node scripts/check-mobile.mjs`** does the half of that a DOM shim cannot:
+  it starts the binary, lays the real page out in headless Chrome at 390, 320,
+  768 and 1440 pixels wide, and fails if anything scrolls sideways, is painted
+  past the right edge, clips instead of scrolling, or is too small to tap. It
+  skips itself with a message where there is no browser to drive.
 
 Match the style of the surrounding code — comment density, naming, idiom.
 Comments should explain *why*, especially for a platform quirk or a deliberate
@@ -85,6 +91,7 @@ trade-off, not restate what the code already says.
 | `tests/ingest.rs` | ingest against real result documents |
 | `tests/stdout_is_data.rs` | runs the **real binary** and parses its stdout, for the commands that print a document |
 | `scripts/check-ui.mjs` | the chart and view geometry check |
+| `scripts/check-mobile.mjs` | the same page in a real browser, at four screen widths |
 
 ## Things this project has opinions about
 
@@ -125,9 +132,10 @@ rather than accidents:
   request proves the projection is the one a request gets.
 - `snapshot()` and the metrics renderer take the clock as a parameter, so
   anything about staleness or age is tested rather than tiptoed around.
-- If you touch a chart or a view, run `node scripts/check-ui.mjs` — and if you
-  can, look at the page. Both of the visual bugs found so far were invisible to
-  the code and obvious on screen.
+- If you touch a chart or a view, run `node scripts/check-ui.mjs` and
+  `node scripts/check-mobile.mjs` — and if you can, look at the page. Every
+  visual bug found so far was invisible to the code and obvious on screen,
+  which is why the second of those drives a real browser rather than a shim.
 - **A command that prints a document is tested by running the binary**, not by
   calling a function — see `tests/stdout_is_data.rs`. `report --json`,
   `init-config`, `reference` and `service unit` all exist to be piped, and the
@@ -144,7 +152,7 @@ rather than accidents:
 
 1. Fork and branch off `main`.
 2. Make the change, with tests where the conventions above call for them.
-3. Run all four checks locally.
+3. Run all five checks locally.
 4. Open a PR describing what changed and why, and reference any related issue
    (`Fixes #123`).
 

@@ -440,6 +440,13 @@ painted outside its own box, bars capped at 24px, markers carrying their surface
 ring, hit targets big enough to hit, and axis labels that fit their band. It
 needs Node; the server does not, so it is deliberately outside `cargo test`.
 
+A shim has no CSS engine, though, so it cannot tell whether the page fits a
+screen — and a dashboard gets read on a phone whether or not it was designed
+for one. `node scripts/check-mobile.mjs` starts the binary and lays the real
+page out in headless Chrome at 390, 320, 768 and 1440 pixels wide, failing if
+anything scrolls sideways, is painted past the right edge, clips instead of
+scrolling, or is too small to tap.
+
 ## Checks
 
 What CI runs, and what to run before pushing:
@@ -449,6 +456,7 @@ cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 cargo build --locked && node scripts/check-ui.mjs
+cargo build --locked && node scripts/check-mobile.mjs
 ```
 
 Clippy and the tests run on both ubuntu-latest and windows-latest, and both

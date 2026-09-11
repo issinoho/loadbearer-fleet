@@ -33,7 +33,6 @@
   </nav>
 
   <div class="topbar-actions">
-    <span class="meta" id="generated"></span>
     <span class="chip" id="who" hidden></span>
     <button type="button" class="btn" id="rescan">Rescan folder</button>
     <!-- A POST, so a link someone is tricked into following cannot sign them
@@ -82,12 +81,15 @@
 
 <main id="main"></main>
 
-<!-- The build goes here rather than in the topbar: it is the answer to "which
-     version am I looking at" when something is being reported, not something
-     to read on the way past. Filled from the snapshot, so it names the build
-     that produced what is on screen. -->
+<!-- Which build, and which read of the folder: both are the answer to "what
+     exactly am I looking at" when something is being reported, rather than
+     something to read on the way past — so they sit here rather than in the
+     topbar, where on a phone they were competing with the navigation. Both
+     come from the snapshot, so they describe what is on screen even when the
+     browser is still holding cached HTML from before an upgrade. -->
 <footer class="footer">
   <span id="footer-note"></span>
+  <span class="meta" id="generated"></span>
   <span class="footer-build" id="footer-build"></span>
 </footer>
 

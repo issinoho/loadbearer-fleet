@@ -104,3 +104,12 @@ jobs:
 
       - name: Check the dashboard
         run: node scripts/check-ui.mjs
+
+      # The check above renders against a DOM shim, which has no CSS engine and
+      # so cannot tell whether the page fits a screen. This one lays the real
+      # thing out in the Chrome the runner already carries, at four widths, and
+      # fails if anything scrolls sideways or is too small to tap. It skips
+      # itself with a message where there is no browser, so it stays runnable on
+      # a developer's machine either way.
+      - name: Check the dashboard on a phone
+        run: node scripts/check-mobile.mjs
