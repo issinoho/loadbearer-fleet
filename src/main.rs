@@ -12,6 +12,7 @@
 
 mod analytics;
 mod auth;
+mod compare;
 mod config;
 mod index;
 mod metrics;

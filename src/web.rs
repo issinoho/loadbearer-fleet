@@ -43,6 +43,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::analytics::{self, Cohort, Detail, Filter, Flag, MachineView, Snapshot, Thresholds};
 use crate::auth::{self, Authenticator, Caller};
+use crate::compare;
 use crate::config::{AuthMode, Config, Metrics as MetricsConfig};
 use crate::index::{Index, ScanReport};
 use crate::metrics::{self, Runtime, ScanStamp};
@@ -308,6 +309,88 @@ struct MachinePayload {
     detail: Detail,
 }
 
+/// Which runs to compare: either explicit run ids, or machine keys meaning
+/// "the latest run of each".
+#[derive(Debug, Default, Deserialize)]
+struct CompareParams {
+    runs: Option<String>,
+    keys: Option<String>,
+}
+
+/// Head-to-head of two to four runs.
+///
+/// Every run is checked against the caller's *own* view of the fleet, the same
+/// way `get_machine` is: a run belonging to a machine outside their scope is
+/// reported as not found, because whether it exists is not something they are
+/// entitled to learn. Checking the run ids directly against the index instead
+/// would leak exactly that.
+async fn get_compare(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Query(params): Query<CompareParams>,
+) -> Result<Json<compare::Comparison>, AppError> {
+    let snap = visible(&state, &caller, FilterParams::default());
+
+    let run_ids: Vec<i64> = match (&params.runs, &params.keys) {
+        (Some(runs), _) => runs
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<i64>()
+                    .map_err(|_| AppError::bad_request(format!("{s:?} is not a run id")))
+            })
+            .collect::<Result<_, _>>()?,
+        (None, Some(keys)) => keys
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|key| {
+                snap.machines
+                    .iter()
+                    .find(|m| m.key == key)
+                    .map(|m| m.run_id)
+                    .ok_or_else(|| {
+                        AppError::not_found(format!("no machine keyed {key:?} in the index"))
+                    })
+            })
+            .collect::<Result<_, _>>()?,
+        (None, None) => {
+            return Err(AppError::bad_request(
+                "ask for runs=<id>,<id> or keys=<machine>,<machine>",
+            ));
+        }
+    };
+
+    // Judged before anything is looked up: these answers depend only on the
+    // request, so they give nothing away — and asking them second would turn
+    // "that is too many runs" into "no such run".
+    compare::check_request(&run_ids).map_err(AppError::bad_request)?;
+
+    let idx = state.index.lock().expect("index lock");
+    for id in &run_ids {
+        let owner: Option<String> = idx
+            .conn()
+            .query_row("SELECT machine_key FROM run WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .ok();
+        let visible_here = owner
+            .as_deref()
+            .is_some_and(|key| snap.machines.iter().any(|m| m.key == key));
+        if !visible_here {
+            return Err(AppError::not_found(format!("no run {id} in the index")));
+        }
+    }
+
+    Ok(Json(compare::compare(idx.conn(), &run_ids).map_err(
+        // A comparison that cannot be built is the caller's request being
+        // impossible — too many runs, the same run twice, nothing in common —
+        // rather than anything failing here.
+        AppError::bad_request,
+    )?))
+}
+
 async fn get_machine(
     State(state): State<Arc<AppState>>,
     caller: Caller,
@@ -495,6 +578,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/me", get(auth::me))
         .route("/api/snapshot", get(get_snapshot))
         .route("/api/machine/{key}", get(get_machine))
+        .route("/api/compare", get(get_compare))
         .route("/api/rescan", post(post_rescan))
         .route("/metrics", get(get_metrics))
         // Unauthenticated on purpose: a service manager or load balancer has to
@@ -1010,6 +1094,93 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The comparison endpoint has to obey the same boundary as everything
+    /// else: a scoped viewer may compare what they can see, and a machine
+    /// outside their scope must not even be confirmed to exist.
+    ///
+    /// Run ids are the risk here. They are small integers a caller can guess,
+    /// and they are not in the snapshot — so checking them against the index
+    /// directly would answer for the whole estate. Every id is resolved to its
+    /// machine and that machine looked up in the caller's *own* view.
+    #[tokio::test]
+    async fn a_scoped_viewer_cannot_compare_outside_their_scope() {
+        let state = state_for(&oidc_config());
+        let admin = session(&state, Role::Admin, &[]);
+        let glasgow = session(&state, Role::Viewer, &[&[("site", "glasgow")]]);
+
+        // What an admin can see: every machine, and their latest runs.
+        let snap = get(&state, "/api/snapshot", Some(&admin)).await.json();
+        let machines = snap["machines"].as_array().expect("machines");
+        assert!(machines.len() >= 2);
+        let all: Vec<i64> = machines
+            .iter()
+            .map(|m| m["run_id"].as_i64().expect("run id"))
+            .collect();
+
+        let both = format!("/api/compare?runs={},{}", all[0], all[1]);
+        let ok = get(&state, &both, Some(&admin)).await;
+        assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+        assert_eq!(ok.json()["runs"].as_array().expect("runs").len(), 2);
+
+        // The viewer sees one machine, so the same request is not theirs to
+        // make — and the answer says "no such run", not "not allowed".
+        let refused = get(&state, &both, Some(&glasgow)).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::NOT_FOUND,
+            "a run outside the caller's scope must be indistinguishable from \
+             one that does not exist: {}",
+            refused.body
+        );
+
+        // And by key, the same. One machine the viewer *can* see, one it
+        // cannot — picked from the admin's view rather than hard-coded, so the
+        // test keeps meaning what it says if the fixtures are relabelled.
+        let mine = machines
+            .iter()
+            .find(|m| m["tags"]["site"] == "glasgow")
+            .expect("a glasgow machine");
+        let theirs = machines
+            .iter()
+            .find(|m| m["tags"]["site"] != "glasgow")
+            .expect("a machine somewhere else");
+        let by_key = format!(
+            "/api/compare?keys={},{}",
+            mine["key"].as_str().expect("key"),
+            theirs["key"].as_str().expect("key")
+        );
+        assert_eq!(
+            get(&state, &by_key, Some(&admin)).await.status,
+            StatusCode::OK,
+            "the admin can compare both"
+        );
+        assert_eq!(
+            get(&state, &by_key, Some(&glasgow)).await.status,
+            StatusCode::NOT_FOUND,
+            "the viewer cannot, and is not told which half was the problem"
+        );
+    }
+
+    /// A request that cannot mean anything is the caller's mistake, not a
+    /// server failure — and the message has to say which mistake.
+    #[tokio::test]
+    async fn an_impossible_comparison_is_a_bad_request() {
+        let state = state_for(&oidc_config());
+        let cookie = session(&state, Role::Admin, &[]);
+
+        for (uri, expect) in [
+            ("/api/compare", "runs="),
+            ("/api/compare?runs=1", "at least two"),
+            ("/api/compare?runs=1,1", "twice"),
+            ("/api/compare?runs=1,2,3,4,5", "at most"),
+            ("/api/compare?runs=1,banana", "not a run id"),
+        ] {
+            let r = get(&state, uri, Some(&cookie)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.body);
+            assert!(r.body.contains(expect), "{uri} said: {}", r.body);
+        }
     }
 
     #[tokio::test]

@@ -87,6 +87,15 @@ fn stamped_version(path: &Path) -> Result<Option<i64>> {
 /// happens during a deliberate upgrade, with somebody watching, and refusing
 /// to start with an explanation is a better outcome than starting successfully
 /// having thrown away the one copy of their history.
+/// A document's identity. sha2 0.11 returns a hybrid-array `Array`, which has
+/// no `LowerHex`, hence the hand-rolled hex.
+fn content_hash(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Columns added to an existing index in place.
 ///
 /// Deliberately *not* an `INDEX_VERSION` bump. A version change moves the old
@@ -99,27 +108,30 @@ fn stamped_version(path: &Path) -> Result<Option<i64>> {
 ///
 /// Rows written before the column existed keep `NULL`, which is the honest
 /// answer — see `scan --reindex` for filling them in from the documents.
-/// A document's identity. sha2 0.11 returns a hybrid-array `Array`, which has
-/// no `LowerHex`, hence the hand-rolled hex.
-fn content_hash(text: &str) -> String {
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    let mut have: Vec<String> = Vec::new();
-    {
-        let mut stmt = conn.prepare("PRAGMA table_info(subtest)")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-        for name in rows {
-            have.push(name?);
+    const ADDED: [(&str, &str, &str); 3] = [
+        ("subtest", "label", "TEXT"),
+        ("subtest", "direction", "TEXT"),
+        // Component ids are short and lower-case — `cpu`, `memory` — so a
+        // heading has to come from the document rather than from title-casing
+        // an id into "Cpu".
+        ("component", "label", "TEXT"),
+    ];
+
+    for (table, column, decl) in ADDED {
+        let mut present = false;
+        {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                if row.get::<_, String>(1)? == column {
+                    present = true;
+                    break;
+                }
+            }
         }
-    }
-    for (name, decl) in [("label", "TEXT"), ("direction", "TEXT")] {
-        if !have.iter().any(|h| h == name) {
-            conn.execute_batch(&format!("ALTER TABLE subtest ADD COLUMN {name} {decl}"))?;
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
         }
     }
     Ok(())
@@ -456,6 +468,7 @@ impl Index {
                  score   REAL NOT NULL,
                  grade   TEXT NOT NULL,
                  graded  INTEGER NOT NULL,
+                 label   TEXT,
                  PRIMARY KEY (run_id, id)
              );
 
@@ -701,8 +714,16 @@ impl Index {
 
         for c in &doc.components {
             tx.execute(
-                "INSERT INTO component (run_id, id, score, grade, graded) VALUES (?1,?2,?3,?4,?5)",
-                params![run_id, c.id, c.score, c.grade, c.graded],
+                "INSERT INTO component (run_id, id, score, grade, graded, label)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    run_id,
+                    c.id,
+                    c.score,
+                    c.grade,
+                    c.graded,
+                    Some(c.label.as_str()).filter(|l| !l.is_empty()),
+                ],
             )?;
             for s in &c.subtests {
                 tx.execute(
