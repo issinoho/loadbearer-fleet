@@ -455,8 +455,14 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()?
                 .block_on(authenticator.check())?;
-            println!("{report}");
-            Ok(())
+            print!("{report}");
+            // Non-zero on a failed check, so this can gate a deploy rather
+            // than being something someone has to read carefully.
+            if report.ok() {
+                Ok(())
+            } else {
+                anyhow::bail!("sign-in is not configured correctly yet — see the FAIL lines above")
+            }
         }
         Command::Service { action } => match action {
             ServiceAction::Run { allow_remote } => service::run(config, *allow_remote),

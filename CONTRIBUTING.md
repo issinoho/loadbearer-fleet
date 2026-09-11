@@ -79,7 +79,11 @@ trade-off, not restate what the code already says.
 | `src/config.rs` | the config file, and the validation that refuses placeholders |
 | `src/service.rs` | Windows service integration, and the systemd unit generator |
 | `src/metrics.rs` | the Prometheus exposition |
+| `src/reference.rs` | builds the command-line and configuration reference from the clap definition and `Config::starter()` — see below |
+| `build.rs` | stamps the commit into the binary, so `--version`, the log, the snapshot, `build_info` and the dashboard footer can all name the build |
 | `assets/` | the dashboard — HTML, CSS, hand-rolled SVG charts, compiled into the binary with `include_str!` |
+| `tests/ingest.rs` | ingest against real result documents |
+| `tests/stdout_is_data.rs` | runs the **real binary** and parses its stdout, for the commands that print a document |
 | `scripts/check-ui.mjs` | the chart and view geometry check |
 
 ## Things this project has opinions about
@@ -124,6 +128,17 @@ rather than accidents:
 - If you touch a chart or a view, run `node scripts/check-ui.mjs` — and if you
   can, look at the page. Both of the visual bugs found so far were invisible to
   the code and obvious on screen.
+- **A command that prints a document is tested by running the binary**, not by
+  calling a function — see `tests/stdout_is_data.rs`. `report --json`,
+  `init-config`, `reference` and `service unit` all exist to be piped, and the
+  regression that broke three of them was a log line going to stdout, which no
+  unit test could have seen.
+- **Watch a new guard fail before keeping it.** Every check added for a real
+  defect here — the compression-bomb cap, the sign-in ceiling, the
+  `ProtectHome` refusal, `ReadWritePaths` naming the archive, stdout staying
+  clean — was run once with its fix removed, to prove it catches the thing it
+  was written for. A guard nobody has seen fail is a guard nobody knows works;
+  two in this codebase passed happily while the bug was still present.
 
 ## Submitting a change
 

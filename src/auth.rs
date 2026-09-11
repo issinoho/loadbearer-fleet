@@ -257,7 +257,7 @@ impl Authenticator {
         (p.expires > OffsetDateTime::now_utc()).then_some(p)
     }
 
-    async fn discover(&self) -> Result<(reqwest::Client, OidcClient)> {
+    async fn discover(&self) -> Result<(reqwest::Client, OidcClient, CoreProviderMetadata)> {
         let mut builder = reqwest::ClientBuilder::new()
             // Following redirects from an identity provider's discovery URL
             // turns this into an SSRF primitive.
@@ -303,7 +303,7 @@ impl Authenticator {
         let secret = (!self.config.client_secret.is_empty())
             .then(|| ClientSecret::new(self.config.client_secret.clone()));
         let client = CoreClient::from_provider_metadata(
-            metadata,
+            metadata.clone(),
             ClientId::new(self.config.client_id.clone()),
             secret,
         )
@@ -311,43 +311,378 @@ impl Authenticator {
             RedirectUrl::new(self.redirect_url.clone())
                 .with_context(|| format!("{:?} is not a URL", self.redirect_url))?,
         );
-        Ok((http, client))
+        Ok((http, client, metadata))
     }
 
-    /// Confirm the settings without waiting for somebody to try signing in.
-    pub async fn check(&self) -> Result<String> {
-        let (_http, _client) = self.discover().await?;
-        Ok(format!(
-            "discovery succeeded for {}\n  client_id:    {}\n  client type:  {}\n  \
-             redirect URI: {}\n  groups claim: {}\n  extra scopes: {}\n  CA trust:     {}\n  \
-             grants:       {}\n\nRegister that exact redirect URI with the provider, and make \
-             sure the {:?} claim reaches the **ID token** — this reads the ID token and never \
-             calls the userinfo endpoint, so a claim that only appears there is invisible. On \
-             Entra that is Token configuration rather than a scope; on a self-hosted provider \
-             it is usually a scope, and often a setting about which claims go in the ID token \
-             as well.",
-            self.config.issuer,
-            self.config.client_id,
+    /// Confirm as much of a sign-in as can be confirmed without a browser.
+    ///
+    /// Every check here is something an operator had to work out with `curl`
+    /// the first time this was pointed at a self-hosted provider, and every one
+    /// of them is answerable from here. What is genuinely not knowable until
+    /// somebody signs in is listed as such, rather than left to be discovered.
+    pub async fn check(&self) -> Result<Report> {
+        let mut r = Report::default();
+
+        let (http, client, meta) = match self.discover().await {
+            Ok(v) => v,
+            Err(e) => {
+                r.fail(
+                    "discovery",
+                    format!("{e:#}"),
+                    "Check auth.issuer is the bare origin with no trailing slash, that this \
+                     host can reach it, and — behind a private CA — that auth.ca_bundle points \
+                     at the authority. This does not read the machine's trust store.",
+                );
+                return Ok(r);
+            }
+        };
+        r.pass("discovery", self.config.issuer.clone());
+        // The library refuses a mismatch, so arriving here proves it. Worth a
+        // line of its own because a proxy that rewrites Host makes a provider
+        // advertise an issuer nobody asked for.
+        r.pass(
+            "issuer",
+            format!("advertised as {}", meta.issuer().as_str()),
+        );
+        r.pass(
+            "client type",
             if self.config.client_secret.is_empty() {
-                "public (PKCE, no secret)"
+                "public — PKCE, no secret".to_string()
             } else {
-                "confidential (client secret configured)"
+                "confidential — a client secret is configured".to_string()
             },
-            self.redirect_url,
-            self.config.groups_claim,
-            if self.config.extra_scopes.is_empty() {
-                "none beyond openid profile email".to_string()
-            } else {
-                self.config.extra_scopes.join(" ")
-            },
+        );
+        r.pass("redirect URI", self.redirect_url.clone());
+
+        let wanted = self.scopes();
+        match meta.scopes_supported() {
+            Some(offered) => {
+                let offered: Vec<&str> = offered.iter().map(|s| s.as_str()).collect();
+                let missing: Vec<&str> = wanted
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|w| !offered.contains(w))
+                    .collect();
+                if missing.is_empty() {
+                    r.pass("scopes", wanted.join(" "));
+                } else {
+                    r.fail(
+                        "scopes",
+                        format!("the provider does not offer {}", missing.join(" ")),
+                        "Either no such scope exists there, or it is not enabled. `groups` in \
+                         particular usually has to be turned on.",
+                    );
+                }
+            }
+            None => r.note(
+                "scopes",
+                format!("{} — the provider publishes no list", wanted.join(" ")),
+            ),
+        }
+
+        let algs: Vec<String> = meta
+            .id_token_signing_alg_values_supported()
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect();
+        if algs
+            .iter()
+            .any(|a| a.contains("Rsa") || a.contains("RS256"))
+        {
+            r.pass("ID token signing", "RS256 offered".to_string());
+        } else {
+            r.note(
+                "ID token signing",
+                format!(
+                    "RS256 not obviously offered; provider lists {}",
+                    algs.join(" ")
+                ),
+            );
+        }
+
+        // The one that used to need curl.
+        self.probe_authorization(&http, &client, &mut r).await;
+
+        if self.config.grants.is_empty() {
+            r.fail(
+                "grants",
+                "none configured".to_string(),
+                "Nobody could sign in: a caller matching no grant is refused rather than shown \
+                 an empty dashboard.",
+            );
+        } else {
+            r.pass("grants", format!("{} configured", self.config.grants.len()));
+        }
+
+        r.pass(
+            "CA trust",
             match &self.config.ca_bundle {
                 Some(p) => format!("built-in roots + {}", p.display()),
-                None => "built-in roots only (not the machine's trust store)".to_string(),
+                None => "built-in roots only, not the machine's trust store".to_string(),
             },
-            self.config.grants.len(),
-            self.config.groups_claim,
-        ))
+        );
+
+        r.unknown = vec![
+            format!(
+                "Whether the {:?} claim reaches the ID token. This reads the ID token and never \
+                 calls the userinfo endpoint, so a claim that only appears there is invisible. \
+                 On Entra that is Token configuration rather than a scope; on a self-hosted \
+                 provider it is usually a scope plus a setting about which claims go in the ID \
+                 token.",
+                self.config.groups_claim
+            ),
+            "Whether your grant values match what is in that claim. Entra emits group object \
+             IDs; Authelia, Keycloak and Authentik emit group names."
+                .to_string(),
+            "The code exchange, which needs a real authorization code.".to_string(),
+            "So sign in once. If you are refused, the message counts the groups it decoded: \
+             0 group(s) means the claim never arrived, and any other number means it did and \
+             your grants do not match it."
+                .to_string(),
+        ];
+        Ok(r)
     }
+
+    /// Every scope a sign-in will ask for.
+    fn scopes(&self) -> Vec<String> {
+        ["openid", "profile", "email"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .chain(self.config.extra_scopes.iter().cloned())
+            .collect()
+    }
+
+    /// Send the authorization request a real sign-in would send, and read the
+    /// answer instead of following it.
+    ///
+    /// The test is whether the `Location` carries an `error=`, **not** where it
+    /// points. That distinction was got wrong first time and passed an
+    /// unregistered client: Authelia redirects `invalid_client` to its own
+    /// consent page rather than refusing outright, so "it redirected somewhere
+    /// that is not us" is not evidence of anything.
+    ///
+    /// Where it points still refines the advice. An error delivered to our own
+    /// `redirect_uri` means that URI is registered — a provider will not send
+    /// one to a URI it has not validated — so the fault is elsewhere in the
+    /// request.
+    async fn probe_authorization(
+        &self,
+        http: &reqwest::Client,
+        client: &OidcClient,
+        r: &mut Report,
+    ) {
+        let (challenge, _verifier) = PkceCodeChallenge::new_random_sha256();
+        let mut request = client.authorize_url(
+            CoreAuthenticationFlow::AuthorizationCode,
+            CsrfToken::new_random,
+            Nonce::new_random,
+        );
+        for scope in self.scopes() {
+            request = request.add_scope(Scope::new(scope));
+        }
+        let (url, _csrf, _nonce) = request.set_pkce_challenge(challenge).url();
+
+        let response = match http.get(url.as_str()).send().await {
+            Ok(v) => v,
+            Err(e) => {
+                r.fail(
+                    "authorization",
+                    format!("could not reach the authorization endpoint: {e}"),
+                    "Discovery worked, so this is usually a proxy serving one path and not \
+                     another.",
+                );
+                return;
+            }
+        };
+
+        let status = response.status();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+
+        match classify_authorization(status.is_redirection(), &location, &self.redirect_url) {
+            Ok(good) => r.pass("authorization", good.to_string()),
+            Err((detail, advice)) => r.fail("authorization", detail, advice),
+        }
+    }
+}
+
+/// What the provider's answer to an authorization request means.
+///
+/// Split out from the request so it can be tested against the answers real
+/// providers actually give — which is how the first version's mistake was
+/// found, having passed an unregistered client.
+fn classify_authorization(
+    redirected: bool,
+    location: &str,
+    redirect_url: &str,
+) -> std::result::Result<&'static str, (String, &'static str)> {
+    if !redirected {
+        return Err((
+            "the provider answered without redirecting".to_string(),
+            "A provider refuses outright rather than redirecting when it does not recognise \
+             the client or the redirect URI. Check client_id, and that the redirect URI above \
+             is registered *exactly*.",
+        ));
+    }
+
+    // The test is whether there is an `error=`, not where the redirect points.
+    if let Some(error) = query_value(location, "error") {
+        let described = query_value(location, "error_description").unwrap_or_default();
+        let to_us = location.starts_with(redirect_url);
+        let advice = match (error.as_str(), to_us) {
+            ("invalid_scope", _) => {
+                "A scope is not allowed for this client. Add it there, or remove it from \
+                 auth.extra_scopes."
+            }
+            ("invalid_client" | "unauthorized_client", _) => {
+                "The provider does not recognise this client, or will not allow it this flow. \
+                 Check auth.client_id matches the registration exactly, and that the client is \
+                 registered for the authorization code flow as a public client."
+            }
+            ("invalid_request", false) => {
+                "The provider rejected the request before it would even redirect to your \
+                 callback, which usually means the redirect URI is not registered exactly as \
+                 shown above."
+            }
+            (_, true) => {
+                "The redirect URI is registered — the provider would not have sent an error to \
+                 it otherwise — so this is about the rest of the request."
+            }
+            (_, false) => {
+                "The provider rejected the request and kept the user on its own site, so this \
+                 is about the client registration rather than about the user."
+            }
+        };
+        return Err((
+            format!("rejected: {error} {described}")
+                .trim_end()
+                .to_string(),
+            advice,
+        ));
+    }
+
+    Ok("client registered, redirect URI matched, scopes and PKCE accepted")
+}
+
+/// One `check-auth` run: what was proved, what was not, and what cannot be.
+#[derive(Default)]
+pub struct Report {
+    checks: Vec<(Outcome, &'static str, String, Option<&'static str>)>,
+    unknown: Vec<String>,
+}
+
+#[derive(PartialEq)]
+enum Outcome {
+    Pass,
+    Fail,
+    Note,
+}
+
+impl Report {
+    fn pass(&mut self, what: &'static str, detail: String) {
+        self.checks.push((Outcome::Pass, what, detail, None));
+    }
+    fn note(&mut self, what: &'static str, detail: String) {
+        self.checks.push((Outcome::Note, what, detail, None));
+    }
+    fn fail(&mut self, what: &'static str, detail: String, advice: &'static str) {
+        self.checks
+            .push((Outcome::Fail, what, detail, Some(advice)));
+    }
+
+    /// Whether anything failed, so the command can exit non-zero and a deploy
+    /// script can stop rather than press on to a sign-in that will not work.
+    pub fn ok(&self) -> bool {
+        !self.checks.iter().any(|(o, ..)| *o == Outcome::Fail)
+    }
+}
+
+impl std::fmt::Display for Report {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (outcome, what, detail, advice) in &self.checks {
+            let mark = match outcome {
+                Outcome::Pass => "ok  ",
+                Outcome::Fail => "FAIL",
+                Outcome::Note => "note",
+            };
+            writeln!(f, "  {mark}  {what:<18} {detail}")?;
+            if let Some(advice) = advice {
+                for line in wrap(advice, 68) {
+                    writeln!(f, "                           {line}")?;
+                }
+            }
+        }
+        if !self.unknown.is_empty() {
+            writeln!(f, "\nNot knowable without a real sign-in:")?;
+            for item in &self.unknown {
+                let mut lines = wrap(item, 72).into_iter();
+                if let Some(first) = lines.next() {
+                    writeln!(f, "  - {first}")?;
+                }
+                for line in lines {
+                    writeln!(f, "    {line}")?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Greedy wrap. The advice is prose and a terminal is not always wide.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.len() + 1 + word.len() > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+/// One query parameter out of a redirect's `Location`, percent-decoded enough
+/// to be readable.
+fn query_value(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    let raw = query
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)?;
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                match u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                    Ok(b) => out.push(b as char),
+                    Err(_) => out.push('%'),
+                }
+                i += 3;
+            }
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Cookie attributes, in one place.
@@ -473,7 +808,7 @@ pub async fn login(
     if !auth.enabled() {
         return Ok(Redirect::to("/").into_response());
     }
-    let (_http, client) = auth.discover().await?;
+    let (_http, client, _meta) = auth.discover().await?;
 
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
     let mut request = client.authorize_url(
@@ -566,7 +901,7 @@ pub async fn callback(
         .take_pending(&returned_state)
         .ok_or_else(|| AuthError::denied("that sign-in has already been used or has expired"))?;
 
-    let (http, client) = auth.discover().await?;
+    let (http, client, _meta) = auth.discover().await?;
     let tokens = client
         .exchange_code(AuthorizationCode::new(code))
         .map_err(|e| AuthError::internal(anyhow!("no token endpoint: {e}")))?
@@ -900,6 +1235,62 @@ mod tests {
             },
         );
         assert!(auth.take_pending("old").is_none());
+    }
+
+    /// The answers below are **real**, copied from a live Authelia 4.39.25
+    /// while building this check. The first version of it classified on where
+    /// the redirect pointed rather than on whether it carried an error — and
+    /// so reported an unregistered client as "client registered", which is
+    /// worse than having no check at all.
+    #[test]
+    fn an_authorization_answer_is_read_for_its_error_not_its_destination() {
+        const CALLBACK: &str = "https://fleet.issinoho.com/auth/callback";
+
+        // Accepted: the provider is asking the user to sign in.
+        assert!(
+            classify_authorization(
+                true,
+                "https://auth.issinoho.com/?flow=openid_connect&flow_id=8ac1c960",
+                CALLBACK
+            )
+            .is_ok()
+        );
+
+        // Unknown client. Authelia sends this to its *own* consent page, not to
+        // the callback — which is exactly what fooled the first version.
+        let (detail, advice) = classify_authorization(
+            true,
+            "https://auth.issinoho.com/consent/completion?error=invalid_client&\
+             error_description=Client+authentication+failed",
+            CALLBACK,
+        )
+        .expect_err("an unregistered client must not pass");
+        assert!(detail.contains("invalid_client"), "{detail}");
+        assert!(advice.contains("client_id"), "{advice}");
+
+        // A scope the client is not allowed. Named, so the fix is obvious.
+        let (detail, advice) = classify_authorization(
+            true,
+            "https://auth.issinoho.com/consent/completion?error=invalid_scope&\
+             error_description=not+allowed+to+request+scope+%27offline_access%27",
+            CALLBACK,
+        )
+        .expect_err("a disallowed scope must not pass");
+        assert!(detail.contains("offline_access"), "{detail}");
+        assert!(advice.contains("extra_scopes"), "{advice}");
+
+        // An error delivered to our own callback proves the URI is registered,
+        // so the advice must point elsewhere.
+        let (_, advice) = classify_authorization(
+            true,
+            &format!("{CALLBACK}?error=access_denied&state=x"),
+            CALLBACK,
+        )
+        .expect_err("an error is an error wherever it arrives");
+        assert!(advice.contains("is registered"), "{advice}");
+
+        // No redirect at all.
+        assert!(classify_authorization(false, "", CALLBACK).is_err());
     }
 
     /// A self-hosted provider behind an internal CA is the case `ca_bundle`
