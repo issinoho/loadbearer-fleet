@@ -5,6 +5,26 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.5.4 - Fri, 11 Sep 2026
+
+One papercut, met while following 0.5.3's own upgrade instructions.
+
+### Fixed
+
+- **`scan` takes its folder from the configuration when it is not given one.**
+  It insisted on being told, having just read a config that names
+  `collection_dir` — and worst of all for `scan --reindex`, whose entire job is
+  to re-read the folder it already knows about. An argument still wins where
+  one is given; with neither, the refusal names both ways of supplying it.
+
+```bash
+# what 0.5.3 required, and still works
+loadbearer-fleet --config /etc/loadbearer-fleet/fleet.toml scan --reindex /srv/loadbearer/collection
+
+# what this accepts
+loadbearer-fleet --config /etc/loadbearer-fleet/fleet.toml scan --reindex
+```
+
 ## 0.5.3 - Fri, 11 Sep 2026
 
 **Compare runs head to head** — a new tab, a new command and a new endpoint —
