@@ -118,6 +118,25 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Compare two to four runs head to head.
+    ///
+    /// The verdict comes from raw metrics rather than from scores, so it does
+    /// not depend on the baseline anything was graded against — which is what
+    /// makes it usable across machines measured months apart. Anything that
+    /// would make the numbers mean something else is left out and named: a
+    /// subtest missing a direction, a peak against a median, a component that
+    /// is measured but never graded.
+    Compare {
+        /// Machines, or run ids. A bare number is a run id; anything else is a
+        /// machine name, meaning its most recent run. Name the same machine
+        /// twice with two run ids to compare it against its own past.
+        #[arg(value_name = "MACHINE|RUN", num_args = 2..)]
+        machines: Vec<String>,
+        /// Emit the whole comparison as JSON, the same shape `/api/compare`
+        /// sends.
+        #[arg(long)]
+        json: bool,
+    },
     /// Take a consistent copy of the index, safe to run while it is serving.
     ///
     /// For a backup agent to call. The collection folder is the thing actually
@@ -465,6 +484,17 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Compare { machines, json } => {
+            let idx = index::Index::open_existing(&config.server.index)?;
+            let ids = compare::resolve(idx.conn(), machines)?;
+            let c = compare::compare(idx.conn(), &ids)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&c)?);
+                return Ok(());
+            }
+            print_comparison(&c);
+            Ok(())
+        }
         Command::Backup { file } => {
             let idx = index::Index::open_existing(&config.server.index)?;
             let bytes = idx.backup_to(file)?;
@@ -579,6 +609,67 @@ fn main() -> Result<()> {
                 .build()?
                 .block_on(web::serve(state, &config, *allow_remote, None))
         }
+    }
+}
+
+/// The comparison as a terminal reads it: the verdict, the runs, the rollup,
+/// then what was left out. The per-subtest detail stays in `--json` and on the
+/// dashboard — thirty rows across four columns is a table for a screen.
+fn print_comparison(c: &compare::Comparison) {
+    println!("{}", c.overall.summary);
+    println!();
+    for (i, r) in c.runs.iter().enumerate() {
+        println!(
+            "  {}{}  {}  {}  {}",
+            // The first run is what everything else is measured against.
+            if i == 0 { "* " } else { "  " },
+            r.label,
+            &r.taken_at[..r.taken_at.len().min(10)],
+            r.comparability.preset,
+            r.cpu_model
+        );
+    }
+    println!();
+    let heads: String = c
+        .runs
+        .iter()
+        .map(|r| format!("{:>10}", short(&r.label)))
+        .collect();
+    println!("  {:<14}{heads}", "");
+    for component in &c.components {
+        let cells: String = component.rel.iter().map(|v| format!("{v:>9.2}x")).collect();
+        println!(
+            "  {:<14}{cells}{}",
+            component.label,
+            if component.graded {
+                ""
+            } else {
+                "   not counted"
+            }
+        );
+    }
+    println!();
+    println!(
+        "  from {} shared measurement(s){}",
+        c.coverage.compared,
+        if c.coverage.left_out > 0 {
+            format!(", {} left out", c.coverage.left_out)
+        } else {
+            String::new()
+        }
+    );
+    for w in &c.warnings {
+        println!("  - {w}");
+    }
+}
+
+/// A column is ten characters wide; a hostname often is not.
+fn short(label: &str) -> String {
+    let n = label.chars().count();
+    if n <= 9 {
+        label.to_string()
+    } else {
+        format!("…{}", label.chars().skip(n - 8).collect::<String>())
     }
 }
 

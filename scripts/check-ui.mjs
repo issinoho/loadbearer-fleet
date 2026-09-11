@@ -422,6 +422,39 @@ ${r.stderr || r.stdout}`);
   }
 }
 
+/**
+ * A comparison built by the binary, for the same reason the snapshot is: the
+ * view is written against a shape, and a hand-written fixture of that shape
+ * drifts the moment the server's changes. Machine *names* rather than run ids,
+ * so this does not depend on two temporary databases numbering their rows
+ * identically.
+ */
+function realCompare(names) {
+  const target = process.env.CARGO_TARGET_DIR || 'target';
+  const exe = join(
+    target,
+    'debug',
+    process.platform === 'win32' ? 'loadbearer-fleet.exe' : 'loadbearer-fleet',
+  );
+  const db = join(tmpdir(), `lbf-check-cmp-${process.pid}.db`);
+  const run = (args) => {
+    const r = spawnSync(exe, ['--index', db, '--log-level', 'warn', ...args], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      console.error(`\n${exe} ${args.join(' ')} failed:\n${r.stderr || r.stdout}`);
+      process.exit(1);
+    }
+    return r.stdout;
+  };
+  try {
+    run(['scan', 'tests/fixtures']);
+    return JSON.parse(run(['compare', '--json', ...names]));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try { rmSync(db + suffix); } catch { /* already gone */ }
+    }
+  }
+}
+
 const snapshot = realSnapshot();
 check('snapshot', snapshot.machines.length > 0, 'the fixtures produced no machines');
 notes.push(`snapshot: ${snapshot.machines.length} machine(s), ${snapshot.flags.length} finding(s), `
@@ -540,6 +573,66 @@ renderView('machines', (h) => mod.renderMachines(h));
     check('machine/missing', textOf(h).includes('no machine keyed'), 'the error was not shown');
   } catch (err) {
     failures.push(`machine/missing: threw ${err.message}`);
+  }
+}
+
+// The comparison, against one the binary produced.
+{
+  const [a, b] = snapshot.machines;
+  const comparison = realCompare([a.hostname || a.key, b.hostname || b.key]);
+  const histories = new Map([
+    [a.key, { history: [{ run_id: a.run_id, taken_at: a.taken_at }] }],
+    [b.key, { history: [{ run_id: b.run_id, taken_at: b.taken_at }] }],
+  ]);
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    const payload = u.startsWith('/api/compare')
+      ? comparison
+      : histories.get(decodeURIComponent(u.replace('/api/machine/', ''))) || { history: [] };
+    return Promise.resolve({
+      ok: true, json: () => Promise.resolve(payload), text: () => Promise.resolve(''),
+    });
+  };
+  const h = host(1200);
+  try {
+    await mod.renderCompare(h, [a.run_id, b.run_id]);
+    const text = textOf(h);
+    check('compare', text.includes(comparison.overall.summary), 'the verdict was not shown');
+    check('compare', text.includes(a.hostname || a.key), 'the first run was not named');
+    check('compare', !text.includes('undefined'), 'the word "undefined" reached the page');
+    check('compare', !text.includes('NaN'), 'the word "NaN" reached the page');
+    // Every component it was handed has to reach the page. Dropping half a
+    // comparison is the failure this view could have while still looking fine.
+    for (const c of comparison.components) {
+      check('compare', text.includes(c.label), `component ${c.id} is missing from the table`);
+    }
+    notes.push(
+      `compare: ${comparison.components.length} component(s), `
+      + `${comparison.coverage.compared} measurement(s), ${text.length} chars of text`,
+    );
+  } catch (err) {
+    failures.push(`compare: threw ${err.message}`);
+  }
+}
+
+// Refusing is most of what that endpoint does, so the view has to show the
+// reason rather than an empty table.
+{
+  globalThis.fetch = (url) => Promise.resolve(
+    String(url).startsWith('/api/compare')
+      ? { ok: false, text: () => Promise.resolve('these runs share no comparable measurements.') }
+      : { ok: true, json: () => Promise.resolve({ history: [] }), text: () => Promise.resolve('') },
+  );
+  const h = host(1200);
+  try {
+    await mod.renderCompare(h, [1, 2]);
+    check(
+      'compare/refused',
+      textOf(h).includes('no comparable measurements'),
+      "the server's reason was not shown",
+    );
+  } catch (err) {
+    failures.push(`compare/refused: threw ${err.message}`);
   }
 }
 

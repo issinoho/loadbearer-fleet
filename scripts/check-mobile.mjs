@@ -43,9 +43,10 @@ const SIZES = [
   { name: 'desktop', width: 1440, height: 900, touch: false },
 ];
 
-// Two of these hold the widest thing on the site: the machines table, and a
-// drilldown with its history charts.
-const VIEWS = ['overview', 'cohorts', 'machines', 'machine'];
+// Three of these hold the widest thing on the site: the machines table, a
+// drilldown with its history charts, and a comparison, which is a table whose
+// width is chosen by the reader — one column per run.
+const VIEWS = ['overview', 'cohorts', 'machines', 'machine', 'compare'];
 
 // A control smaller than this is a control you miss. 40px is the floor here
 // rather than Apple's 44 because the theme toggle is square and 44 looks
@@ -222,6 +223,8 @@ if (!up) {
 // A real machine key, so the drilldown is rendered against something.
 const snapshot = await (await fetch(`${origin}/api/snapshot`)).json();
 const machineKey = snapshot.machines[0].key;
+// Three runs: the widest table a reader can ask for on a phone, short of four.
+const compareRuns = snapshot.machines.slice(0, 3).map((m) => m.run_id);
 check('fixtures', snapshot.machines.length > 0, 'the fixtures produced no machines');
 
 /* ----------------------------------------------------------------- the runs */
@@ -257,7 +260,11 @@ try {
     });
 
     for (const view of VIEWS) {
-      const hash = view === 'machine' ? `machine/${encodeURIComponent(machineKey)}` : view;
+      let hash = view;
+      if (view === 'machine') hash = `machine/${encodeURIComponent(machineKey)}`;
+      // A comparison with nothing chosen is only the picker, which is not the
+      // layout worth checking — the table is.
+      if (view === 'compare') hash = `compare/${compareRuns.join(',')}`;
       const where = `${size.name}/${view}`;
       // A fresh navigation rather than a hash change, so each measurement is of
       // a page that laid itself out at this size from the start.

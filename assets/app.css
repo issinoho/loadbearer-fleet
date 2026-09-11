@@ -166,6 +166,12 @@ a { color: inherit; }
 
 /* ---------- filters ---------- */
 
+/* `display: flex` beats the user agent's `[hidden] { display: none }`, so
+   hiding this row from script did nothing at all — the drilldown has been
+   showing the fleet filter since the day it was written. An author rule has to
+   win against an author rule. */
+.filters[hidden] { display: none; }
+
 .filters {
   display: flex;
   align-items: flex-end;
@@ -529,4 +535,97 @@ table.data td.wrap { white-space: normal; }
 
   .btn-square { min-width: 40px; }
   .field select, .field input { min-height: 40px; }
+}
+
+/* ---------- compare ---------- */
+
+.compare-slots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+/* A `select` takes its width from its widest *option*, and these hold a whole
+   CPU model — so without a ceiling the picker alone made the page wider than a
+   phone. The closed control truncates; the open list still shows all of it. */
+.compare-slots > select {
+  max-width: 100%;
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+
+.compare-slot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 6px 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--plane);
+  /* The name can be long and the row must not grow past the card. */
+  max-width: 100%;
+  min-width: 0;
+}
+
+.compare-slot-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.compare-slot select { max-width: 40vw; }
+
+.compare-summary { font-size: 15px; margin: 0 0 4px; }
+
+/* The first column is the label and the rest are figures, so only the first
+   is allowed the width to wrap. */
+table.compare th[scope="row"] { text-align: left; font-weight: 400; }
+/* Every other heading in the dashboard is one short word and stays on its
+   line. These carry a machine name and a timestamp, and holding those on one
+   line sized each column at 212px — wide enough to push the ratios, which are
+   the whole point, off the side of a phone. */
+table.compare thead th { white-space: normal; vertical-align: bottom; }
+table.compare .compare-component th { font-weight: 600; }
+.compare-component { border-top: 1px solid var(--grid); }
+.compare-subtest { padding-left: 14px; }
+
+/* The ratio under each value: the number is the measurement, this is the
+   comparison, and they are different questions about the same cell. */
+.compare-rel { font-size: 12px; }
+.compare-best { font-weight: 600; }
+
+.compare-warnings {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.compare-warnings li { margin-bottom: 4px; }
+
+@media (max-width: 720px) {
+  /* The label column was taking the whole screen, so a phone showed thirty
+     rows of names and not one measurement — everything was off to the right,
+     behind a swipe nobody would know to make. Capped and allowed to wrap, so
+     at least two runs are visible at once and the scroller is for the rest. */
+  table.compare th[scope="row"] {
+    max-width: 116px;
+    white-space: normal;
+  }
+
+  /* Tighter than the other tables on purpose. The column that matters here is
+     a ratio the reader came to see, and the first data column is the baseline
+     — the least useful of them — so every pixel spent on padding is one that
+     keeps a comparison off the screen. */
+  table.compare th, table.compare td { padding: 6px; }
+  table.compare td { min-width: 68px; }
+
+  /* Each chosen run gets its own line: three controls side by side do not fit
+     a phone, and a wrapped pill reads worse than a stack. */
+  .compare-slot { width: 100%; border-radius: var(--radius); }
+  .compare-slot-name { flex: 1 1 auto; }
+  .compare-slot select { max-width: none; flex: 0 1 auto; min-width: 0; }
 }

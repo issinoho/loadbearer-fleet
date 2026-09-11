@@ -648,6 +648,9 @@ const QUEUES = {
 // standing between a typo in here and a blank panel in production.
 export const state = {
   snap: null, me: null, view: 'overview', key: null, filter: {}, showInfo: false,
+  /// The run ids being compared, in the order they were chosen: the first is
+  /// the one everything else is measured against.
+  runs: [],
 };
 
 function parseHash() {
@@ -660,16 +663,30 @@ function parseHash() {
     const v = params.get(k);
     if (v) filter[k] = v;
   }
+  const named = ['overview', 'cohorts', 'machines', 'compare'];
+  const view = parts[0] === 'machine'
+    ? 'machine'
+    : (named.includes(parts[0]) ? parts[0] : 'overview');
   return {
-    view: parts[0] === 'machine' ? 'machine' : (['overview', 'cohorts', 'machines'].includes(parts[0]) ? parts[0] : 'overview'),
+    view,
     key: parts[0] === 'machine' ? decodeURIComponent(parts.slice(1).join('/')) : null,
+    // The runs being compared sit in the path, not the query: the query is the
+    // fleet filter, and a comparison is of *named runs*. Keeping them apart
+    // means changing the filter cannot silently change what is being compared.
+    runs: view === 'compare'
+      ? (parts[1] || '').split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0)
+      : [],
     filter,
   };
 }
 
-function writeHash({ view = state.view, key = state.key, filter = state.filter } = {}) {
+function writeHash({
+  view = state.view, key = state.key, filter = state.filter, runs = state.runs,
+} = {}) {
   const q = new URLSearchParams(filter).toString();
-  const path = view === 'machine' ? `machine/${encodeURIComponent(key)}` : view;
+  let path = view;
+  if (view === 'machine') path = `machine/${encodeURIComponent(key)}`;
+  if (view === 'compare') path = runs?.length ? `compare/${runs.join(',')}` : 'compare';
   location.hash = `#/${path}${q ? `?${q}` : ''}`;
 }
 
@@ -1310,6 +1327,223 @@ export async function renderMachine(main, key) {
   );
 }
 
+/* ----------------------------------------------------------------- compare */
+
+/** Machines the caller can see, for the picker. Scoped already: this is the
+ *  filtered snapshot, and the server refuses anything outside it anyway. */
+function pickableMachines() {
+  return (state.snap?.machines || []).slice()
+    .sort((a, b) => (a.hostname || a.key).localeCompare(b.hostname || b.key));
+}
+
+/**
+ * The chooser. Machines go in, runs come out — each slot defaulting to the
+ * machine's latest run, and swappable for an earlier one.
+ *
+ * Adding the same machine twice is allowed on purpose: "this machine before
+ * the firmware update, and now" is the comparison with the fewest confounders
+ * in it, and the only one where the hardware is definitely identical.
+ */
+function comparePicker(runs, histories) {
+  const machines = pickableMachines();
+  const byRun = new Map();
+  for (const [key, h] of histories) for (const p of h) byRun.set(p.run_id, { key, point: p });
+
+  const slots = runs.map((id, i) => {
+    const found = byRun.get(id);
+    const m = machines.find((x) => x.key === found?.key);
+    const name = m ? (m.hostname || m.key) : `run ${id}`;
+    const history = found ? histories.get(found.key) : null;
+
+    const chooser = history && history.length > 1
+      ? el('select', {
+        'aria-label': `Which run of ${name}`,
+        onchange: (e) => {
+          const next = runs.slice();
+          next[i] = Number(e.target.value);
+          writeHash({ view: 'compare', runs: next });
+        },
+      }, history.slice().reverse().map((p) => el('option', {
+        value: String(p.run_id), text: when(p.taken_at), selected: p.run_id === id,
+      })))
+      : el('span', { class: 'meta', text: found ? when(found.point.taken_at) : 'run not found' });
+
+    return el('div', { class: 'compare-slot' }, [
+      el('span', { class: 'compare-slot-name', text: `${i === 0 ? 'Baseline: ' : ''}${name}` }),
+      chooser,
+      el('button', {
+        type: 'button', class: 'btn btn-quiet', text: 'Remove',
+        'aria-label': `Remove ${name} from the comparison`,
+        onclick: () => writeHash({ view: 'compare', runs: runs.filter((_, j) => j !== i) }),
+      }),
+    ]);
+  });
+
+  // A machine already in the comparison stays in the list: choosing it again
+  // adds its previous run, which is how you compare a machine with itself.
+  const add = el('select', {
+    'aria-label': 'Add a machine to the comparison',
+    onchange: (e) => {
+      const m = machines.find((x) => x.key === e.target.value);
+      if (!m) return;
+      const used = new Set(runs);
+      const history = histories.get(m.key);
+      const pick = history
+        ? [...history].reverse().map((p) => p.run_id).find((id) => !used.has(id))
+        : m.run_id;
+      if (pick === undefined || used.has(pick)) return;
+      writeHash({ view: 'compare', runs: [...runs, pick] });
+    },
+  }, [
+    el('option', { value: '', text: runs.length >= 4 ? 'Four is the most that fits' : 'Add a machine…', selected: true }),
+    ...(runs.length >= 4 ? [] : machines.map((m) => el('option', {
+      value: m.key, text: `${m.hostname || m.key} — ${m.cpu_model}`,
+    }))),
+  ]);
+
+  return el('div', { class: 'card col-12' }, [
+    el('div', { class: 'card-head' }, [el('h3', { text: 'Compare runs' })]),
+    el('p', {
+      class: 'card-sub',
+      text: 'Two to four runs, measured against the first. The same machine twice compares it '
+        + 'with its own past, which is the comparison with the fewest other things changing.',
+    }),
+    el('div', { class: 'compare-slots' }, [...slots, add]),
+  ]);
+}
+
+/** `1.24×` / `0.81×`, coloured the way the rest of the dashboard colours a
+ *  delta, and marked when it is the best of the row. */
+function relCell(rel, best) {
+  const cls = rel > 1.02 ? 'delta-up' : rel < 0.98 ? 'delta-down' : '';
+  return el('span', { class: `${cls}${best ? ' compare-best' : ''}`.trim(), text: `${rel.toFixed(2)}×` });
+}
+
+function compareTable(data) {
+  // Name over date, in two elements rather than one string: a heading of
+  // `FLEET-WIN-01 Sep 9, 2026, 02:50 PM` is `nowrap` like every other heading
+  // in the dashboard, which made each column 212px wide and pushed every ratio
+  // off a phone. The columns should be as wide as their numbers.
+  const head = [el('th', {})].concat(data.runs.map((r) => el('th', { class: 'num' }, [
+    el('div', { text: r.label }),
+    el('div', { class: 'meta', text: when(r.taken_at) }),
+  ])));
+  const table = el('table', { class: 'data compare' });
+  const rows = [];
+
+  // The first run is the reference, so its ratio is 1.00× in every single row.
+  // A column of constants is a column of noise: the baseline shows its
+  // measurements and leaves comparing to the columns that are doing some.
+  for (const c of data.components) {
+    rows.push(el('tr', { class: 'compare-component' }, [
+      el('th', { scope: 'row' }, [
+        el('span', { text: c.label }),
+        c.graded ? null : el('span', { class: 'meta', text: ' not counted' }),
+      ]),
+      ...c.rel.map((r, i) => el('td', { class: 'num' }, [
+        i === 0 ? el('span', { class: 'meta', text: 'baseline' }) : relCell(r, i === c.best),
+      ])),
+    ]));
+    for (const s of c.subtests) {
+      rows.push(el('tr', {}, [
+        el('th', { scope: 'row', class: 'compare-subtest' }, [
+          el('span', { text: s.label }),
+          el('span', { class: 'meta', text: ` ${s.unit}${s.scored ? '' : ' · informational'}` }),
+        ]),
+        ...s.values.map((v, i) => el('td', { class: 'num' }, [
+          el('div', { text: num(v) }),
+          i === 0 ? null : el('div', { class: 'compare-rel' }, [relCell(s.rel[i], i === s.best)]),
+        ])),
+      ]));
+    }
+  }
+
+  table.append(el('thead', {}, [el('tr', {}, head)]), el('tbody', {}, rows));
+  return el('div', { class: 'table-wrap' }, [table]);
+}
+
+export async function renderCompare(main, runs) {
+  // Each selected machine's history, so a slot can offer its earlier runs.
+  const histories = new Map();
+  const machines = pickableMachines();
+  const wanted = new Set(runs);
+  await Promise.all(machines.map(async (m) => {
+    // Every machine's latest run is already known; only fetch the history of
+    // one that is actually in play, or that the picker may need to offer.
+    if (!wanted.has(m.run_id) && !runs.length) {
+      histories.set(m.key, [{ run_id: m.run_id, taken_at: m.taken_at }]);
+      return;
+    }
+    try {
+      const payload = await fetchJson(`/api/machine/${encodeURIComponent(m.key)}`);
+      histories.set(m.key, payload.history || []);
+    } catch {
+      histories.set(m.key, [{ run_id: m.run_id, taken_at: m.taken_at }]);
+    }
+  }));
+
+  const cards = [comparePicker(runs, histories)];
+
+  if (runs.length < 2) {
+    cards.push(el('div', { class: 'card col-12' }, [
+      el('div', {
+        class: 'empty',
+        text: machines.length < 2
+          ? 'Two machines are needed before anything can be compared.'
+          : 'Pick a second run to compare against.',
+      }),
+    ]));
+    main.append(el('div', { class: 'grid' }, cards));
+    return;
+  }
+
+  let data;
+  try {
+    data = await fetchJson(`/api/compare?runs=${runs.join(',')}`);
+  } catch (err) {
+    // The server's refusals are written to be read — a mixed statistic, a
+    // missing direction, nothing in common — so they are shown as they are.
+    cards.push(el('div', { class: 'card col-12' }, [
+      el('div', { class: 'banner' }, [el('span', { text: err.message })]),
+    ]));
+    main.append(el('div', { class: 'grid' }, cards));
+    return;
+  }
+
+  const { coverage } = data;
+  cards.push(el('div', { class: 'card col-12' }, [
+    el('div', { class: 'card-head' }, [el('h3', { text: 'Verdict' })]),
+    el('p', { class: 'compare-summary', text: data.overall.summary }),
+    el('p', {
+      class: 'card-sub',
+      text: `From ${coverage.compared} shared measurement(s)`
+        + (coverage.left_out ? `, with ${coverage.left_out} left out.` : '.')
+        + ' Ratios are against the first run; over 1.00× is better, whichever direction the'
+        + ' metric runs in.',
+    }),
+    compareTable(data),
+    data.components.some((c) => !c.graded)
+      ? el('p', {
+        class: 'card-note',
+        text: 'Network and GPU are shown but not counted: they depend on the host, its drivers '
+          + 'and whatever the network is doing, which is why they are left out of a grade too.',
+      })
+      : null,
+  ]));
+
+  if (data.warnings.length) {
+    cards.push(el('div', { class: 'card col-12' }, [
+      el('div', { class: 'card-head' }, [
+        el('h3', { text: `${data.warnings.length} thing(s) not compared` }),
+      ]),
+      el('p', { class: 'card-sub', text: 'Left out rather than guessed at. Each one would have made the numbers mean something else.' }),
+      el('ul', { class: 'compare-warnings' }, data.warnings.map((w) => el('li', { text: w }))),
+    ]));
+  }
+
+  main.append(el('div', { class: 'grid' }, cards));
+}
+
 /* -------------------------------------------------------------------- boot */
 
 function render() {
@@ -1321,23 +1555,28 @@ function render() {
       || (state.view === 'machine' && tab.dataset.view === 'machines');
     if (on) tab.setAttribute('aria-current', 'page'); else tab.removeAttribute('aria-current');
   }
-  // Filters scope a fleet, not one machine.
+  // Filters scope a fleet, so a drilldown of one machine hides them. The
+  // comparison keeps them: its picker is built from the filtered snapshot, so
+  // the filter is what decides which machines are on offer, and hiding the
+  // control while it still applied would be the confusing half of both.
   $('#filters').hidden = state.view === 'machine';
 
   const notice = scopeNotice();
   if (notice) main.append(notice);
 
   if (state.view === 'machine') { renderMachine(main, state.key); return; }
+  if (state.view === 'compare') { renderCompare(main, state.runs); return; }
   if (state.view === 'cohorts') renderCohorts(main);
   else if (state.view === 'machines') renderMachines(main);
   else renderOverview(main);
 }
 
 async function route() {
-  const { view, key, filter } = parseHash();
+  const { view, key, filter, runs } = parseHash();
   state.view = view;
   state.key = key;
   state.filter = filter;
+  state.runs = runs;
   const main = $('#main');
   main.classList.add('loading');
   try {

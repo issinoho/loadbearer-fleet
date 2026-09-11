@@ -220,6 +220,39 @@ pub fn compare(conn: &Connection, run_ids: &[i64]) -> Result<Comparison> {
     })
 }
 
+/// Turn what somebody typed into run ids.
+///
+/// A bare number is a run id; anything else is a machine, meaning its latest
+/// run. The ambiguity is real but narrow — a hostname made only of digits —
+/// and worth it, because the useful thing to type is a machine name and the
+/// useful thing to *script* is an id.
+pub fn resolve(conn: &Connection, names: &[String]) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for name in names {
+        if let Ok(id) = name.parse::<i64>() {
+            ids.push(id);
+            continue;
+        }
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM run
+                   WHERE machine_key = ?1 COLLATE NOCASE OR hostname = ?1 COLLATE NOCASE
+                   ORDER BY taken_at DESC, id DESC LIMIT 1",
+                [name],
+                |r| r.get(0),
+            )
+            .ok();
+        match found {
+            Some(id) => ids.push(id),
+            None => bail!(
+                "no machine in the index matches {name:?}. Try the hostname, the machine key the \
+                 dashboard shows on the drilldown, or a run id."
+            ),
+        }
+    }
+    Ok(ids)
+}
+
 /// Everything wrong with a request that can be judged without looking at the
 /// index at all.
 ///
