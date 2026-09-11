@@ -42,11 +42,12 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::analytics::{self, Cohort, Detail, Filter, Flag, MachineView, Snapshot, Thresholds};
-use crate::auth::{self, Authenticator, Caller};
+use crate::auth::{self, Authenticator, Caller, IngestTokens, Submitter, token_matches};
 use crate::compare;
 use crate::config::{AuthMode, Config, Metrics as MetricsConfig};
 use crate::index::{Index, ScanReport};
 use crate::metrics::{self, Runtime, ScanStamp};
+use crate::ratelimit::Limiter;
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
@@ -73,6 +74,11 @@ pub struct AppState {
     /// to accept it.
     upload_dir: Option<PathBuf>,
     authenticator: Authenticator,
+    /// The credentials machines submit with. Consulted by the upload route and
+    /// by nothing else.
+    ingest: IngestTokens,
+    /// How fast any one of them may write to the collection folder.
+    uploads: Limiter,
     metrics_config: MetricsConfig,
     /// Counters that outlive any one snapshot, for the metrics endpoint.
     runtime: Mutex<Runtime>,
@@ -90,6 +96,8 @@ impl AppState {
             root: config.server.collection_dir.clone(),
             upload_dir: config.server.upload_dir.clone(),
             authenticator: Authenticator::new(config),
+            ingest: IngestTokens::new(config),
+            uploads: Limiter::new(config.server.upload_limit_per_minute),
             metrics_config: config.metrics.clone(),
             runtime: Mutex::new(Runtime::new()),
         }))
@@ -97,6 +105,10 @@ impl AppState {
 
     pub fn auth(&self) -> &Authenticator {
         &self.authenticator
+    }
+
+    pub fn ingest(&self) -> &IngestTokens {
+        &self.ingest
     }
 
     /// The current fleet-wide analysis, rebuilt first if another process has
@@ -197,6 +209,9 @@ impl AppState {
 struct AppError {
     status: StatusCode,
     source: anyhow::Error,
+    /// Only on a 429, where the answer is "later" and the caller deserves to
+    /// be told how much later rather than made to guess.
+    retry_after: Option<Duration>,
 }
 
 impl AppError {
@@ -206,23 +221,31 @@ impl AppError {
     /// scope: whether that machine exists is not something they are entitled to
     /// learn.
     fn not_found(what: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            source: anyhow::anyhow!("{what}"),
-        }
+        Self::at(StatusCode::NOT_FOUND, what)
     }
 
     fn bad_request(what: impl std::fmt::Display) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            source: anyhow::anyhow!("{what}"),
-        }
+        Self::at(StatusCode::BAD_REQUEST, what)
     }
 
     fn forbidden(what: impl std::fmt::Display) -> Self {
+        Self::at(StatusCode::FORBIDDEN, what)
+    }
+
+    /// Too fast, and when to try again. The wait is a header as well as
+    /// prose, because the thing being refused is usually a script.
+    fn too_many(wait: Duration, what: impl std::fmt::Display) -> Self {
         Self {
-            status: StatusCode::FORBIDDEN,
+            retry_after: Some(wait),
+            ..Self::at(StatusCode::TOO_MANY_REQUESTS, what)
+        }
+    }
+
+    fn at(status: StatusCode, what: impl std::fmt::Display) -> Self {
+        Self {
+            status,
             source: anyhow::anyhow!("{what}"),
+            retry_after: None,
         }
     }
 }
@@ -235,7 +258,14 @@ impl IntoResponse for AppError {
         } else {
             tracing::debug!(status = %self.status, error = %message, "request refused");
         }
-        (self.status, message).into_response()
+        let mut response = (self.status, message).into_response();
+        if let Some(wait) = self.retry_after {
+            let seconds = wait.as_secs().max(1);
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -244,6 +274,7 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             source: e.into(),
+            retry_after: None,
         }
     }
 }
@@ -330,12 +361,16 @@ struct UploadOutcome {
 ///
 /// 1. **The server was given somewhere to put it.** No `upload_dir`, no
 ///    uploading, whatever anybody's role says.
-/// 2. **The caller may upload.** `contributor` or better.
+/// 2. **The caller may upload.** `contributor` or better — either a person
+///    whose grant says so, or an ingest token, which is a contributor by
+///    definition and cannot be anything else.
 /// 3. **It is JSON.** A cross-origin form can only send urlencoded,
 ///    multipart or plain text, so insisting on `application/json` means no
 ///    HTML page on another site can post here with the user's cookie — on top
 ///    of `SameSite=Lax`, which already withholds it.
-/// 4. **It parses, and it is in scope.** A contributor scoped to one site may
+/// 4. **Not too fast.** A cap per credential, so a script in a loop cannot
+///    fill the disk. Idle time banks, and the refusal says when to come back.
+/// 5. **It parses, and it is in scope.** A contributor scoped to one site may
 ///    not submit a result claiming to be from another; the same
 ///    `scopes_allow` that decides what they may *read* decides this.
 ///
@@ -343,7 +378,7 @@ struct UploadOutcome {
 /// applies to a file on disk.
 async fn post_upload(
     State(state): State<Arc<AppState>>,
-    caller: Caller,
+    Submitter(who): Submitter,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<Json<UploadOutcome>, AppError> {
@@ -353,7 +388,7 @@ async fn post_upload(
              Set one inside the collection folder and restart.",
         ));
     };
-    if !caller.0.may_upload() {
+    if !who.may_upload() {
         return Err(AppError::forbidden(
             "submitting a result needs a grant with role = \"contributor\" or \"admin\"",
         ));
@@ -367,13 +402,32 @@ async fn post_upload(
             "send the document as application/json",
         ));
     }
+    // Last of the cheap checks, and the first that costs anything to answer:
+    // the limit is per principal, so it needs a caller, and it goes before the
+    // parse and the write so that a client in a loop costs neither.
+    if let Err(wait) = state.uploads.check(&who.subject) {
+        state
+            .runtime
+            .lock()
+            .expect("runtime lock")
+            .uploads_limited_total += 1;
+        return Err(AppError::too_many(
+            wait,
+            format!(
+                "too many submissions from this credential; try again in {} second(s). \
+                 Resending is safe — ingest is idempotent by content, so a document that \
+                 did land is answered as already indexed rather than stored twice.",
+                wait.as_secs().max(1)
+            ),
+        ));
+    }
 
     // Parsed here as well as in the index, because the scope check needs the
     // tags before anything is written, and a document that is not a result
     // should be refused in the reader's own words.
     let doc = crate::schema::ResultFile::from_json(&body)
         .map_err(|e| AppError::bad_request(format!("{e:#}")))?;
-    if !analytics::scopes_allow(&caller.0.scopes, &doc.tags) {
+    if !analytics::scopes_allow(&who.scopes, &doc.tags) {
         // Deliberately not "your scope is X": that would tell a caller what
         // else exists. It says what they sent and what it needed.
         return Err(AppError::forbidden(
@@ -385,11 +439,12 @@ async fn post_upload(
 
     let fresh = {
         let mut idx = state.index.lock().expect("index lock");
-        idx.accept_upload(&body, &dir, &caller.0.subject)
+        idx.accept_upload(&body, &dir, &who.subject)
             .map_err(|e| AppError::bad_request(format!("{e:#}")))?
     };
+    state.runtime.lock().expect("runtime lock").uploads_total += 1;
     tracing::info!(
-        by = %caller.0.subject,
+        by = %who.subject,
         machine = %doc.machine_key().value,
         fresh,
         "result uploaded"
@@ -577,17 +632,6 @@ async fn index_html(_caller: Caller) -> Response {
     asset(INDEX_HTML, "text/html; charset=utf-8")
 }
 
-/// Compare a presented credential without leaking, through timing, how much of
-/// it was right.
-///
-/// Digesting both sides first means the comparison runs over 32 bytes of hash
-/// whatever the inputs were, so neither the length nor any prefix of the real
-/// token is recoverable from how long the answer took.
-fn token_matches(presented: &str, configured: &str) -> bool {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(presented.as_bytes()) == Sha256::digest(configured.as_bytes())
-}
-
 async fn get_metrics(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -600,16 +644,12 @@ async fn get_metrics(
         ));
     }
     if !state.metrics_config.token.is_empty() {
-        let presented = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or("");
+        let presented = auth::bearer(&headers).unwrap_or("");
         if !token_matches(presented, &state.metrics_config.token) {
-            return Err(AppError {
-                status: StatusCode::UNAUTHORIZED,
-                source: anyhow::anyhow!("metrics need the configured bearer token"),
-            });
+            return Err(AppError::at(
+                StatusCode::UNAUTHORIZED,
+                "metrics need the configured bearer token",
+            ));
         }
     }
     // Fleet-wide and unscoped: this is an operator's view of the service, and a
@@ -915,7 +955,7 @@ mod tests {
 
     use super::*;
     use crate::auth::Principal;
-    use crate::config::{Auth, Grant, Role};
+    use crate::config::{Auth, Grant, IngestToken, Role};
 
     fn fixtures() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -978,12 +1018,40 @@ mod tests {
         body: &str,
         cookie: Option<&str>,
     ) -> Reply {
+        post_as(state, uri, content_type, body, cookie, None).await
+    }
+
+    /// The same, from something that is not a browser: a bearer token and no
+    /// cookie, exactly as a deployment script would send it.
+    async fn post_token(state: &Arc<AppState>, body: &str, token: &str) -> Reply {
+        post_as(
+            state,
+            "/api/upload",
+            "application/json",
+            body,
+            None,
+            Some(token),
+        )
+        .await
+    }
+
+    async fn post_as(
+        state: &Arc<AppState>,
+        uri: &str,
+        content_type: &str,
+        body: &str,
+        cookie: Option<&str>,
+        token: Option<&str>,
+    ) -> Reply {
         let mut builder = Request::builder()
             .method(Method::POST)
             .uri(uri)
             .header(header::CONTENT_TYPE, content_type);
         if let Some(c) = cookie {
             builder = builder.header(header::COOKIE, format!("lbf_session={c}"));
+        }
+        if let Some(t) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
         }
         let response = router(Arc::clone(state))
             .oneshot(builder.body(Body::from(body.to_string())).expect("request"))
@@ -1017,9 +1085,26 @@ mod tests {
         uri: &str,
         cookie: Option<&str>,
     ) -> Reply {
+        request_as(state, method, uri, cookie, None).await
+    }
+
+    async fn get_token(state: &Arc<AppState>, uri: &str, token: &str) -> Reply {
+        request_as(state, Method::GET, uri, None, Some(token)).await
+    }
+
+    async fn request_as(
+        state: &Arc<AppState>,
+        method: Method,
+        uri: &str,
+        cookie: Option<&str>,
+        token: Option<&str>,
+    ) -> Reply {
         let mut builder = Request::builder().method(method).uri(uri);
         if let Some(c) = cookie {
             builder = builder.header(header::COOKIE, format!("lbf_session={c}"));
+        }
+        if let Some(t) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
         }
         let response = router(Arc::clone(state))
             .oneshot(builder.body(Body::empty()).expect("request"))
@@ -1544,6 +1629,235 @@ mod tests {
         )
         .await;
         assert_eq!(mine.status, StatusCode::OK, "{}", mine.body);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn token(name: &str, secret: &str, tags: &[(&str, &str)]) -> IngestToken {
+        IngestToken {
+            name: name.to_string(),
+            token: secret.to_string(),
+            tags: tags
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
+    /// The whole point of a token, and its whole limit: a machine with no
+    /// browser and no session can submit a result, and can do nothing else.
+    #[tokio::test]
+    async fn an_ingest_token_submits_without_a_session_and_reads_nothing() {
+        let dir = std::env::temp_dir().join(format!("lbf-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.ingest.tokens = vec![token("deploy", "s3cret", &[])];
+        let state = state_for(&config);
+
+        let sent = post_token(&state, &a_later_run(serde_json::json!({})), "s3cret").await;
+        assert_eq!(sent.status, StatusCode::OK, "{}", sent.body);
+        assert_eq!(sent.json()["outcome"], "added");
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 1);
+
+        // It is accepted on the upload route and nowhere else. This is what
+        // makes "may write, may not read" a property of the code rather than
+        // an intention: no reading endpoint looks at the header at all.
+        for path in ["/api/snapshot", "/api/me", "/api/machine/anything"] {
+            let read = get_token(&state, path, "s3cret").await;
+            assert_eq!(
+                read.status,
+                StatusCode::UNAUTHORIZED,
+                "{path} answered {}",
+                read.status
+            );
+        }
+
+        // An unknown token is named as one, because the caller is a script and
+        // "your credential is wrong" is the entire diagnosis.
+        let wrong = post_token(&state, &a_later_run(serde_json::json!({})), "s3crev").await;
+        assert_eq!(wrong.status, StatusCode::UNAUTHORIZED, "{}", wrong.body);
+        assert!(wrong.body.contains("ingest token"), "{}", wrong.body);
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir").count(),
+            1,
+            "nothing refused may reach the disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A revoked token must stop working, including in a browser that is
+    /// signed in as somebody who could have uploaded anyway. Falling back to
+    /// the cookie would hide the revocation for as long as the session lasted.
+    #[tokio::test]
+    async fn a_bad_token_is_fatal_rather_than_a_reason_to_try_the_cookie() {
+        let dir = std::env::temp_dir().join(format!("lbf-tokenfall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.ingest.tokens = vec![token("deploy", "s3cret", &[])];
+        let state = state_for(&config);
+        let admin = session(&state, Role::Admin, &[]);
+
+        let both = post_as(
+            &state,
+            "/api/upload",
+            "application/json",
+            &a_later_run(serde_json::json!({})),
+            Some(&admin),
+            Some("revoked"),
+        )
+        .await;
+        assert_eq!(both.status, StatusCode::UNAUTHORIZED, "{}", both.body);
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same `scopes_allow` as a person gets, reached the same way — a
+    /// token is a principal, not a second authorization path.
+    #[tokio::test]
+    async fn a_scoped_token_cannot_submit_another_sites_result() {
+        let dir = std::env::temp_dir().join(format!("lbf-tokenscope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.ingest.tokens = vec![token("glasgow", "s3cret", &[("site", "glasgow")])];
+        let state = state_for(&config);
+
+        let elsewhere = post_token(
+            &state,
+            &a_later_run(serde_json::json!({ "site": "edinburgh" })),
+            "s3cret",
+        )
+        .await;
+        assert_eq!(
+            elsewhere.status,
+            StatusCode::FORBIDDEN,
+            "{}",
+            elsewhere.body
+        );
+
+        let mine = post_token(
+            &state,
+            &a_later_run(serde_json::json!({ "site": "glasgow" })),
+            "s3cret",
+        )
+        .await;
+        assert_eq!(mine.status, StatusCode::OK, "{}", mine.body);
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two bearer credentials exist, and they are not each other. A metrics
+    /// scrape token must not become a way to write to the collection folder.
+    #[tokio::test]
+    async fn a_metrics_token_is_not_an_ingest_token() {
+        let dir = std::env::temp_dir().join(format!("lbf-tokenmix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.metrics.enabled = true;
+        config.metrics.token = "scrape-me".into();
+        config.ingest.tokens = vec![token("deploy", "s3cret", &[])];
+        let state = state_for(&config);
+
+        let sent = post_token(&state, &a_later_run(serde_json::json!({})), "scrape-me").await;
+        assert_eq!(sent.status, StatusCode::UNAUTHORIZED, "{}", sent.body);
+        // Nor the other way about.
+        assert_eq!(
+            get_token(&state, "/metrics", "s3cret").await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_token(&state, "/metrics", "scrape-me").await.status,
+            StatusCode::OK
+        );
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A credential in a loop is the failure this exists for: it costs disk
+    /// rather than secrecy, so the answer is "later", with a header saying how
+    /// much later and prose saying that coming back is safe.
+    #[tokio::test]
+    async fn a_credential_submitting_too_fast_is_told_when_to_come_back() {
+        let dir = std::env::temp_dir().join(format!("lbf-tokenrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.server.upload_limit_per_minute = 1;
+        config.metrics.enabled = true;
+        config.ingest.tokens = vec![token("deploy", "s3cret", &[])];
+        let state = state_for(&config);
+
+        let first = post_token(&state, &a_later_run(serde_json::json!({})), "s3cret").await;
+        assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+
+        let second = post_token(
+            &state,
+            &a_later_run(serde_json::json!({ "site": "glasgow" })),
+            "s3cret",
+        )
+        .await;
+        assert_eq!(
+            second.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{}",
+            second.body
+        );
+        assert_eq!(
+            second.header(header::RETRY_AFTER).as_deref(),
+            Some("60"),
+            "one a minute means a minute"
+        );
+        assert!(
+            second.body.contains("idempotent"),
+            "a client that stops retrying loses the result: {}",
+            second.body
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir").count(),
+            1,
+            "the refused submission is not written, parsed or indexed"
+        );
+
+        // The limit belongs to the credential, not to the endpoint: a person
+        // uploading is not held up by somebody else's runaway script.
+        let admin = session(&state, Role::Admin, &[]);
+        let theirs = post_body(
+            &state,
+            "/api/upload",
+            "application/json",
+            &a_later_run(serde_json::json!({ "site": "glasgow" })),
+            Some(&admin),
+        )
+        .await;
+        assert_eq!(theirs.status, StatusCode::OK, "{}", theirs.body);
+
+        // And an operator can see it happening without reading the log.
+        let scrape = get(&state, "/metrics", None).await.body;
+        assert!(
+            scrape.contains("loadbearer_fleet_uploads_total 2"),
+            "{scrape}"
+        );
+        assert!(
+            scrape.contains("loadbearer_fleet_uploads_rate_limited_total 1"),
+            "{scrape}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

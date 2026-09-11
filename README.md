@@ -261,6 +261,42 @@ named from the *document*, never from the request. The
 [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API#submitting-a-result)
 page has the whole of it, including `POST /api/upload` for scripting.
 
+**A machine with nobody at it uses an ingest token.** A person uploading
+through the dashboard covers the laptop somebody emailed you a result from; it
+does not cover a deployment tool running overnight. For that, name a bearer
+credential:
+
+```toml
+[[ingest.tokens]]
+name = "deployment-tool"
+token = "<openssl rand -hex 32>"
+# tags = { site = "glasgow" }   # optional: what it may submit for
+```
+
+```bash
+curl -sS https://fleet.example.com/api/upload \
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: application/json' \
+  --data-binary @result.json
+```
+
+**A token may write and may not read.** It is accepted on the upload endpoint
+and nowhere else — every other route wants a session, and none of them so much
+as looks at an `Authorization` header — so a credential sitting in a
+deployment script cannot be used to enumerate the estate. It is a contributor
+and cannot be configured into anything else, its optional `tags` scope it the
+same way a grant scopes a person, and revoking it is deleting the entry and
+restarting. Nothing in loadbearer itself sends one: what runs the benchmark and
+what is trusted to publish its results are deliberately different things.
+
+**And one credential can only write so fast.** `upload_limit_per_minute` (120
+by default, zero for none) caps submissions per person and per token, and a
+refusal is a `429` carrying a `Retry-After` — which is safe to act on, because
+ingest is idempotent by content, so a resend of something that did land is
+answered `already indexed`. It is a safety valve rather than a defence: what it
+stops is a script retrying on a timer somebody misread, or a leaked token
+filling the disk 40 KB at a time.
+
 **The folder is the source of truth.** The index is a derived read model, so
 deleting it costs a rescan and nothing else — which is why its shape can change
 freely and why there is nothing to migrate. That holds only as far as your
@@ -592,6 +628,10 @@ does:
 | `viewer` | Read the dashboard |
 | `contributor` | …and submit results to it |
 | `admin` | …and trigger a rescan |
+
+An [ingest token](#when-a-machine-cannot-reach-the-share) is a `contributor`
+that never gets the first row: it may submit and it may not read, because the
+only endpoint that accepts one is the one it submits to.
 
 The most privileged matching grant wins; scopes are the union of the matching
 grants at that role, so somebody in two site groups sees both sites. Someone who

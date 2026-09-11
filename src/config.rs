@@ -37,6 +37,13 @@ use time::macros::format_description;
 /// nobody filled in.
 const PLACEHOLDER: &str = "PUT-";
 
+/// The shortest ingest token this will accept.
+///
+/// 32 hex characters is 128 bits, which is the point at which guessing stops
+/// being a strategy. The refusal names the command that produces one, because
+/// a length rule without a way to satisfy it just gets worked around.
+const MIN_INGEST_TOKEN_LEN: usize = 32;
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -47,7 +54,39 @@ pub struct Config {
     #[serde(default)]
     pub metrics: Metrics,
     #[serde(default)]
+    pub ingest: Ingest,
+    #[serde(default)]
     pub log: Log,
+}
+
+/// Machines submitting their own results, without a person and without a share.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ingest {
+    #[serde(default)]
+    pub tokens: Vec<IngestToken>,
+}
+
+/// One credential a deployment tool can post a result with.
+///
+/// **A token may write and may not read.** It is accepted on the upload
+/// endpoint and nowhere else, so a credential sitting in a deployment script
+/// cannot be used to enumerate the estate — which is the difference between
+/// leaking a write path and leaking the fleet.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestToken {
+    /// What this token is for, in the log and against every run it submits.
+    /// Names are unique, so revoking one is unambiguous.
+    pub name: String,
+    /// The secret itself. Generate it rather than inventing it:
+    /// `openssl rand -hex 32`.
+    pub token: String,
+    /// Optional, and it means what the same key means on a grant: this token
+    /// may only submit results carrying these tags. Absent means the whole
+    /// fleet.
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -96,6 +135,22 @@ pub struct Server {
     /// uploader sent.
     #[serde(default)]
     pub upload_dir: Option<PathBuf>,
+    /// The most results one credential may submit per minute. Zero is no
+    /// limit.
+    ///
+    /// A safety valve rather than a defence: what it stops is a script
+    /// retrying on a timer somebody misread, or a leaked token filling a disk
+    /// 40 KB at a time. It is counted per principal — a person's subject or a
+    /// token's name — because behind a reverse proxy every request arrives
+    /// from the proxy, so an address-keyed limit would be one bucket for the
+    /// whole world.
+    ///
+    /// Idle time banks up to a minute's worth, so a rollout that submits for
+    /// two thousand machines at nine o'clock gets the first minute's worth at
+    /// once and the rest at the sustained rate, each told when to come back.
+    /// Resending is safe: ingest is idempotent by content.
+    #[serde(default = "upload_limit_per_minute")]
+    pub upload_limit_per_minute: u32,
     /// How often to rescan the folder by itself. Zero switches it off and
     /// leaves rescanning to the button.
     ///
@@ -108,6 +163,10 @@ pub struct Server {
 
 fn scan_interval_minutes() -> u64 {
     15
+}
+
+fn upload_limit_per_minute() -> u32 {
+    120
 }
 
 /// Prometheus metrics, off unless asked for.
@@ -191,6 +250,7 @@ impl Default for Server {
             index: PathBuf::from("fleet-index.db"),
             archive_dir: None,
             upload_dir: None,
+            upload_limit_per_minute: upload_limit_per_minute(),
             scan_interval_minutes: scan_interval_minutes(),
         }
     }
@@ -463,6 +523,41 @@ impl Config {
             }
         }
 
+        // Ingest tokens are bearer credentials reachable from every machine in
+        // the estate, so the weak ones are refused rather than warned about.
+        let mut named: Vec<&str> = Vec::new();
+        for t in &self.ingest.tokens {
+            if t.name.trim().is_empty() {
+                bail!("an [[ingest.tokens]] entry has no name; the name is what you revoke");
+            }
+            check_placeholder(&format!("ingest.tokens.{}.token", t.name), &t.token)?;
+            if t.token.len() < MIN_INGEST_TOKEN_LEN {
+                bail!(
+                    "the ingest token {:?} is {} characters; {} is the minimum. It is a bearer \
+                     credential that lets a machine write to the fleet, so generate one rather \
+                     than choosing it: openssl rand -hex 32",
+                    t.name,
+                    t.token.len(),
+                    MIN_INGEST_TOKEN_LEN
+                );
+            }
+            if named.contains(&t.name.as_str()) {
+                bail!(
+                    "two [[ingest.tokens]] entries are both named {:?}; revoking one would be \
+                     ambiguous, and so would the provenance on everything they submit",
+                    t.name
+                );
+            }
+            named.push(&t.name);
+        }
+        if !self.ingest.tokens.is_empty() && self.server.upload_dir.is_none() {
+            bail!(
+                "{} ingest token(s) are configured but there is no server.upload_dir, so nothing \
+                 can be submitted. Set one inside the collection folder, or remove the tokens.",
+                self.ingest.tokens.len()
+            );
+        }
+
         if self.auth.mode == AuthMode::None {
             if !self.auth.grants.is_empty() {
                 // Silently ignoring the grants would look like they applied.
@@ -588,6 +683,21 @@ index = "fleet-index.db"
 #
 # upload_dir = 'PUT-THE-PATH-FOR-UPLOADED-RESULTS-HERE'
 
+# The most results one credential may submit per minute. Zero is no limit.
+#
+# A safety valve rather than a defence: it stops a script retrying on a timer
+# somebody misread, or a leaked token filling the disk 40 KB at a time. Counted
+# per person or per token, never per address - behind a reverse proxy every
+# request arrives from the proxy, so an address is either everybody or whatever
+# the caller claims.
+#
+# Idle time banks up to a minute's worth, so a rollout for two thousand
+# machines at nine o'clock gets the first minute's worth at once and the rest
+# at the sustained rate, each refusal saying when to come back. Retrying is
+# safe: ingest is idempotent by content, so a document that did land is
+# answered as already indexed rather than stored twice.
+upload_limit_per_minute = 120
+
 # How often to re-read the collection folder by itself. This is what makes it a
 # service rather than a command: a dashboard that only refreshes when somebody
 # happens to click is out of date exactly when nobody is looking at it. Zero
@@ -709,6 +819,31 @@ role = "viewer"   # read the dashboard
 # [[auth.grants]]
 # group = "PUT-THE-OBJECT-ID-OF-THE-GLASGOW-DESKTOP-TEAM-HERE"
 # role = "viewer"
+# tags = { site = "glasgow" }
+
+# Machines that submit their own results, with no person and no share.
+#
+# A token is a bearer credential: whatever runs loadbearer sends it as
+# "Authorization: Bearer <token>" to POST /api/upload. It may write and may not
+# read - it is accepted on that endpoint and nowhere else - so a credential
+# sitting in a deployment script cannot be used to enumerate the estate.
+#
+# Generate one, do not invent one:  openssl rand -hex 32
+# Anything shorter than 32 characters is refused at startup.
+#
+# Needs upload_dir set above: tokens with nowhere to put a result are refused
+# at startup rather than at the first submission. To revoke, delete the entry
+# and restart. The name is what appears against everything it submitted, so it
+# is what you go looking for afterwards.
+#
+# [[ingest.tokens]]
+# name = "deployment-tool"
+# token = "PUT-A-GENERATED-INGEST-TOKEN-HERE"
+#
+# Optional, and it means what the same key means on a grant: this token may
+# only submit results carrying these tags, and loadbearer has to be run with
+# the matching --tag. Absent means the whole fleet.
+#
 # tags = { site = "glasgow" }
 "##;
         example.to_string()
@@ -1095,6 +1230,77 @@ mod tests {
             .expect_err("refused")
             .to_string();
         assert!(err.contains("no server.collection_dir"), "{err}");
+    }
+
+    /// A bearer credential every machine in the estate holds is worth being
+    /// unfriendly about at load time, because every one of these fails later
+    /// as something that looks like a different problem.
+    #[test]
+    fn a_weak_or_ambiguous_ingest_token_is_refused_at_load() {
+        let with = |tokens: Vec<IngestToken>, upload: Option<&str>| Config {
+            server: Server {
+                collection_dir: Some(PathBuf::from("/srv/collection")),
+                upload_dir: upload.map(PathBuf::from),
+                ..Server::default()
+            },
+            ingest: Ingest { tokens },
+            ..Config::default()
+        };
+        let tok = |name: &str, secret: &str| IngestToken {
+            name: name.to_string(),
+            token: secret.to_string(),
+            tags: BTreeMap::new(),
+        };
+        let good = "0123456789abcdef0123456789abcdef";
+        let uploads = Some("/srv/collection/uploaded");
+
+        assert!(
+            with(vec![tok("deployment-tool", good)], uploads)
+                .validate()
+                .is_ok()
+        );
+
+        let err = with(vec![tok("", good)], uploads)
+            .validate()
+            .expect_err("a token you cannot name is a token you cannot revoke")
+            .to_string();
+        assert!(err.contains("no name"), "{err}");
+
+        let err = with(vec![tok("deployment-tool", "hunter2")], uploads)
+            .validate()
+            .expect_err("a chosen token is a guessable one")
+            .to_string();
+        assert!(err.contains("7 characters"), "{err}");
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "a length rule with no way to satisfy it gets worked around: {err}"
+        );
+
+        let err = with(
+            vec![tok("deployment-tool", good), tok("deployment-tool", good)],
+            uploads,
+        )
+        .validate()
+        .expect_err("two tokens of one name")
+        .to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+
+        let err = with(
+            vec![tok("deployment-tool", "PUT-A-GENERATED-TOKEN-HERE")],
+            uploads,
+        )
+        .validate()
+        .expect_err("the starter file's own placeholder")
+        .to_string();
+        assert!(err.contains("placeholder"), "{err}");
+
+        // Tokens with nowhere to put a result: every submission would be a 400
+        // about a setting the person holding the token cannot see.
+        let err = with(vec![tok("deployment-tool", good)], None)
+            .validate()
+            .expect_err("refused")
+            .to_string();
+        assert!(err.contains("no server.upload_dir"), "{err}");
     }
 
     #[test]

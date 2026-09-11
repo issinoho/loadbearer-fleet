@@ -414,6 +414,7 @@ mod tests {
                 index: "i.db".into(),
                 archive_dir: Some("archive".into()),
                 upload_dir: Some("collection/uploaded".into()),
+                upload_limit_per_minute: 120,
                 scan_interval_minutes: 15,
             },
             auth: crate::config::Auth {
@@ -435,6 +436,13 @@ mod tests {
                 enabled: true,
                 token: "t".into(),
             },
+            ingest: crate::config::Ingest {
+                tokens: vec![crate::config::IngestToken {
+                    name: "deployment-tool".into(),
+                    token: "t".into(),
+                    tags: Default::default(),
+                }],
+            },
             log: crate::config::Log {
                 format: crate::config::LogFormat::Text,
                 level: "info".into(),
@@ -453,13 +461,18 @@ mod tests {
         keys(&starter, "", &mut have);
 
         // A commented-out optional key is still documented, so check the text
-        // as well as the parsed table.
+        // as well as the parsed table. An array of tables is documented by its
+        // own header rather than by an assignment — and it has to be, because
+        // a `tokens = []` sitting above a commented `[[ingest.tokens]]` is a
+        // TOML error the moment somebody uncomments it.
         let text = Config::starter();
         let undocumented: Vec<&String> = want
             .iter()
             .filter(|k| {
                 let leaf = k.rsplit('.').next().unwrap();
-                !have.contains(k) && !text.contains(&format!("{leaf} ="))
+                !have.contains(k)
+                    && !text.contains(&format!("{leaf} ="))
+                    && !text.contains(&format!("[[{k}]]"))
             })
             .collect();
         assert!(

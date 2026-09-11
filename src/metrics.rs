@@ -40,6 +40,8 @@ pub struct Runtime {
     pub started: OffsetDateTime,
     pub scans_total: u64,
     pub scan_failures_total: u64,
+    pub uploads_total: u64,
+    pub uploads_limited_total: u64,
     pub last_scan: Option<ScanStamp>,
 }
 
@@ -49,6 +51,8 @@ impl Runtime {
             started: OffsetDateTime::now_utc(),
             scans_total: 0,
             scan_failures_total: 0,
+            uploads_total: 0,
+            uploads_limited_total: 0,
             last_scan: None,
         }
     }
@@ -267,6 +271,18 @@ pub fn render(snapshot: &Snapshot, runtime: &Runtime, now: OffsetDateTime) -> St
          than an unreadable file.",
         runtime.scan_failures_total as f64,
     );
+    out.counter(
+        "uploads_total",
+        "Results accepted through the upload endpoint since startup, whether they were new or \
+         already indexed.",
+        runtime.uploads_total as f64,
+    );
+    out.counter(
+        "uploads_rate_limited_total",
+        "Submissions refused for going too fast. Steadily above zero means a client in a loop \
+         or a credential worth revoking — nothing here is a normal occurrence.",
+        runtime.uploads_limited_total as f64,
+    );
     if let Some(scan) = &runtime.last_scan {
         out.gauge(
             "scan_last_success_timestamp_seconds",
@@ -328,6 +344,8 @@ mod tests {
             started: now() - Duration::hours(3),
             scans_total: 12,
             scan_failures_total: 1,
+            uploads_total: 7,
+            uploads_limited_total: 0,
             last_scan: Some(ScanStamp {
                 at: now() - Duration::minutes(5),
                 seen: 3,

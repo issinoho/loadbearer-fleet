@@ -16,6 +16,7 @@ mod compare;
 mod config;
 mod index;
 mod metrics;
+mod ratelimit;
 mod reference;
 mod report;
 mod schema;

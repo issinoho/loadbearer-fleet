@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 
-use crate::config::{Auth as AuthConfig, AuthMode, Config, Entitlement, Role};
+use crate::config::{Auth as AuthConfig, AuthMode, Config, Entitlement, IngestToken, Role};
 use crate::report::Report;
 use crate::web::AppState;
 
@@ -694,6 +694,134 @@ impl FromRequestParts<Arc<AppState>> for Caller {
                     .unwrap_or_else(|| "/".into()),
             }),
         }
+    }
+}
+
+/// Compare a presented credential without leaking, through timing, how much of
+/// it was right.
+///
+/// Digesting both sides first means the comparison runs over 32 bytes of hash
+/// whatever the inputs were, so neither the length nor any prefix of the real
+/// token is recoverable from how long the answer took.
+pub(crate) fn token_matches(presented: &str, configured: &str) -> bool {
+    Sha256::digest(presented.as_bytes()) == Sha256::digest(configured.as_bytes())
+}
+
+/// The token from an `Authorization: Bearer` header, if there is one.
+pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+/// The credentials machines submit results with.
+///
+/// Kept beside the session code on purpose. A service with two ways in wants
+/// both of them in the module somebody would think to audit, rather than one
+/// here and one wherever the endpoint happens to live.
+pub struct IngestTokens {
+    tokens: Vec<IngestToken>,
+}
+
+impl IngestTokens {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            tokens: config.ingest.tokens.clone(),
+        }
+    }
+
+    /// The principal a token stands for, or `None` if it is not one of ours.
+    ///
+    /// Every configured token is compared, including after a match, so the
+    /// answer takes the same time whether the presented secret is first in the
+    /// list, last, or absent from it.
+    fn lookup(&self, presented: &str) -> Option<Principal> {
+        let mut found = None;
+        for t in &self.tokens {
+            if token_matches(presented, &t.token) {
+                found = Some(t);
+            }
+        }
+        let t = found?;
+        Some(Principal {
+            // Namespaced, so a token can never collide with a subject the
+            // identity provider issued, and so `uploaded_by` on the run reads
+            // as what it was rather than as a person.
+            subject: format!("token:{}", t.name),
+            name: t.name.clone(),
+            email: None,
+            // Fixed rather than configurable. A credential sitting in a
+            // deployment script exists to submit results; an administrator is
+            // a person, and stays one.
+            role: Role::Contributor,
+            scopes: if t.tags.is_empty() {
+                Vec::new()
+            } else {
+                vec![t.tags.clone()]
+            },
+            authenticated: true,
+        })
+    }
+}
+
+/// Extractor for something entitled to *submit* a result: a person with a
+/// session, or a machine with an ingest token.
+///
+/// This is the only extractor that accepts a token, which is what makes "a
+/// token may write and may not read" true rather than merely intended — every
+/// reading endpoint takes [`Caller`], and [`Caller`] never looks at an
+/// `Authorization` header. A token presented to `/api/snapshot` is not a
+/// session, so it is a 401.
+///
+/// **A bearer token is tried first, and a bad one is fatal rather than a
+/// reason to go and look at the cookie.** Falling through would mean a script
+/// whose token had been revoked carried on working from whatever browser
+/// session happened to be alongside it, which is the kind of failure that is
+/// discovered months later by somebody else.
+pub struct Submitter(pub Principal);
+
+/// Why a submission was not accepted, before anything about the body is read.
+pub enum NotASubmitter {
+    BadToken,
+    NoSession(NotSignedIn),
+}
+
+impl IntoResponse for NotASubmitter {
+    fn into_response(self) -> Response {
+        match self {
+            // Named as the token rather than as "unauthorized", because the
+            // caller is a script and the distinction between "my credential is
+            // wrong" and "I am not signed in" is the whole diagnosis.
+            Self::BadToken => (
+                StatusCode::UNAUTHORIZED,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"that ingest token is not one this server knows"}"#,
+            )
+                .into_response(),
+            Self::NoSession(no) => no.into_response(),
+        }
+    }
+}
+
+impl FromRequestParts<Arc<AppState>> for Submitter {
+    type Rejection = NotASubmitter;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(presented) = bearer(&parts.headers) {
+            return match state.ingest().lookup(presented) {
+                Some(principal) => Ok(Submitter(principal)),
+                None => Err(NotASubmitter::BadToken),
+            };
+        }
+        let Caller(principal) = Caller::from_request_parts(parts, state)
+            .await
+            .map_err(NotASubmitter::NoSession)?;
+        Ok(Submitter(principal))
     }
 }
 
@@ -1392,6 +1520,67 @@ mod tests {
 
     /// Where sign-in is switched off there is still exactly one authorization
     /// path — the caller is simply a local administrator.
+    fn one_token(name: &str, secret: &str, tags: &[(&str, &str)]) -> IngestTokens {
+        IngestTokens {
+            tokens: vec![IngestToken {
+                name: name.to_string(),
+                token: secret.to_string(),
+                tags: tags
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn an_ingest_token_is_a_contributor_named_after_itself() {
+        let list = one_token("deploy", "s3cret", &[]);
+        let p = list.lookup("s3cret").expect("a known token");
+        assert_eq!(p.role, Role::Contributor);
+        assert!(p.may_upload());
+        assert!(!p.may_rescan(), "a script is not an administrator");
+        assert_eq!(
+            p.subject, "token:deploy",
+            "namespaced, so it can never collide with a subject the provider issued"
+        );
+        assert!(p.scopes.is_empty(), "no tags means the whole fleet");
+        assert!(p.authenticated);
+    }
+
+    #[test]
+    fn a_tokens_tags_become_its_scope() {
+        let list = one_token("glasgow", "s3cret", &[("site", "glasgow")]);
+        let p = list.lookup("s3cret").expect("a known token");
+        assert_eq!(p.scopes.len(), 1);
+        assert_eq!(p.scopes[0]["site"], "glasgow");
+    }
+
+    #[test]
+    fn an_unknown_token_is_nobody() {
+        let list = one_token("deploy", "s3cret", &[]);
+        assert!(list.lookup("s3crev").is_none());
+        assert!(list.lookup("s3cret ").is_none());
+        assert!(list.lookup("").is_none(), "and neither is an empty one");
+        assert!(
+            IngestTokens { tokens: Vec::new() }.lookup("").is_none(),
+            "least of all against a server with no tokens configured"
+        );
+    }
+
+    #[test]
+    fn a_bearer_header_is_read_only_as_a_bearer_header() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(bearer(&headers), None);
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
+        assert_eq!(bearer(&headers), None, "a different scheme is not a token");
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer abc"),
+        );
+        assert_eq!(bearer(&headers), Some("abc"));
+    }
+
     #[test]
     fn local_access_is_an_unauthenticated_administrator() {
         let p = Principal::local();
