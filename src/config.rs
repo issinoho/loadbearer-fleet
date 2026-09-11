@@ -288,10 +288,17 @@ pub struct Grant {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+/// **The order of these variants is the order of privilege**, because
+/// `resolve` takes the `max()` of a caller's matching grants. Sorting them
+/// alphabetically, or inserting one in the wrong place, silently changes who
+/// is allowed what — which is why a test pins the order rather than trusting
+/// it to be obvious.
 pub enum Role {
     /// Read the dashboard.
     Viewer,
-    /// Read the dashboard, and trigger a rescan.
+    /// Read the dashboard, and submit results to it.
+    Contributor,
+    /// Read the dashboard, submit results, and trigger a rescan.
     Admin,
 }
 
@@ -299,6 +306,7 @@ impl Role {
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Viewer => "viewer",
+            Role::Contributor => "contributor",
             Role::Admin => "admin",
         }
     }
@@ -628,6 +636,14 @@ role = "admin"    # read the dashboard, and trigger a rescan
 group = "PUT-THE-GROUP-YOUR-FLEET-VIEWERS-ARE-IN-HERE"
 role = "viewer"   # read the dashboard
 
+# The three roles nest: a contributor does everything a viewer does and may
+# also submit results; an admin does everything a contributor does and may also
+# trigger a rescan.
+#
+# [[auth.grants]]
+# group = "PUT-THE-GROUP-THAT-MAY-SUBMIT-RESULTS-HERE"
+# role = "contributor"
+
 # A team that should only see its own site. Tags come from loadbearer's --tag,
 # so this only means anything if your deployment tool sets them.
 #
@@ -942,6 +958,48 @@ mod tests {
         assert_eq!(e.role, Role::Admin);
         assert_eq!(e.scopes.len(), 1);
         assert_eq!(e.scopes[0]["site"], "glasgow");
+    }
+
+    /// **The declaration order of `Role` is the order of privilege**, because
+    /// `resolve` takes `max()` of the matching grants. Nothing in the type
+    /// system says so, and nothing about reading the enum makes it obvious —
+    /// somebody tidying it alphabetically would demote every admin to below a
+    /// contributor and no other test would notice.
+    #[test]
+    fn the_role_order_is_the_privilege_order() {
+        assert!(Role::Viewer < Role::Contributor);
+        assert!(Role::Contributor < Role::Admin);
+
+        // And the thing that order is *for*: two grants, the stronger wins.
+        let auth = auth_with(vec![
+            grant("readers", Role::Viewer, &[]),
+            grant("submitters", Role::Contributor, &[]),
+        ]);
+        let e = auth
+            .resolve(&["readers".into(), "submitters".into()])
+            .expect("matches");
+        assert_eq!(e.role, Role::Contributor);
+    }
+
+    /// The role names are a published interface: they are what somebody writes
+    /// in `fleet.toml`, so renaming one breaks every deployment silently.
+    #[test]
+    fn role_names_round_trip_through_the_config_file() {
+        for (text, role) in [
+            ("viewer", Role::Viewer),
+            ("contributor", Role::Contributor),
+            ("admin", Role::Admin),
+        ] {
+            let parsed: Role = toml::from_str::<toml::Value>(&format!("r = \"{text}\""))
+                .expect("toml")
+                .get("r")
+                .cloned()
+                .expect("key")
+                .try_into()
+                .expect("a role");
+            assert_eq!(parsed, role);
+            assert_eq!(role.as_str(), text);
+        }
     }
 
     #[test]

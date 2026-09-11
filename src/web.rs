@@ -1183,6 +1183,46 @@ mod tests {
         }
     }
 
+    /// A contributor sits between the two: everything a viewer can do, plus
+    /// submitting results, and nothing an administrator can.
+    #[tokio::test]
+    async fn a_contributor_may_read_and_upload_but_not_rescan() {
+        let state = state_for(&oidc_config());
+        let cookie = session(&state, Role::Contributor, &[]);
+
+        assert_eq!(
+            get(&state, "/api/snapshot", Some(&cookie)).await.status,
+            StatusCode::OK
+        );
+
+        let me = get(&state, "/api/me", Some(&cookie)).await.json();
+        assert_eq!(me["role"], "contributor");
+        assert_eq!(me["may_upload"], true);
+        assert_eq!(me["may_rescan"], false);
+
+        assert_eq!(
+            request(&state, Method::POST, "/api/rescan", Some(&cookie))
+                .await
+                .status,
+            StatusCode::FORBIDDEN,
+            "submitting a result is not administering the server"
+        );
+
+        // And the two that bracket it, so the ordering is asserted through the
+        // API rather than only against the enum.
+        let viewer = session(&state, Role::Viewer, &[]);
+        assert_eq!(
+            get(&state, "/api/me", Some(&viewer)).await.json()["may_upload"],
+            false
+        );
+        let admin = session(&state, Role::Admin, &[]);
+        assert_eq!(
+            get(&state, "/api/me", Some(&admin)).await.json()["may_upload"],
+            true,
+            "an administrator inherits what a contributor may do"
+        );
+    }
+
     #[tokio::test]
     async fn an_admin_may_rescan() {
         let state = state_for(&oidc_config());

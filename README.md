@@ -545,6 +545,15 @@ role = "viewer"    # read only
 tags = { site = "glasgow" }   # and only the machines tagged this way
 ```
 
+There are three roles and they nest — each does everything the one above it
+does:
+
+| | |
+| --- | --- |
+| `viewer` | Read the dashboard |
+| `contributor` | …and submit results to it |
+| `admin` | …and trigger a rescan |
+
 The most privileged matching grant wins; scopes are the union of the matching
 grants at that role, so somebody in two site groups sees both sites. Someone who
 authenticates but matches no grant is refused rather than shown an empty

@@ -137,6 +137,14 @@ impl Principal {
     pub fn may_rescan(&self) -> bool {
         self.role == Role::Admin
     }
+
+    /// Submitting a result is a write to the source of truth, so it sits above
+    /// reading and below administering. Expressed as `>=` rather than a list
+    /// of variants, so a role added above `Contributor` later inherits it
+    /// instead of silently not.
+    pub fn may_upload(&self) -> bool {
+        self.role >= Role::Contributor
+    }
 }
 
 struct Session {
@@ -980,11 +988,13 @@ pub struct Me {
     /// honestly instead of showing a Sign out button that does nothing.
     sign_in_enabled: bool,
     may_rescan: bool,
+    may_upload: bool,
 }
 
 pub async fn me(State(app): State<Arc<AppState>>, Caller(principal): Caller) -> axum::Json<Me> {
     axum::Json(Me {
         may_rescan: principal.may_rescan(),
+        may_upload: principal.may_upload(),
         sign_in_enabled: app.auth().enabled(),
         principal,
     })

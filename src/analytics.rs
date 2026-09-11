@@ -1062,6 +1062,26 @@ pub struct Filter {
     pub scopes: Vec<BTreeMap<String, String>>,
 }
 
+/// Whether a set of tags falls inside any of these scopes.
+///
+/// The one place this question is answered. A caller's scope decides what they
+/// may *read* — it is ANDed into the `Filter` a snapshot is projected through —
+/// and the same rule decides what they may *write*, so a contributor scoped to
+/// one site cannot submit a result claiming to be from another. Two
+/// implementations of that sentence would eventually disagree, and the
+/// disagreement would be a security bug rather than a rendering one.
+///
+/// Empty scopes mean the whole fleet, matching every other use of `scopes` in
+/// the codebase. A scoped caller and an *untagged* machine never match: if
+/// authority is defined by a tag, something carrying no tags cannot be shown to
+/// be theirs.
+pub fn scopes_allow(scopes: &[BTreeMap<String, String>], tags: &BTreeMap<String, String>) -> bool {
+    scopes.is_empty()
+        || scopes
+            .iter()
+            .any(|scope| scope.iter().all(|(k, v)| tags.get(k) == Some(v)))
+}
+
 impl Filter {
     fn matches(&self, m: &MachineView, flagged: &HashSet<&str>) -> bool {
         if let Some(days) = self.max_age_days
@@ -1082,12 +1102,7 @@ impl Filter {
                 return false;
             }
         }
-        if !self.scopes.is_empty()
-            && !self
-                .scopes
-                .iter()
-                .any(|scope| scope.iter().all(|(k, v)| m.tags.get(k) == Some(v)))
-        {
+        if !scopes_allow(&self.scopes, &m.tags) {
             return false;
         }
         if let Some(q) = &self.search {
