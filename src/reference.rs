@@ -413,6 +413,7 @@ mod tests {
                 collection_dir: Some("collection".into()),
                 index: "i.db".into(),
                 archive_dir: Some("archive".into()),
+                upload_dir: Some("collection/uploaded".into()),
                 scan_interval_minutes: 15,
             },
             auth: crate::config::Auth {

@@ -78,6 +78,24 @@ pub struct Server {
     /// once.
     #[serde(default)]
     pub archive_dir: Option<PathBuf>,
+    /// Where results submitted through the dashboard are written.
+    ///
+    /// Unset switches uploading off entirely, whatever anybody's role says —
+    /// a server that has not been given somewhere to put a result cannot be
+    /// persuaded to accept one.
+    ///
+    /// **It has to sit inside the collection folder**, and is refused at load
+    /// if it does not. The whole design rests on that folder being the source
+    /// of truth and the index being derived from it, so an upload stored
+    /// anywhere else would exist only in the index — and the rescan this
+    /// documentation calls safe would silently destroy it. Inside the folder,
+    /// an uploaded run is an ordinary result file that any rebuild finds
+    /// again.
+    ///
+    /// Files are named by the SHA-256 of their contents, never by anything the
+    /// uploader sent.
+    #[serde(default)]
+    pub upload_dir: Option<PathBuf>,
     /// How often to rescan the folder by itself. Zero switches it off and
     /// leaves rescanning to the button.
     ///
@@ -172,6 +190,7 @@ impl Default for Server {
             collection_dir: None,
             index: PathBuf::from("fleet-index.db"),
             archive_dir: None,
+            upload_dir: None,
             scan_interval_minutes: scan_interval_minutes(),
         }
     }
@@ -377,6 +396,7 @@ impl Config {
             .as_deref()
             .map(|p| beside(base, p));
         self.server.archive_dir = self.server.archive_dir.as_deref().map(|p| beside(base, p));
+        self.server.upload_dir = self.server.upload_dir.as_deref().map(|p| beside(base, p));
         self.log.file = self.log.file.as_deref().map(|p| beside(base, p));
         self.auth.ca_bundle = self.auth.ca_bundle.as_deref().map(|p| beside(base, p));
     }
@@ -415,8 +435,33 @@ impl Config {
             self.server.collection_dir.as_deref(),
         )?;
         check_placeholder_path("server.archive_dir", self.server.archive_dir.as_deref())?;
+        check_placeholder_path("server.upload_dir", self.server.upload_dir.as_deref())?;
         check_placeholder_path("log.file", self.log.file.as_deref())?;
         check_placeholder_path("auth.ca_bundle", self.auth.ca_bundle.as_deref())?;
+
+        // An upload has to become a file the next scan will find, or it lives
+        // only in the index — and this documentation tells people the index is
+        // safe to delete. Refusing here is the difference between a rule and a
+        // hope.
+        if let Some(upload) = &self.server.upload_dir {
+            match &self.server.collection_dir {
+                None => bail!(
+                    "server.upload_dir is set to {} but there is no server.collection_dir. An \
+                     uploaded result has to land in the folder that gets scanned, or it exists \
+                     only in the index and a rebuild loses it.",
+                    upload.display()
+                ),
+                Some(collection) if !upload.starts_with(collection) => bail!(
+                    "server.upload_dir ({}) is outside server.collection_dir ({}). An uploaded \
+                     result has to land in the folder that gets scanned, or it exists only in \
+                     the index and a rebuild loses it — put it inside, for example {}.",
+                    upload.display(),
+                    collection.display(),
+                    collection.join("uploaded").display()
+                ),
+                Some(_) => {}
+            }
+        }
 
         if self.auth.mode == AuthMode::None {
             if !self.auth.grants.is_empty() {
@@ -528,6 +573,20 @@ index = "fleet-index.db"
 # storing a second copy of what you already keep.
 #
 # archive_dir = 'PUT-THE-PATH-FOR-THE-DOCUMENT-ARCHIVE-HERE'
+
+# Optional, and off unless set: where results submitted through the dashboard
+# are written. Without it nobody can upload, whatever their role says.
+#
+# It must sit *inside* collection_dir, and is refused at load if it does not.
+# An uploaded result has to become an ordinary file in the folder that gets
+# scanned - anywhere else and it exists only in the index, so the rebuild this
+# documentation calls safe would quietly destroy it. Files are named by the
+# SHA-256 of their contents, never by anything the uploader sent.
+#
+# Uploading also needs a grant with role = "contributor" or "admin", and the
+# service account needs write access to this directory.
+#
+# upload_dir = 'PUT-THE-PATH-FOR-UPLOADED-RESULTS-HERE'
 
 # How often to re-read the collection folder by itself. This is what makes it a
 # service rather than a command: a dashboard that only refreshes when somebody
@@ -1000,6 +1059,42 @@ mod tests {
             assert_eq!(parsed, role);
             assert_eq!(role.as_str(), text);
         }
+    }
+
+    /// An upload has to become a file the next scan will find. Anywhere else
+    /// and it exists only in the index — which this project tells people is
+    /// safe to delete — so the rule is enforced at load rather than hoped for.
+    #[test]
+    fn an_upload_directory_outside_the_collection_folder_is_refused() {
+        let with = |collection: Option<&str>, upload: Option<&str>| Config {
+            server: Server {
+                collection_dir: collection.map(PathBuf::from),
+                upload_dir: upload.map(PathBuf::from),
+                ..Server::default()
+            },
+            ..Config::default()
+        };
+
+        assert!(
+            with(Some("/srv/collection"), Some("/srv/collection/uploaded"))
+                .validate()
+                .is_ok(),
+            "inside the collection folder is the whole point"
+        );
+
+        let err = with(Some("/srv/collection"), Some("/var/lib/lbf/uploads"))
+            .validate()
+            .expect_err("outside is refused")
+            .to_string();
+        assert!(err.contains("outside server.collection_dir"), "{err}");
+        assert!(err.contains("a rebuild loses it"), "and says why: {err}");
+
+        // With nowhere to scan at all, an upload directory cannot mean anything.
+        let err = with(None, Some("/srv/uploads"))
+            .validate()
+            .expect_err("refused")
+            .to_string();
+        assert!(err.contains("no server.collection_dir"), "{err}");
     }
 
     #[test]

@@ -58,6 +58,9 @@ pub fn systemd_unit(exe: &Path, config_path: &Path, config: &Config, user: &str)
     want(config.log.file.as_ref().and_then(|f| f.parent()));
     // The archive is a directory in its own right, not a file in one.
     want(config.server.archive_dir.as_deref());
+    // As is the upload directory — and unlike the others, a missing entry here
+    // fails at the moment somebody submits a result rather than at startup.
+    want(config.server.upload_dir.as_deref());
     let read_write = if writable.is_empty() {
         String::new()
     } else {
@@ -163,6 +166,7 @@ fn unreachable_under_protect_home(config: &Config) -> Vec<(&'static str, String)
         config.server.collection_dir.as_deref(),
     );
     check("server.archive_dir", config.server.archive_dir.as_deref());
+    check("server.upload_dir", config.server.upload_dir.as_deref());
     check("log.file", config.log.file.as_deref());
     found
 }
@@ -252,6 +256,9 @@ pub fn service_preflight(config_path: Option<&Path>, config: &Config, user: &str
     }
     if let Some(d) = &config.server.archive_dir {
         writable.push((d.clone(), "archive_dir"));
+    }
+    if let Some(d) = &config.server.upload_dir {
+        writable.push((d.clone(), "upload_dir"));
     }
     writable.sort();
 
@@ -998,6 +1005,54 @@ mod tests {
             line.contains("/srv/loadbearer-archive"),
             "archive_dir is writable at runtime and must be named: {line}"
         );
+    }
+
+    /// The same for uploads, and the failure is worse than the archive's: a
+    /// missing `ReadWritePaths` entry here surfaces the first time somebody
+    /// submits a result, long after the service started cleanly.
+    #[test]
+    fn the_unit_grants_write_access_to_the_upload_directory() {
+        let mut c = config();
+        c.server.collection_dir = Some(PathBuf::from("/srv/loadbearer/collection"));
+        c.server.upload_dir = Some(PathBuf::from("/srv/loadbearer/collection/uploaded"));
+        let unit = systemd_unit(
+            Path::new("/usr/local/bin/loadbearer-fleet"),
+            Path::new("/etc/loadbearer-fleet/fleet.toml"),
+            &c,
+            "loadbearer",
+        );
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("ReadWritePaths="))
+            .expect("a ReadWritePaths line");
+        assert!(
+            line.contains("/srv/loadbearer/collection/uploaded"),
+            "upload_dir is written to at runtime and must be named: {line}"
+        );
+    }
+
+    /// And preflight names it while the answer is still readable, rather than
+    /// leaving it to be discovered by a failed upload.
+    #[test]
+    fn preflight_checks_the_upload_directory() {
+        let dir = std::env::temp_dir().join(format!("lbf-upl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let cfg = dir.join("fleet.toml");
+
+        let mut c = config();
+        c.server.collection_dir = Some(dir.clone());
+        c.server.upload_dir = Some(dir.join("uploaded-but-never-created"));
+        let r = service_preflight(Some(&cfg), &c, "root");
+        let shown = r.to_string();
+        assert!(
+            !r.ok(),
+            "a missing upload directory must fail:
+{shown}"
+        );
+        assert!(shown.contains("uploaded-but-never-created"), "{shown}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `ProtectHome=yes` makes a home directory *invisible*, so a path there
