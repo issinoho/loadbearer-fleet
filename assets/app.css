@@ -105,6 +105,12 @@ a { color: inherit; }
 .topbar {
   display: flex;
   align-items: center;
+  /* Wrapping is not a narrow-screen special case. A fifth tab pushed this 24px
+     past a 768px tablet — on CI, where the fonts are wider than the ones this
+     was written on — and without `wrap` the overflow becomes the *page's*,
+     dragging everything sideways. Now it folds instead, at any width. */
+  flex-wrap: wrap;
+  row-gap: 8px;
   gap: var(--gap);
   padding: 12px 20px;
   background: var(--surface-1);
@@ -124,7 +130,18 @@ a { color: inherit; }
 /* "fleet" carries the weight, as in the wordmark. */
 .brand-name b { color: var(--text-primary); font-weight: 600; }
 
-.tabs { display: flex; gap: 2px; margin-left: 12px; }
+/* The strip scrolls inside itself rather than widening its parent, so the
+   number of tabs can never decide whether the page fits. */
+.tabs {
+  display: flex;
+  gap: 2px;
+  margin-left: 12px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tabs::-webkit-scrollbar { display: none; }
 
 .tab {
   font: inherit;
@@ -438,10 +455,11 @@ table.data td.wrap { white-space: normal; }
    nothing but a horizontal drag could reach them. Each row is allowed to wrap
    here, and the one thing that must not wrap — the tab strip — scrolls inside
    itself rather than widening the page. */
-@media (max-width: 720px) {
+/* 820 rather than 720: a 768px tablet cannot hold brand, five tabs and the
+   actions on one line either, and letting it wrap by accident gave a three-row
+   header. Two deliberate rows beat three accidental ones. */
+@media (max-width: 820px) {
   .topbar {
-    flex-wrap: wrap;
-    row-gap: 8px;
     padding: 10px 14px;
     /* Not sticky at this width. A hundred pixels of permanent chrome out of
        eight hundred costs more than scrolling back up to change view. */

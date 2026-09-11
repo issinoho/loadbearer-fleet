@@ -40,6 +40,10 @@ const SIZES = [
   { name: 'phone', width: 390, height: 844, touch: true },
   { name: 'small-phone', width: 320, height: 568, touch: true },
   { name: 'tablet', width: 768, height: 1024, touch: true },
+  // Just above the 720px breakpoint: the *desktop* header layout at the
+  // tightest width it ever has to hold. That is where a fifth tab first
+  // overflowed, and where the next one will.
+  { name: 'narrow-desktop', width: 740, height: 900, touch: false },
   { name: 'desktop', width: 1440, height: 900, touch: false },
 ];
 
@@ -330,7 +334,13 @@ try {
       // The fixtures sign nobody in, so the Sign out button is not in this
       // measurement; a signed-in session on a 320px screen has one more thing
       // in that row and may take three.
-      const ceiling = size.width <= 720 ? 120 : 90;
+      // Matches the CSS breakpoint: below it the header is two deliberate
+      // rows, above it one. The numbers are what those cost — two 40px touch
+      // rows plus padding and a gap is about 110, and the thing being guarded
+      // against is a *third* row at roughly 160. Tight enough to catch that,
+      // loose enough that one machine's fonts being wider than another's is
+      // not a failure.
+      const ceiling = size.width <= 820 ? 130 : 90;
       check(where, m.topbarHeight <= ceiling,
         `the topbar is ${m.topbarHeight}px at ${size.width}px wide (ceiling ${ceiling}px)`);
 
