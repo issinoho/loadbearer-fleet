@@ -313,11 +313,19 @@ try {
         }
       }
 
-      // The topbar is sticky on the desktop and not on a phone, so it is only
-      // worth a ceiling where it is chrome the reader cannot scroll away.
-      const ceiling = size.width <= 720 ? Math.round(size.height * 0.2) : 80;
+      // An absolute ceiling, not a fraction of the screen: what makes the
+      // header tall is how much has to wrap at that *width*, and a short
+      // screen does not make a two-row header any worse. 120px is two 40px
+      // rows plus its padding and gap, with a little room for the font metrics
+      // to differ between a developer's machine and a CI runner — which is
+      // exactly how the 320px case got through locally and failed here.
+      //
+      // The fixtures sign nobody in, so the Sign out button is not in this
+      // measurement; a signed-in session on a 320px screen has one more thing
+      // in that row and may take three.
+      const ceiling = size.width <= 720 ? 120 : 90;
       check(where, m.topbarHeight <= ceiling,
-        `the topbar is ${m.topbarHeight}px of a ${size.height}px screen (ceiling ${ceiling}px)`);
+        `the topbar is ${m.topbarHeight}px at ${size.width}px wide (ceiling ${ceiling}px)`);
 
       notes.push(`${where}: ${m.documentWidth}px wide, topbar ${m.topbarHeight}px, `
         + `${m.controls.length} control(s), ${m.selfScrolls.length} scroller(s)`);

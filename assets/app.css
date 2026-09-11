@@ -392,9 +392,14 @@ table.data td.wrap { white-space: normal; }
 .detail-facts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .breadcrumb { margin-bottom: 12px; }
 
-.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+/* `minmax(0, 1fr)` rather than `1fr`: a bare `1fr` refuses to shrink below its
+   content, so a long CPU model in the value column pushed the whole page wider
+   than a 320px phone. */
+.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; font-size: 13px; }
 .kv dt { color: var(--text-secondary); }
-.kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+/* `anywhere`, because some of these values have nowhere to break — a serial or
+   an install ID has no spaces in it. */
+.kv dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 
 .empty { color: var(--text-muted); padding: 28px 0; text-align: center; }
 .banner {
@@ -500,6 +505,16 @@ table.data td.wrap { white-space: normal; }
    still identifiable, and the row it saves is worth more than the word. */
 @media (max-width: 440px) {
   .brand-name { display: none; }
+
+  /* The action row has to fit one line on a 320px screen, and "fits" has to
+     mean it with room to spare: the same row measured 277px under Windows font
+     metrics and over 293px under Linux ones, which is how it came to wrap on
+     CI and not here. Smaller type, tighter padding and a harder cap on the
+     chip buy about 30px of margin instead of 0. */
+  .topbar { padding: 10px 12px; }
+  .topbar-actions { gap: 6px; }
+  .topbar-actions .btn { font-size: 12px; padding-left: 8px; padding-right: 8px; }
+  .chip { max-width: 35vw; }
 }
 
 /* Touch, whatever the width: a 30px-tall control is a miss waiting to happen.
