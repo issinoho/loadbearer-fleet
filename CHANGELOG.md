@@ -5,6 +5,46 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.4.1 - Fri, 11 Sep 2026
+
+Four fixes to running as a service on Linux, all found by following this
+project's own instructions on a real host rather than reading them. If you run
+it under systemd with `archive_dir` set, the first one matters to you.
+
+- **`ReadWritePaths` omitted `archive_dir`.** The generated unit named the
+  index's directory and the log's, and `ProtectSystem=strict` makes everything
+  else read-only — so with an archive anywhere outside those two, every archive
+  write was refused at runtime. It fails in the worst available shape: the
+  service starts, the dashboard works, and the symptom is an archive that is
+  mysteriously empty, noticed months later. **Regenerate your unit after
+  upgrading** — `service unit` writes the correct `ReadWritePaths` now, but an
+  already-installed unit keeps the old one.
+- **`service unit` refuses a configuration whose paths are under a home
+  directory.** The unit sets `ProtectHome=yes`, which makes `/home`, `/root`
+  and `/run/user` *invisible* to the service rather than merely unreadable — so
+  an index or log there fails as though it had never been created. That is
+  knowable when the unit is printed, so it is refused then, naming each setting
+  and its path, rather than left to systemd to report obscurely.
+- **`service unit` no longer creates the log directory just to print.** It set
+  logging up first, so previewing a unit as an ordinary user produced
+  `creating the log directory /var/log/loadbearer-fleet` instead of a unit, and
+  the only way to read one was as root. `init-config` and `reference` already
+  skipped logging for that reason; this was the third command of the kind and
+  the only one not treated as one.
+- **The README's Linux service path was incomplete**, which is how the three
+  above came to light. Following it exactly failed: nothing created the
+  `loadbearer-fleet` account the unit names — systemd reports `217/USER` —
+  nothing created the directories `ReadWritePaths` needs, which is
+  `226/NAMESPACE` and says nothing about the cause, and `ExecStart` is whichever
+  binary printed the unit, so generating it from an unpacked tarball in a home
+  directory baked in a path `ProtectHome` then hid. Windows and Linux now have
+  their own headings, and the Linux one is the whole sequence.
+
+Both new guards were watched failing with the fix removed. The `ProtectHome`
+one needed a Linux build to demonstrate at all: on Windows `/home/...` is not
+an absolute path, so it is resolved beside the config file before the check
+ever sees it.
+
 ## 0.4.0 - Thu, 10 Sep 2026
 
 Sign-in against a **self-hosted** identity provider — Authelia, Keycloak,
