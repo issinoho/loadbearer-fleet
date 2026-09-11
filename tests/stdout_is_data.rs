@@ -68,6 +68,62 @@ fn report_json_writes_only_the_snapshot_to_stdout() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The same property with a log file configured, which the test above cannot
+/// see: without one there is nothing to announce.
+///
+/// A configured log file makes the binary say which *dated* file it is
+/// writing, because the configured path is a stem and `tail -f` on it fails.
+/// That announcement belongs on stderr — where a service's journal picks it up
+/// — and if it ever moves to stdout it breaks every pipe this file exists to
+/// protect.
+#[test]
+fn a_configured_log_file_does_not_put_its_name_on_stdout() {
+    let dir = scratch("logline");
+    let unixish = |p: PathBuf| p.display().to_string().replace('\\', "/");
+    let config = dir.join("fleet.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:8788\"\npublic_url = \"http://127.0.0.1:8788\"\n\
+             index = '{}'\n\n[log]\nfile = '{}'\n",
+            unixish(dir.join("i.db")),
+            unixish(dir.join("fleet.log")),
+        ),
+    )
+    .expect("write a config");
+
+    let out = Command::new(EXE)
+        .args([
+            "--config",
+            config.to_str().expect("path"),
+            "report",
+            "--json",
+        ])
+        .output()
+        .expect("run the binary");
+    assert!(
+        out.status.success(),
+        "report --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let json = String::from_utf8(out.stdout).expect("stdout should be UTF-8");
+    serde_json::from_str::<serde_json::Value>(&json).unwrap_or_else(|e| {
+        panic!(
+            "stdout did not parse as JSON ({e}). The first 200 bytes were:\n{}",
+            &json[..json.len().min(200)]
+        )
+    });
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("logging to") && err.contains("fleet.log."),
+        "stderr should name the dated log file, but was:\n{err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn init_config_writes_only_the_config_to_stdout() {
     let text = stdout_of(&["init-config"]);

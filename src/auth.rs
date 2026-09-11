@@ -435,6 +435,11 @@ impl Authenticator {
             "Whether your grant values match what is in that claim. Entra emits group object \
              IDs; Authelia, Keycloak and Authentik emit group names."
                 .to_string(),
+            "Whether a name reaches the ID token. `name`, `preferred_username` and `email` are \
+             subject to the same rule as the groups claim, and a provider that sends them to \
+             userinfo only — Authelia's default — leaves the dashboard labelling the session \
+             with its subject, which is usually a UUID. Harmless, but it looks broken."
+                .to_string(),
             "The code exchange, which needs a real authorization code.".to_string(),
             "So sign in once. If you are refused, the message counts the groups it decoded: \
              0 group(s) means the claim never arrived, and any other number means it did and \

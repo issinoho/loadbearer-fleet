@@ -197,9 +197,13 @@ pub fn service_preflight(config_path: Option<&Path>, config: &Config, user: &str
         ),
     }
 
-    match &config.log.file {
-        Some(f) => r.pass("log file", f.display().to_string()),
-        None => r.fail(
+    // The dated name rather than the configured stem. This is the one place
+    // somebody is told where the log is, and the stem is not a file that
+    // exists — `tail -f` on it fails, which is a poor way to find that out.
+    match (&config.log.file, config.log.current_file()) {
+        (Some(_), Some(actual)) => r.pass("log file", actual.display().to_string()),
+        (Some(f), None) => r.pass("log file", f.display().to_string()),
+        (None, _) => r.fail(
             "log file",
             "not set".to_string(),
             "A service has no console. Without [log] file there is no way to find out why it \
@@ -236,21 +240,63 @@ pub fn service_preflight(config_path: Option<&Path>, config: &Config, user: &str
 
     check_account(&mut r, user);
 
-    // The directories the unit will name as writable.
-    let mut writable: Vec<std::path::PathBuf> = Vec::new();
+    // The directories the unit will name as writable, each carrying the
+    // setting that put it there — so a failure can name the setting to change
+    // rather than only the directory that cannot be written.
+    let mut writable: Vec<(std::path::PathBuf, &'static str)> = Vec::new();
     if let Some(d) = config.server.index.parent() {
-        writable.push(d.to_path_buf());
+        writable.push((d.to_path_buf(), "index"));
     }
     if let Some(d) = config.log.file.as_ref().and_then(|f| f.parent()) {
-        writable.push(d.to_path_buf());
+        writable.push((d.to_path_buf(), "[log] file"));
     }
     if let Some(d) = &config.server.archive_dir {
-        writable.push(d.clone());
+        writable.push((d.clone(), "archive_dir"));
     }
     writable.sort();
-    writable.dedup();
-    for dir in &writable {
-        check_writable_dir(&mut r, dir, user);
+
+    // Grouped by directory, keeping every setting that named it: two settings
+    // in the same wrong place is one problem, and reporting it once with both
+    // names beats reporting it twice — or worse, once, and then again after
+    // the first has been fixed.
+    let mut by_dir: Vec<(std::path::PathBuf, Vec<&'static str>)> = Vec::new();
+    for (dir, key) in writable {
+        match by_dir.iter_mut().find(|(d, _)| *d == dir) {
+            Some((_, keys)) => keys.push(key),
+            None => by_dir.push((dir, vec![key])),
+        }
+    }
+
+    // One case needs different advice rather than more of the same: a data path
+    // that lands in the configuration's *own* directory. Relative paths resolve
+    // beside the config file, so `index = 'fleet-index.db'` alongside
+    // /etc/loadbearer-fleet/fleet.toml asks for /etc/loadbearer-fleet to be
+    // writable by the service — and advising a chown there would hand the
+    // service write access to its own configuration. The fix is the path.
+    let config_dir = config_path.and_then(|p| p.parent());
+    for (dir, keys) in &by_dir {
+        if config_dir.is_some() && config_dir == Some(dir.as_path()) {
+            let names = and_list(keys);
+            let verb = if keys.len() == 1 {
+                "resolves"
+            } else {
+                "resolve"
+            };
+            r.fail(
+                "data path",
+                format!(
+                    "{names} {verb} to {}, beside the config file",
+                    dir.display()
+                ),
+                format!(
+                    "A relative path resolves against the config file's own directory. Give \
+                     {names} an absolute path under /var/lib/loadbearer-fleet — do not make the \
+                     configuration directory writable by the service."
+                ),
+            );
+        } else {
+            check_writable_dir(&mut r, dir, user);
+        }
     }
 
     // Read-only, and a missing one is survivable — the startup scan reports it
@@ -354,6 +400,15 @@ fn check_dir_exists(r: &mut Report, dir: &Path) -> bool {
     }
 }
 
+/// `a`, `a and b`, `a, b and c` — a list a sentence can contain.
+fn and_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 #[cfg(unix)]
 fn check_writable_dir(r: &mut Report, dir: &Path, user: &str) {
     use std::os::unix::fs::MetadataExt;
@@ -394,7 +449,8 @@ fn check_writable_dir(r: &mut Report, dir: &Path, user: &str) {
                 meta.gid(),
                 mode & 0o777
             ),
-            "sudo chown loadbearer-fleet: <dir>",
+            // The real user and the real directory, so it can be pasted.
+            format!("sudo chown {user}: {}", dir.display()),
         );
     }
 }
@@ -774,6 +830,78 @@ mod tests {
         let r = service_preflight(Some(&cfg), &c, "root");
         assert!(!r.ok());
         assert!(r.to_string().contains("ProtectHome"), "{}", r.to_string());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A data path that lands beside the config file has to be reported as a
+    /// path to change, not as a directory to open up.
+    ///
+    /// This is the version that shipped in 0.5.0 getting it wrong on a real
+    /// host: `index` was relative, so it resolved into `/etc/loadbearer-fleet`,
+    /// and the report advised `chown loadbearer-fleet: <dir>` — which would
+    /// have handed the service write access to its own configuration.
+    #[test]
+    fn a_data_path_beside_the_config_names_the_setting_not_a_chown() {
+        let dir = std::env::temp_dir().join(format!("lbf-pf-rel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let cfg = dir.join("fleet.toml");
+
+        // What a relative `index` and `[log] file` become once resolved.
+        let mut c = config();
+        c.server.index = dir.join("fleet-index.db");
+        c.log.file = Some(dir.join("fleet.log"));
+
+        let r = service_preflight(Some(&cfg), &c, "root");
+        let shown = r.to_string();
+        assert!(!r.ok(), "this is a misconfiguration:\n{shown}");
+        assert!(
+            shown.contains("beside the config file"),
+            "it should say where the path landed:\n{shown}"
+        );
+        assert!(
+            !shown.contains("chown"),
+            "never advise making the config directory writable:\n{shown}"
+        );
+        // Both settings, in one failure: fixing one and being told about the
+        // other on the next run is two rounds where one would do.
+        assert!(
+            shown.contains("[log] file and index"),
+            "both settings should be named:\n{shown}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The configured log path is a stem — the date is appended — so reporting
+    /// it verbatim sends somebody to `tail` a file that does not exist.
+    #[test]
+    fn the_log_path_reported_is_the_file_that_exists() {
+        let dir = std::env::temp_dir().join(format!("lbf-pf-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut c = config();
+        c.server.index = dir.join("fleet-index.db");
+        c.log.file = Some(dir.join("fleet.log"));
+
+        let dated = c.log.current_file().expect("a log file is configured");
+        let name = dated
+            .file_name()
+            .expect("a file name")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            name.starts_with("fleet.log.") && name.len() == "fleet.log.2026-09-11".len(),
+            "the stem should carry a date: {name}"
+        );
+
+        let shown = service_preflight(Some(&dir.join("fleet.toml")), &c, "root").to_string();
+        assert!(
+            shown.contains(&name),
+            "the report should name the dated file:\n{shown}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

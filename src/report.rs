@@ -9,7 +9,7 @@
 /// One `check-auth` run: what was proved, what was not, and what cannot be.
 #[derive(Default)]
 pub struct Report {
-    checks: Vec<(Outcome, &'static str, String, Option<&'static str>)>,
+    checks: Vec<(Outcome, &'static str, String, Option<String>)>,
     pub(crate) unknown: Vec<String>,
 }
 
@@ -27,9 +27,12 @@ impl Report {
     pub(crate) fn note(&mut self, what: &'static str, detail: String) {
         self.checks.push((Outcome::Note, what, detail, None));
     }
-    pub(crate) fn fail(&mut self, what: &'static str, detail: String, advice: &'static str) {
+    /// `advice` takes an owned string so it can name the actual account and
+    /// the actual directory. Advice with a `<placeholder>` in it is advice
+    /// somebody has to translate before they can use it.
+    pub(crate) fn fail(&mut self, what: &'static str, detail: String, advice: impl Into<String>) {
         self.checks
-            .push((Outcome::Fail, what, detail, Some(advice)));
+            .push((Outcome::Fail, what, detail, Some(advice.into())));
     }
 
     /// Whether anything failed, so the command can exit non-zero and a deploy

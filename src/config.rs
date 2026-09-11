@@ -30,6 +30,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::macros::format_description;
 
 /// The marker a starter file uses. Any setting still containing it is a setting
 /// nobody filled in.
@@ -141,6 +143,24 @@ impl Default for Log {
             level: log_level(),
             file: None,
         }
+    }
+}
+
+impl Log {
+    /// The file this run will actually write, date and all.
+    ///
+    /// `file` is a *stem*: the rotation appends the UTC date, so the path in
+    /// the configuration never exists as a file and `tail -f` on it fails with
+    /// `No such file or directory`. Anything that tells somebody where the log
+    /// is should tell them this instead of the stem.
+    pub fn current_file(&self) -> Option<PathBuf> {
+        let path = self.file.as_ref()?;
+        let stamp = OffsetDateTime::now_utc()
+            .format(format_description!("[year]-[month]-[day]"))
+            .ok()?;
+        let mut name = path.file_name()?.to_os_string();
+        name.push(format!(".{stamp}"));
+        Some(path.with_file_name(name))
     }
 }
 

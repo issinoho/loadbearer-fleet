@@ -237,6 +237,16 @@ fn init_logging(log: &config::Log, cli_level: Option<&str>) -> Result<()> {
                 dir.unwrap_or_else(|| std::path::Path::new(".")),
                 name,
             );
+            // Which file, said out loud, before anything is written to it.
+            //
+            // The configured path is a stem, so it never exists and `tail -f`
+            // on it fails with `No such file or directory` — and the operator
+            // of a service is reading the journal, which is where stderr goes.
+            // This is the line that turns that into an answer. Stdout is
+            // untouched, so a piped `report --json` is unaffected.
+            if let Some(actual) = log.current_file() {
+                eprintln!("logging to {}", actual.display());
+            }
             match format {
                 LogFormat::Text => tracing_subscriber::fmt()
                     .with_env_filter(filter)
