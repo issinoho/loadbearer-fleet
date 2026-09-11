@@ -87,6 +87,57 @@ fn stamped_version(path: &Path) -> Result<Option<i64>> {
 /// happens during a deliberate upgrade, with somebody watching, and refusing
 /// to start with an explanation is a better outcome than starting successfully
 /// having thrown away the one copy of their history.
+/// What an uploaded document is called once it is in the collection folder.
+///
+/// **Nothing the uploader sent is used.** The name is built from the parsed
+/// document and the hash of its bytes, which is what makes it impossible to
+/// weaponise: a hostname of `../../etc/cron.d/x` is text in a JSON field, and
+/// text is all it ever becomes.
+///
+/// It is *readable* rather than merely safe, because the folder is something a
+/// person has to look at: `SGS-D47TDY3-20260911T163000-8f3ac1d2.json` follows
+/// the same shape this project recommends for collected copies generally. The
+/// hash suffix makes it unique — two runs of one machine in the same second
+/// would otherwise collide — and ties the name to the contents.
+fn upload_name(doc: &ResultFile, hash: &str) -> String {
+    let host = doc
+        .machine
+        .hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or("machine");
+    // Anything that is not plainly a filename character becomes a hyphen: no
+    // separators, no traversal, no leading dot, no surprises on either
+    // platform. Truncated because a hostname has no length limit and a path
+    // does.
+    let safe: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(40)
+        .collect();
+    let safe = safe.trim_matches('-');
+    let safe = if safe.is_empty() { "machine" } else { safe };
+
+    // The document's own timestamp, compacted: 2026-09-11T16:30:00Z becomes
+    // 20260911T163000, which sorts chronologically in a directory listing.
+    let stamp: String = doc
+        .timestamp
+        .chars()
+        .take_while(|c| *c != '.' && *c != '+')
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(15)
+        .collect();
+
+    format!("{safe}-{stamp}-{}.json", &hash[..8])
+}
+
 /// A document's identity. sha2 0.11 returns a hybrid-array `Array`, which has
 /// no `LowerHex`, hence the hand-rolled hex.
 fn content_hash(text: &str) -> String {
@@ -109,13 +160,18 @@ fn content_hash(text: &str) -> String {
 /// Rows written before the column existed keep `NULL`, which is the honest
 /// answer — see `scan --reindex` for filling them in from the documents.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    const ADDED: [(&str, &str, &str); 3] = [
+    const ADDED: [(&str, &str, &str); 5] = [
         ("subtest", "label", "TEXT"),
         ("subtest", "direction", "TEXT"),
         // Component ids are short and lower-case — `cpu`, `memory` — so a
         // heading has to come from the document rather than from title-casing
         // an id into "Cpu".
         ("component", "label", "TEXT"),
+        // Who submitted a run through the dashboard, and when. NULL for the
+        // ordinary case of a file that arrived in the collection folder by
+        // itself, which is most of them.
+        ("run", "uploaded_by", "TEXT"),
+        ("run", "uploaded_at", "TEXT"),
     ];
 
     for (table, column, decl) in ADDED {
@@ -195,7 +251,7 @@ fn set_aside(path: &Path, found: i64) -> Result<()> {
 /// stop the dashboard coming up at all, which is the failure that hides every
 /// other one. Rejecting on size has to happen *before* the read, because the
 /// schema reader rejecting the document afterwards is far too late.
-const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Read a result document, transparently un-gzipping a `.json.gz`.
 ///
@@ -581,6 +637,58 @@ impl Index {
     pub fn ingest_file(&mut self, path: &Path) -> Result<bool> {
         let text = read_document(path)?;
         self.ingest_text(&text, path)
+    }
+
+    /// Take a document submitted through the dashboard.
+    ///
+    /// It becomes a file in `dir` **before** it is indexed, named from the
+    /// document itself — never from anything the uploader sent, which is what
+    /// makes a filename impossible to weaponise. See [`upload_name`].
+    /// Configuration requires `dir` to sit inside the collection folder, so
+    /// what lands there is an ordinary result file: the next scan finds it,
+    /// and rebuilding the index from the folder keeps it. An upload that
+    /// existed only in the index would be destroyed by the rebuild this
+    /// project calls safe.
+    ///
+    /// Returns `false` when the document was already indexed, which is not an
+    /// error. The same result submitted twice is a question already answered,
+    /// and saying so is more useful than either a duplicate or a failure.
+    ///
+    /// **`uploaded_by` does not survive a rebuild**, and cannot: once the
+    /// index is deleted and the folder rescanned, the run arrived as a file
+    /// like any other and nothing in the document says who sent it. The column
+    /// is a convenience for the drilldown. The durable record is the log line
+    /// written here, which names the subject and the machine.
+    pub fn accept_upload(&mut self, text: &str, dir: &Path, by: &str) -> Result<bool> {
+        // Parsed before anything is written, so a document that is not a
+        // result never reaches the disk at all.
+        let doc = ResultFile::from_json(text).context("this is not a loadbearer result file")?;
+        let hash = content_hash(text);
+
+        let target = dir.join(upload_name(&doc, &hash));
+        if !target.exists() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating the upload directory {}", dir.display()))?;
+            // Temporary name, then rename: a failed write cannot leave a
+            // truncated file behind whose name is a claim about its contents.
+            let partial = dir.join(format!("{hash}.json.partial"));
+            std::fs::write(&partial, text)
+                .with_context(|| format!("writing {}", partial.display()))?;
+            std::fs::rename(&partial, &target)
+                .with_context(|| format!("moving {} into place", partial.display()))?;
+        }
+
+        let fresh = self.ingest_text(text, &target)?;
+        if fresh {
+            // Recorded afterwards rather than threaded through `insert`, which
+            // is shared with the scan path where there is no uploader.
+            self.conn.execute(
+                "UPDATE run SET uploaded_by = ?1, uploaded_at = datetime('now')
+                   WHERE content_hash = ?2",
+                params![by, hash],
+            )?;
+        }
+        Ok(fresh)
     }
 
     /// Ingest a file that may already be indexed, replacing what is there.
@@ -1078,6 +1186,52 @@ mod tests {
         let conn = Connection::open(path).expect("open");
         conn.query_row("SELECT COUNT(*) FROM run", [], |r| r.get(0))
             .expect("count")
+    }
+
+    /// An uploaded file is named from the *document*, never from the uploader.
+    ///
+    /// The hostname is attacker-controlled text, so this is the one place a
+    /// submitted result could reach outside the directory it belongs in. It
+    /// cannot: every character that is not plainly a filename becomes a
+    /// hyphen, which leaves a name that is readable and inert.
+    #[test]
+    fn an_uploaded_file_is_named_from_the_document_and_cannot_escape_its_directory() {
+        let mut doc =
+            ResultFile::from_json(&std::fs::read_to_string(fixture("win-modern.json")).unwrap())
+                .unwrap();
+
+        let name = upload_name(&doc, "8f3ac1d2deadbeef");
+        assert!(name.starts_with("FLEET-WIN-01-"), "readable: {name}");
+        assert!(
+            name.ends_with("-8f3ac1d2.json"),
+            "and tied to its bytes: {name}"
+        );
+
+        for hostile in [
+            "../../etc/cron.d/x",
+            "..\\..\\windows\\system32\\evil",
+            "/etc/passwd",
+            "con",
+            "",
+            "   ",
+            "a".repeat(400).as_str(),
+        ] {
+            doc.machine.hostname = Some(hostile.to_string());
+            let name = upload_name(&doc, "8f3ac1d2deadbeef");
+            assert!(!name.contains('/'), "{hostile:?} produced {name}");
+            assert!(!name.contains('\\'), "{hostile:?} produced {name}");
+            assert!(!name.contains(".."), "{hostile:?} produced {name}");
+            assert!(!name.starts_with('.'), "{hostile:?} produced {name}");
+            assert!(name.ends_with(".json"), "{hostile:?} produced {name}");
+            assert!(name.len() < 80, "{hostile:?} produced {} chars", name.len());
+            // And the path it builds stays where it was put.
+            let dir = Path::new("/srv/collection/uploaded");
+            assert_eq!(
+                dir.join(&name).parent(),
+                Some(dir),
+                "{hostile:?} escaped to {name}"
+            );
+        }
     }
 
     /// `direction` is what makes two measurements comparable — without it a

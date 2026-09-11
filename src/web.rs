@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -68,6 +68,10 @@ pub struct AppState {
     /// The collection folder, if this instance was told about one. Absent means
     /// the index is read-only from here and `rescan` has nothing to walk.
     root: Option<PathBuf>,
+    /// Where a submitted result is written. Absent switches uploading off, so
+    /// a server that was never given somewhere to put one cannot be persuaded
+    /// to accept it.
+    upload_dir: Option<PathBuf>,
     authenticator: Authenticator,
     metrics_config: MetricsConfig,
     /// Counters that outlive any one snapshot, for the metrics endpoint.
@@ -84,6 +88,7 @@ impl AppState {
             data_version: Mutex::new(version),
             thresholds,
             root: config.server.collection_dir.clone(),
+            upload_dir: config.server.upload_dir.clone(),
             authenticator: Authenticator::new(config),
             metrics_config: config.metrics.clone(),
             runtime: Mutex::new(Runtime::new()),
@@ -307,6 +312,93 @@ struct MachinePayload {
     cohort: Option<Cohort>,
     #[serde(flatten)]
     detail: Detail,
+}
+
+#[derive(Debug, Serialize)]
+struct UploadOutcome {
+    /// `added` or `already indexed` — the second is a normal answer, not a
+    /// failure, because ingest is idempotent by content.
+    outcome: &'static str,
+    machine_key: String,
+    hostname: Option<String>,
+}
+
+/// Take a result document submitted through the dashboard.
+///
+/// Four things have to be true before a byte of it is kept, and they are
+/// checked in this order deliberately — cheapest and least revealing first:
+///
+/// 1. **The server was given somewhere to put it.** No `upload_dir`, no
+///    uploading, whatever anybody's role says.
+/// 2. **The caller may upload.** `contributor` or better.
+/// 3. **It is JSON.** A cross-origin form can only send urlencoded,
+///    multipart or plain text, so insisting on `application/json` means no
+///    HTML page on another site can post here with the user's cookie — on top
+///    of `SameSite=Lax`, which already withholds it.
+/// 4. **It parses, and it is in scope.** A contributor scoped to one site may
+///    not submit a result claiming to be from another; the same
+///    `scopes_allow` that decides what they may *read* decides this.
+///
+/// The body size is capped at the route, at the same limit the scanner
+/// applies to a file on disk.
+async fn post_upload(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<Json<UploadOutcome>, AppError> {
+    let Some(dir) = state.upload_dir.clone() else {
+        return Err(AppError::bad_request(
+            "this server has no [server] upload_dir configured, so it cannot accept results. \
+             Set one inside the collection folder and restart.",
+        ));
+    };
+    if !caller.0.may_upload() {
+        return Err(AppError::forbidden(
+            "submitting a result needs a grant with role = \"contributor\" or \"admin\"",
+        ));
+    }
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if !json {
+        return Err(AppError::bad_request(
+            "send the document as application/json",
+        ));
+    }
+
+    // Parsed here as well as in the index, because the scope check needs the
+    // tags before anything is written, and a document that is not a result
+    // should be refused in the reader's own words.
+    let doc = crate::schema::ResultFile::from_json(&body)
+        .map_err(|e| AppError::bad_request(format!("{e:#}")))?;
+    if !analytics::scopes_allow(&caller.0.scopes, &doc.tags) {
+        // Deliberately not "your scope is X": that would tell a caller what
+        // else exists. It says what they sent and what it needed.
+        return Err(AppError::forbidden(
+            "this result is not tagged as one you may submit. A scoped contributor may only \
+             submit results carrying the tags their grant names — which means whoever runs \
+             loadbearer has to pass them with --tag.",
+        ));
+    }
+
+    let fresh = {
+        let mut idx = state.index.lock().expect("index lock");
+        idx.accept_upload(&body, &dir, &caller.0.subject)
+            .map_err(|e| AppError::bad_request(format!("{e:#}")))?
+    };
+    tracing::info!(
+        by = %caller.0.subject,
+        machine = %doc.machine_key().value,
+        fresh,
+        "result uploaded"
+    );
+    Ok(Json(UploadOutcome {
+        outcome: if fresh { "added" } else { "already indexed" },
+        machine_key: doc.machine_key().value,
+        hostname: doc.machine.hostname.clone(),
+    }))
 }
 
 /// Which runs to compare: either explicit run ids, or machine keys meaning
@@ -580,6 +672,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/machine/{key}", get(get_machine))
         .route("/api/compare", get(get_compare))
         .route("/api/rescan", post(post_rescan))
+        // The cap belongs on this route rather than globally: every other
+        // endpoint takes a query string, and axum's 2 MB default would refuse
+        // a legitimate result from a long soak run.
+        .route(
+            "/api/upload",
+            post(post_upload).layer(DefaultBodyLimit::max(
+                crate::index::MAX_DOCUMENT_BYTES as usize,
+            )),
+        )
         .route("/metrics", get(get_metrics))
         // Unauthenticated on purpose: a service manager or load balancer has to
         // be able to ask whether the process is alive, and the answer says
@@ -866,6 +967,48 @@ mod tests {
         fn header(&self, name: HeaderName) -> Option<String> {
             Some(self.headers.get(name)?.to_str().expect("ASCII").to_string())
         }
+    }
+
+    /// A POST with a body and a content type, for the upload endpoint — the
+    /// only one that takes either.
+    async fn post_body(
+        state: &Arc<AppState>,
+        uri: &str,
+        content_type: &str,
+        body: &str,
+        cookie: Option<&str>,
+    ) -> Reply {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, content_type);
+        if let Some(c) = cookie {
+            builder = builder.header(header::COOKIE, format!("lbf_session={c}"));
+        }
+        let response = router(Arc::clone(state))
+            .oneshot(builder.body(Body::from(body.to_string())).expect("request"))
+            .await
+            .expect("response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 24)
+            .await
+            .expect("body");
+        Reply {
+            status,
+            headers,
+            body: String::from_utf8_lossy(&bytes).to_string(),
+        }
+    }
+
+    /// A result the fixtures have not already indexed: same machine, a later
+    /// run, so the content hash differs.
+    fn a_later_run(tags: serde_json::Value) -> String {
+        let text = std::fs::read_to_string(fixtures().join("win-modern.json")).expect("fixture");
+        let mut doc: serde_json::Value = serde_json::from_str(&text).expect("json");
+        doc["timestamp"] = serde_json::json!("2026-09-11T16:30:00Z");
+        doc["tags"] = tags;
+        serde_json::to_string(&doc).expect("json")
     }
 
     async fn request(
@@ -1221,6 +1364,188 @@ mod tests {
             true,
             "an administrator inherits what a contributor may do"
         );
+    }
+
+    /// Everything an upload has to get past, and the order it gets past it in.
+    #[tokio::test]
+    async fn uploading_is_refused_unless_every_condition_holds() {
+        let dir = std::env::temp_dir().join(format!("lbf-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        // No upload_dir: the server cannot accept a result at all, whatever
+        // anybody's role says.
+        let closed = state_for(&oidc_config());
+        let admin = session(&closed, Role::Admin, &[]);
+        let shut = post_body(
+            &closed,
+            "/api/upload",
+            "application/json",
+            &a_later_run(serde_json::json!({})),
+            Some(&admin),
+        )
+        .await;
+        assert_eq!(shut.status, StatusCode::BAD_REQUEST);
+        assert!(shut.body.contains("upload_dir"), "{}", shut.body);
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        let state = state_for(&config);
+        let good = a_later_run(serde_json::json!({}));
+
+        // Not signed in at all.
+        assert_eq!(
+            post_body(&state, "/api/upload", "application/json", &good, None)
+                .await
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Signed in, but only to read.
+        let viewer = session(&state, Role::Viewer, &[]);
+        let refused = post_body(
+            &state,
+            "/api/upload",
+            "application/json",
+            &good,
+            Some(&viewer),
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        assert!(refused.body.contains("contributor"), "{}", refused.body);
+
+        let contributor = session(&state, Role::Contributor, &[]);
+
+        // A form post from another origin cannot set this content type, which
+        // is the second lock after SameSite=Lax.
+        let wrong = post_body(
+            &state,
+            "/api/upload",
+            "application/x-www-form-urlencoded",
+            &good,
+            Some(&contributor),
+        )
+        .await;
+        assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
+        assert!(wrong.body.contains("application/json"), "{}", wrong.body);
+
+        // Not a result document: refused in the parser's own words, and
+        // nothing reaches the disk.
+        let junk = post_body(
+            &state,
+            "/api/upload",
+            "application/json",
+            "{\"hello\":true}",
+            Some(&contributor),
+        )
+        .await;
+        assert_eq!(junk.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir").count(),
+            0,
+            "a document that is not a result must not be written"
+        );
+
+        // And the one that works.
+        let ok = post_body(
+            &state,
+            "/api/upload",
+            "application/json",
+            &good,
+            Some(&contributor),
+        )
+        .await;
+        assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+        assert_eq!(ok.json()["outcome"], "added");
+        assert_eq!(ok.json()["hostname"], "FLEET-WIN-01");
+
+        // It is a file in the folder, named from the document rather than from
+        // anything the caller sent, so a rebuild from the folder keeps it.
+        let written: Vec<String> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert!(written[0].starts_with("FLEET-WIN-01-"), "{written:?}");
+        assert!(written[0].ends_with(".json"), "{written:?}");
+
+        // Sending it again is a question already answered.
+        let again = post_body(
+            &state,
+            "/api/upload",
+            "application/json",
+            &good,
+            Some(&contributor),
+        )
+        .await;
+        assert_eq!(again.status, StatusCode::OK);
+        assert_eq!(again.json()["outcome"], "already indexed");
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rule that decides what a contributor may *read* decides what they
+    /// may *write*: one `scopes_allow`, two call sites.
+    #[tokio::test]
+    async fn a_scoped_contributor_cannot_submit_a_result_from_another_site() {
+        let dir = std::env::temp_dir().join(format!("lbf-upscope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        let state = state_for(&config);
+        let glasgow = session(&state, Role::Contributor, &[&[("site", "glasgow")]]);
+
+        let elsewhere = post_body(
+            &state,
+            "/api/upload",
+            "application/json",
+            &a_later_run(serde_json::json!({ "site": "edinburgh" })),
+            Some(&glasgow),
+        )
+        .await;
+        assert_eq!(
+            elsewhere.status,
+            StatusCode::FORBIDDEN,
+            "{}",
+            elsewhere.body
+        );
+        assert!(elsewhere.body.contains("--tag"), "{}", elsewhere.body);
+
+        // An untagged result is refused too: authority defined by a tag cannot
+        // be claimed by something carrying none.
+        assert_eq!(
+            post_body(
+                &state,
+                "/api/upload",
+                "application/json",
+                &a_later_run(serde_json::json!({})),
+                Some(&glasgow),
+            )
+            .await
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("dir").count(),
+            0,
+            "nothing refused may reach the disk"
+        );
+
+        // Their own site goes through.
+        let mine = post_body(
+            &state,
+            "/api/upload",
+            "application/json",
+            &a_later_run(serde_json::json!({ "site": "glasgow" })),
+            Some(&glasgow),
+        )
+        .await;
+        assert_eq!(mine.status, StatusCode::OK, "{}", mine.body);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
