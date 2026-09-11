@@ -8,9 +8,10 @@ into, and it indexes them and reports across the estate — executive summary,
 grouping, drilldown, and the outliers and red flags worth acting on.
 
 **Status: early but usable.** Ingest, cohort analytics, the red-flag engine, the
-web dashboard and single sign-on all work. Out of the box it runs
-unauthenticated on loopback; point it at your identity provider and it does OIDC
-with roles and per-site scoping. See [Roadmap](#roadmap).
+web dashboard, comparison, submitting results and single sign-on all work. Out
+of the box it runs unauthenticated on loopback; point it at your identity
+provider and it does OIDC with roles and per-site scoping. See
+[Roadmap](#roadmap).
 
 This file is written to be read start to finish. The
 [wiki](https://github.com/issinoho/loadbearer-fleet/wiki) holds what gets
@@ -429,6 +430,11 @@ resets when they're reimaged" is something an estate owner should know.
 - [x] Service packaging, config file, metrics — see [Running it as a service](#running-it-as-a-service)
 - [x] Backup, restore and moving between instances — see [Backup, restore, and
       moving to another server](#backup-restore-and-moving-to-another-server)
+- [x] Compare two to four runs head to head, from raw metrics rather than
+      scores, on the dashboard and at a prompt
+- [x] Submitting results through the dashboard and over the API, with ingest
+      tokens for machines nobody is sitting at — see [When a machine cannot
+      reach the share](#when-a-machine-cannot-reach-the-share)
 
 ## Analysis
 

@@ -36,8 +36,19 @@ It:
   sign-in is configured *and* `public_url` is https, or `--allow-remote` is
   passed explicitly;
 - **does not terminate TLS.** Put a reverse proxy in front of it;
-- **reads** the collection folder and never writes to it; **writes** the index,
-  and the document archive if `archive_dir` is set;
+- **reads** the collection folder, and never writes to it **unless
+  `[server] upload_dir` is set** — which is off by default, and which has to
+  name a directory *inside* the collection folder. It also **writes** the
+  index, and the document archive if `archive_dir` is set. Nothing here ever
+  deletes from the collection folder;
+- **accepts submitted results only through one route.** `POST /api/upload`,
+  from a signed-in `contributor` or an ingest token, with five things checked
+  before a byte is kept: that an `upload_dir` exists, that the caller may
+  upload, that the body is `application/json` (which no cross-origin form can
+  send, on top of `SameSite=Lax`), that the caller is inside a per-credential
+  rate limit, and that the document parses and falls within their tag scope.
+  The stored filename is built from the *document* and sanitised, never from
+  anything the request chose;
 - **treats the collection folder as untrusted input**, because anything that
   can write there controls it — in the documented deployment, every machine in
   the estate. A document is refused above **16 MB**, on its size on disk before
@@ -64,9 +75,17 @@ It:
   a private CA to the built-in roots for a self-hosted provider, and is the
   only way to do it.
 
-It stores no credentials. `client_secret` exists in the config for providers
-that require one, but the intended shape is a public client with PKCE, so the
-field is normally empty.
+It stores no user credentials — no passwords, and no tokens from the identity
+provider are kept after a sign-in. `client_secret` exists in the config for
+providers that require one, but the intended shape is a public client with
+PKCE, so the field is normally empty.
+
+Two bearer credentials **do** live in the configuration file in plain text when
+they are used: `[metrics] token`, and each `[[ingest.tokens]]` entry. They are
+compared by digesting both sides, so neither its length nor a prefix leaks
+through timing, but the file itself is the store — treat it as one. `640
+root:<service account>` is what the runbook installs it as, and revoking is
+deleting the entry and restarting.
 
 ## Before you report: known, by-design behaviour
 
@@ -93,6 +112,23 @@ field is normally empty.
   certificate. Verify it against `SHA256SUMS` and the build-provenance
   attestation — `gh attestation verify <file> --repo issinoho/loadbearer-fleet`
   — rather than by publisher.
+- **A contributor can fabricate a result.** Tag scoping on submission is
+  containment, not prevention: the tags are checked against what the uploader
+  sent, so a contributor scoped to `site=glasgow` can invent a machine tagged
+  `site=glasgow`. What it stops is them reaching Edinburgh. An *unscoped*
+  contributor is unconstrained, because an empty scope means the whole fleet
+  everywhere else in this tool. Give the ability to submit to the people you
+  would give the collection folder's write permission to.
+- **An ingest token may write and may not read.** It is accepted on
+  `/api/upload` and nowhere else — every reading endpoint requires a session
+  and never looks at an `Authorization` header — so a token leaking out of a
+  deployment script leaks a write path rather than the estate. It is also,
+  deliberately, always a `contributor` and never more.
+- **The upload rate limit is a safety valve, not DoS protection.** It bounds
+  what one credential can write, which is the runaway-script and leaked-token
+  case. Absorbing a flood is the reverse proxy's job; unauthenticated requests
+  never reach the limiter, because they are refused before there is a
+  principal to count them against.
 - **Result documents embed a machine inventory**, so the collection folder, the
   index, the archive and a `backup` snapshot are all machine fingerprints. See
   [Removing a machine](README.md#removing-a-machine--deleting-its-file-is-not-enough):
@@ -113,6 +149,15 @@ been audited":
   indistinguishable from one that doesn't exist, that both halves of the
   sign-in CSRF defence are required, that the post-sign-in redirect cannot
   leave the site, and that sessions expire and are stored only as hashes.
+  On the write path: that uploading is refused with no `upload_dir`, for the
+  wrong role, for the wrong content type and for a document outside the
+  caller's scope; that an unknown ingest token is refused *without* falling
+  back to whatever session sat beside it; that a token is refused on every
+  reading endpoint; that a metrics token is not an ingest token and vice
+  versa; that a hostile hostname cannot escape the upload directory; and that
+  a credential over its rate limit is refused before the document is parsed or
+  written. The token fall-through and the rate limit were each watched failing
+  with the guard removed before being kept.
   Also, from the input side: that a real compression bomb — built in the test,
   not mocked — is refused *before* it is decompressed, that an oversized plain
   document is refused on its size alone, and that half-finished sign-ins cannot
