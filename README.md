@@ -22,6 +22,14 @@ the [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API),
 [metrics](https://github.com/issinoho/loadbearer-fleet/wiki/Metrics), and
 [troubleshooting](https://github.com/issinoho/loadbearer-fleet/wiki/Troubleshooting).
 
+**Putting it into production** is two runbooks, ordered, with a command at the
+end of each step rather than a paragraph of caveats:
+[deploying as a service](https://github.com/issinoho/loadbearer-fleet/wiki/Deploying-as-a-Service)
+and
+[adding an identity provider](https://github.com/issinoho/loadbearer-fleet/wiki/Adding-an-Identity-Provider).
+`service preflight` and `check-auth` do the checking those runbooks would
+otherwise ask you to do by hand.
+
 ## Getting started
 
 The dashboard reads a folder of result files, so the whole job is: get one
@@ -517,129 +525,36 @@ server-side and keyed by the token's SHA-256 so a memory dump doesn't hand
 anyone a live session. They live in memory, so a restart signs everyone out;
 there are no refresh tokens stored anywhere.
 
-### Self-hosted providers — Authelia, Keycloak, Authentik
+### Other providers, and proving it before anyone tries
 
 Nothing here is Entra-specific: any provider with a discovery document, the
-authorization code flow and PKCE works. Two things catch people out, and both
-are visible in `check-auth` before a user ever tries to sign in.
+authorization code flow and PKCE works. **Authelia has been run end to end**,
+and Keycloak and Authentik follow the same shape.
 
-**Groups must reach the ID token.** This reads the ID token and **never calls
-the userinfo endpoint**, so a `groups` claim that only appears at userinfo is
-invisible — you sign in successfully and match no grant. On a self-hosted
-provider that is usually two settings rather than one: a scope to *request* the
-claim, and something that decides which claims go in the ID token rather than
-only at userinfo. Entra needs the opposite — no scope, a token-configuration
-change.
+Two things catch people out, both covered in the runbook:
 
-#### Authelia — a configuration that has been run
-
-Verified end to end against **Authelia 4.39.25** on 2026-09-11: discovery,
-sign-in, the code exchange, and a group claim read out of the ID token and
-mapped to a role.
-
-On the Authelia side, the client and the claims policy that puts `groups`
-where this can see it:
-
-```yaml
-identity_providers:
-  oidc:
-    claims_policies:
-      fleet:
-        id_token:
-          - 'groups'
-    clients:
-      - client_id: 'loadbearer-fleet'
-        client_name: 'loadbearer-fleet'
-        public: true
-        require_pkce: true
-        pkce_challenge_method: 'S256'
-        token_endpoint_auth_method: 'none'
-        authorization_policy: 'two_factor'
-        claims_policy: 'fleet'
-        redirect_uris:
-          - 'https://fleet.example.com/auth/callback'
-        scopes: ['openid', 'profile', 'email', 'groups']
-```
-
-`claims_policies` is the part that matters and the part without an equivalent
-before 4.39 — without it `groups` goes to userinfo only, and this cannot read
-it. `token_endpoint_auth_method: 'none'` matters too: the exchange arrives
-with no client secret, and getting it wrong fails *after* the user has
-authenticated, which is a confusing place to land.
-
-And on this side:
-
-```toml
-[auth]
-mode = "oidc"
-issuer = "https://auth.example.com"     # bare origin, no trailing slash
-client_id = "loadbearer-fleet"
-client_secret = ""
-groups_claim = "groups"
-extra_scopes = ["groups"]
-
-[[auth.grants]]
-group = "fleet-admins"     # the group *name* from users_database.yml
-role = "admin"
-```
-
-Two things about the reverse proxy in front of Authelia, both of which look
-like problems here and are not:
-
-- **Authelia derives its issuer from the request**, so the proxy must pass the
-  original `Host` and set `X-Forwarded-Proto: https`. With `http` there,
-  Authelia refuses discovery outright — and the error surfaces as a failed
-  discovery from this side.
-- **Do not put this dashboard behind Authelia's forward-auth.** It is an OIDC
-  *client*, not a protected app; `auth_request` in front of it would intercept
-  the callback. Authelia protects nothing here, it issues tokens.
-
-#### An internal CA needs pointing at
-
-The HTTP client trusts a built-in root set and does **not** read the machine's
-trust store, so installing your CA on the server changes nothing. Point at it:
-
-```toml
-[auth]
-ca_bundle = '/etc/loadbearer-fleet/internal-ca.pem'
-```
-
-It is added to the built-in roots rather than replacing them, so moving the
-provider to a publicly-trusted certificate later doesn't break anything. A
-publicly-trusted certificate — Let's Encrypt via DNS-01 works for an
-internal-only hostname — needs no setting at all.
-
-`check-auth` reports both, so you can see what it will look for:
+- **Groups must reach the ID token.** This reads the ID token and never calls
+  the userinfo endpoint, so a claim that only appears at userinfo is invisible
+  — you sign in successfully and match no grant. On a self-hosted provider that
+  is usually a scope *plus* a setting about which claims go in the ID token.
+- **An internal CA has to be pointed at** with `auth.ca_bundle`. The HTTP
+  client trusts a built-in root set and does not read the machine's trust
+  store, so installing the CA on the server changes nothing.
 
 ```
-discovery succeeded for https://auth.example.internal
-  client_id:    loadbearer-fleet
-  client type:  public (PKCE, no secret)
-  redirect URI: https://fleet.example.internal/auth/callback
-  groups claim: groups
-  extra scopes: groups
-  CA trust:     built-in roots + /etc/loadbearer-fleet/internal-ca.pem
-  grants:       2
+loadbearer-fleet --config /etc/loadbearer-fleet/fleet.toml check-auth
 ```
 
-What it does **not** test is the code exchange or whether the group claim
-actually reaches the ID token — both need a real sign-in. When one fails, the
-refusal is the diagnostic: it counts the groups it decoded, so `0 group(s)`
-means the claim never arrived and any other number means it did and your
-grants don't match it.
+That contacts the provider and sends the same authorization request a real
+sign-in sends, so it proves discovery, the issuer, the certificate, the client
+registration, the redirect URI, the scopes and PKCE — and exits non-zero, so it
+can gate a deploy. What it cannot know it lists, because the group claim only
+appears in a real ID token.
 
-#### If the sign-in fails, in the order things break
-
-| Symptom | Where to look |
-| --- | --- |
-| `check-auth` fails on the certificate | `ca_bundle`, or give the provider a publicly-trusted certificate |
-| `check-auth` fails on the issuer not matching | the proxy is not passing `Host` / `X-Forwarded-Proto: https`, so the provider is advertising the wrong issuer |
-| `invalid_scope` at the provider | the client is missing one of `openid profile email groups` |
-| `invalid_client` at the exchange | the client is not registered as public — `token_endpoint_auth_method: none` |
-| Signed in, refused, `0 group(s)` | the claim is not in the ID token — a provider setting, not a setting here |
-| Signed in, refused, `N group(s)` | the claim arrived; `[[auth.grants]] group` does not match what is in it |
-
-See [SECURITY.md](SECURITY.md) for what has and hasn't been verified.
+Full detail, per provider:
+**[Adding an identity provider](https://github.com/issinoho/loadbearer-fleet/wiki/Adding-an-Identity-Provider)**
+and
+**[Authelia](https://github.com/issinoho/loadbearer-fleet/wiki/Identity-Provider-Authelia)**.
 
 ### It will not put the estate on the wire in the clear
 
@@ -656,76 +571,34 @@ The dashboard does not terminate TLS. Put a reverse proxy in front of it and set
 
 ## Running it as a service
 
-### On Windows
+`service preflight` checks everything the service needs before you install
+anything — the account, the directories, the paths, the port — and names what
+is missing with its fix. It exits non-zero, so a deploy script can stop on it:
 
-```powershell
-# The folder first: `>` will not create one, and fails with
-# "Could not find a part of the path".
-New-Item -ItemType Directory -Force C:\ProgramData\loadbearer-fleet | Out-Null
-$cfg = "C:\ProgramData\loadbearer-fleet\fleet.toml"
-.\loadbearer-fleet.exe init-config | Set-Content -Encoding utf8 $cfg
-# fill it in, then, from an elevated prompt:
-.\loadbearer-fleet.exe --config $cfg service install
-sc.exe start loadbearer-fleet
+```
+loadbearer-fleet --config /etc/loadbearer-fleet/fleet.toml service preflight
 ```
 
-`Set-Content -Encoding utf8` rather than `>` because **Windows PowerShell 5.1
-redirects as UTF-16**, and it is still what `powershell.exe` runs on a Windows
-Server box. The config is read as UTF-8, so `>` there gets you `reading config
-from ...: stream did not contain valid UTF-8`. PowerShell 7 (`pwsh`) redirects
-as UTF-8 and `>` is fine. `Set-Content -Encoding utf8` works on both — it adds
-a byte-order mark on 5.1 and not on 7, and the parser accepts either.
-
-### On Linux, with systemd
-
-The unit is hardened, which means it will not start unless the things it
-mentions already exist. All of it, in order:
-
-```bash
-# The binary where the service will run it from. ExecStart is whichever binary
-# prints the unit, so install it first or the unit points into your download.
-sudo install -m 755 ./loadbearer-fleet /usr/local/bin/loadbearer-fleet
-
-# The account the unit runs as. `--user` defaults to this name, and systemd
-# fails the unit with 217/USER if it does not exist.
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin loadbearer-fleet
-
-# The directories it writes. ReadWritePaths cannot create them, and a missing
-# one fails the unit with 226/NAMESPACE — which says nothing about the cause.
-sudo mkdir -p /etc/loadbearer-fleet /var/lib/loadbearer-fleet /var/log/loadbearer-fleet
-sudo chown loadbearer-fleet: /var/lib/loadbearer-fleet /var/log/loadbearer-fleet
-
-# `sudo` does not help a redirect — the shell opens the file before sudo runs.
-loadbearer-fleet init-config | sudo tee /etc/loadbearer-fleet/fleet.toml > /dev/null
-sudo nano /etc/loadbearer-fleet/fleet.toml
-```
-
-Point `index`, `archive_dir` and `[log] file` at `/var/lib/loadbearer-fleet`
-and `/var/log/loadbearer-fleet`. **Not at your home directory** — the unit sets
-`ProtectHome=yes`, which makes `/home`, `/root` and `/run/user` *invisible* to
-the service rather than merely unreadable, so a path there fails as though it
-were never created. `service unit` refuses to print a unit for a config like
-that rather than letting you find out from systemd.
+The short path on Linux, once that is clean:
 
 ```bash
 sudo loadbearer-fleet --config /etc/loadbearer-fleet/fleet.toml service unit \
   | sudo tee /etc/systemd/system/loadbearer-fleet.service
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now loadbearer-fleet
-systemctl status loadbearer-fleet --no-pager
+sudo systemctl daemon-reload && sudo systemctl enable --now loadbearer-fleet
 ```
 
-Two lines worth reading in the unit before you enable it: `ExecStart=` should
-say `/usr/local/bin/loadbearer-fleet`, and `ReadWritePaths=` should name every
-directory it writes — the index's, the log's, and the archive's. Everything
-else is read-only under `ProtectSystem=strict`.
+and on Windows, from an elevated prompt:
 
-The log rotates daily with the date appended, so it is
-`/var/log/loadbearer-fleet/fleet.log.2026-09-11`, not `fleet.log`.
+```powershell
+.\loadbearer-fleet.exe --config C:\ProgramData\loadbearer-fleet\fleet.toml service install
+sc.exe start loadbearer-fleet
+```
 
-`--user <account>` overrides the service account if you would rather it ran as
-an existing one.
+**[Deploying as a service](https://github.com/issinoho/loadbearer-fleet/wiki/Deploying-as-a-Service)**
+is the full runbook: the order things have to exist in, what each step proves,
+upgrading, and the reverse proxy. Worth following rather than improvising —
+the generated unit is hardened, and hardening means it refuses to start unless
+what it names is already there.
 
 It stops when it is told to. systemd's SIGTERM, Ctrl+C and the Windows service
 controller's stop request all land in the same shutdown path, so a restart is
