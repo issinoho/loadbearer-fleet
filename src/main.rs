@@ -246,10 +246,11 @@ fn init_logging(log: &config::Log, cli_level: Option<&str>) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    // Both of these write a document to stdout and must stay pipeable, so they
-    // run before logging is set up — and before the config is loaded, since
+    // These two write a document to stdout and must stay pipeable, so they run
+    // before logging is set up — and before the config is loaded, since
     // `reference` describes the settings rather than needing them and must
-    // work on a machine that has never been configured.
+    // work on a machine that has never been configured. `service unit` is the
+    // third of that kind but needs the config, so it is handled below.
     match cli.command {
         Command::InitConfig => {
             print!("{}", Config::starter());
@@ -273,6 +274,27 @@ fn main() -> Result<()> {
     if let Some(index) = &cli.index {
         config.server.index = index.clone();
     }
+
+    // `service unit` prints a document too, but it needs the config to build
+    // one — so it goes after the load and before logging. Setting logging up
+    // *creates the log directory*, which turns previewing a unit as an ordinary
+    // user into "creating the log directory /var/log/loadbearer-fleet" instead
+    // of a unit. Printing a file for review should not need write access to
+    // somewhere the service will later run.
+    if let Command::Service {
+        action: ServiceAction::Unit { user },
+    } = &cli.command
+    {
+        let path = service::preflight(cli.config.as_deref(), &config)?;
+        service::systemd_preflight(&config)?;
+        // Whatever binary prints the unit is the one it will start, so
+        // generating it from an unpacked tarball in a home directory bakes that
+        // path into ExecStart — and then ProtectHome hides it.
+        let exe = std::env::current_exe().context("finding this executable")?;
+        print!("{}", service::systemd_unit(&exe, path, &config, user));
+        return Ok(());
+    }
+
     init_logging(&config.log, cli.log_level.as_deref())?;
     // First line of every run, before any work, because a service log rotates
     // daily and outlives upgrades: without this, a line from six weeks ago
@@ -454,17 +476,7 @@ fn main() -> Result<()> {
                 )
             }
             ServiceAction::Uninstall => service::uninstall(),
-            ServiceAction::Unit { user } => {
-                let path = service::preflight(cli.config.as_deref(), &config)?;
-                service::systemd_preflight(&config)?;
-                // Whatever binary printed the unit is the one it will start, so
-                // generating it from an unpacked tarball in a home directory
-                // bakes that path into ExecStart — and then ProtectHome hides
-                // it. Worth saying, because the unit looks right either way.
-                let exe = std::env::current_exe().context("finding this executable")?;
-                print!("{}", service::systemd_unit(&exe, path, &config, user));
-                Ok(())
-            }
+            ServiceAction::Unit { .. } => unreachable!("handled before logging"),
         },
         Command::Serve {
             dir,

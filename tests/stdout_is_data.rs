@@ -80,6 +80,52 @@ fn init_config_writes_only_the_config_to_stdout() {
     assert!(text.starts_with('#'), "should open with its own comment");
 }
 
+/// `service unit` prints a file for review, so it must not need write access to
+/// anywhere the service will later run. It used to set logging up first, which
+/// *creates the log directory* — so an ordinary user previewing a unit got
+/// "creating the log directory /var/log/loadbearer-fleet" rather than a unit,
+/// and the only way to read one was as root.
+#[test]
+fn service_unit_prints_a_unit_without_creating_anything() {
+    let dir = scratch("unit");
+    let log_dir = dir.join("logs-that-should-not-be-created");
+    let cfg = dir.join("fleet.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            // `bind` and `index` have no serde default, so a partial [server]
+            // table is rejected outright — all three have to be here.
+            "[server]\n\
+             bind = '127.0.0.1:8787'\n\
+             public_url = 'https://fleet.example'\n\
+             index = '{}'\n\
+             [log]\n\
+             file = '{}'\n",
+            dir.join("i.db").display().to_string().replace('\\', "/"),
+            log_dir
+                .join("fleet.log")
+                .display()
+                .to_string()
+                .replace('\\', "/"),
+        ),
+    )
+    .expect("write config");
+
+    let unit = stdout_of(&["--config", cfg.to_str().expect("path"), "service", "unit"]);
+
+    assert!(unit.contains("[Service]"), "not a unit file:\n{unit}");
+    assert!(unit.contains("ExecStart="), "no ExecStart:\n{unit}");
+    assert!(!unit.contains('\u{1b}'), "stdout carried ANSI escape codes");
+    assert!(
+        !log_dir.exists(),
+        "printing a unit created {} — reviewing a file should not need write \
+         access to where the service will run",
+        log_dir.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn reference_writes_only_markdown_to_stdout() {
     let text = stdout_of(&["reference"]);
