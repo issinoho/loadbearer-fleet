@@ -2,6 +2,11 @@
 
 # loadbearer-fleet
 
+[![Release](https://img.shields.io/github/v/release/issinoho/loadbearer-fleet?label=release)](https://github.com/issinoho/loadbearer-fleet/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/issinoho/loadbearer-fleet/total?label=downloads)](https://github.com/issinoho/loadbearer-fleet/releases)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-blue)
+[![License](https://img.shields.io/github/license/issinoho/loadbearer-fleet)](LICENSE)
+
 A fleet dashboard over collected [loadbearer](https://github.com/issinoho/loadbearer)
 results: point it at the folder your deployment tool drops `.json` result files
 into, and it indexes them and reports across the estate — executive summary,
