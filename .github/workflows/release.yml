@@ -118,7 +118,7 @@ jobs:
         # Skip on a throwaway workflow_dispatch build, so a test run leaves no
         # public attestation behind.
         if: github.event_name == 'push' || inputs.publish_release
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             loadbearer-fleet-*.zip
