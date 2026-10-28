@@ -194,7 +194,7 @@ fn content_hash(text: &str) -> String {
 /// Rows written before the column existed keep `NULL`, which is the honest
 /// answer — see `scan --reindex` for filling them in from the documents.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    const ADDED: [(&str, &str, &str); 5] = [
+    const ADDED: [(&str, &str, &str); 13] = [
         ("subtest", "label", "TEXT"),
         ("subtest", "direction", "TEXT"),
         // Component ids are short and lower-case — `cpu`, `memory` — so a
@@ -206,6 +206,18 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         // itself, which is most of them.
         ("run", "uploaded_by", "TEXT"),
         ("run", "uploaded_at", "TEXT"),
+        // The machine-age evidence, from loadbearer 1.6.0's `machine.age`,
+        // `firmware` and `nvme` blocks. NULL for older documents, which carry
+        // none of it. The drive columns are the first NVMe drive's, the one
+        // loadbearer's own age estimate reads.
+        ("run", "system_model", "TEXT"),
+        ("run", "cpu_family", "TEXT"),
+        ("run", "cpu_launched", "TEXT"),
+        ("run", "max_age_months", "INTEGER"),
+        ("run", "firmware_dated", "TEXT"),
+        ("run", "firmware_likely_original", "INTEGER"),
+        ("run", "drive_power_on_hours", "INTEGER"),
+        ("run", "drive_wear_pct", "INTEGER"),
     ];
 
     for (table, column, decl) in ADDED {
@@ -821,6 +833,8 @@ impl Index {
         let key = doc.machine_key();
         let ident = doc.machine.identity.clone().unwrap_or_default();
         let caveats = doc.quality_caveats().join(" | ");
+        let age = doc.machine.age.clone().unwrap_or_default();
+        let drive = doc.machine.nvme.first();
         let tx = self.conn.transaction()?;
 
         tx.execute(
@@ -829,9 +843,12 @@ impl Index {
                  baseline, build_isa, overall_score, overall_grade, cpu_model, cpu_cores,
                  ram_bytes, os, arch, serial, asset_tag, on_ac, thermal_limited,
                  battery_health, battery_cycles, partial, caveats, source_path,
-                 content_hash, ingested_at
+                 content_hash, system_model, cpu_family, cpu_launched, max_age_months,
+                 firmware_dated, firmware_likely_original, drive_power_on_hours,
+                 drive_wear_pct, ingested_at
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
-                       ?19,?20,?21,?22,?23,?24,?25,?26, datetime('now'))",
+                       ?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,
+                       datetime('now'))",
             params![
                 key.value,
                 key.kind.as_str(),
@@ -859,6 +876,14 @@ impl Index {
                 caveats,
                 path.display().to_string(),
                 hash,
+                doc.machine.firmware.as_ref().and_then(|f| f.system_name()),
+                age.cpu_family,
+                age.cpu_launched,
+                age.max_age_months,
+                age.firmware_dated,
+                age.firmware_likely_original,
+                drive.map(|d| d.power_on_hours as i64),
+                drive.map(|d| d.percentage_used),
             ],
         )?;
         let run_id = tx.last_insert_rowid();

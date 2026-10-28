@@ -13,7 +13,8 @@
 //!   field is not a breaking change and consumers must tolerate one. There is
 //!   no `deny_unknown_fields` anywhere in this file.
 //! * **Nearly everything is optional.** `gates`, `notes`, `tags`,
-//!   `machine.identity`, `telemetry` and `battery` are all omitted when empty
+//!   `machine.identity`, `telemetry`, `battery`, and `machine.firmware` /
+//!   `nvme` / `age` are all omitted when empty
 //!   or unsupported, and older files predate them entirely — a 1.2.4 result has
 //!   no identity block at all.
 //! * **Open enumerations stay `String`.** `grade`, `confidence` and
@@ -94,6 +95,113 @@ pub struct Machine {
     pub disks: Vec<Disk>,
     #[serde(default)]
     pub battery: Option<Battery>,
+    /// System model and firmware. 1.6.0+.
+    #[serde(default)]
+    pub firmware: Option<Firmware>,
+    /// Health counters for each NVMe drive loadbearer could query — absent on
+    /// a run without admin / root. 1.6.0+.
+    #[serde(default)]
+    pub nvme: Vec<Nvme>,
+    /// loadbearer's estimate of how old the machine is. 1.6.0+.
+    #[serde(default)]
+    pub age: Option<Age>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Firmware {
+    #[serde(default)]
+    pub system_vendor: Option<String>,
+    #[serde(default)]
+    pub system_model: Option<String>,
+    /// The marketing name on Lenovo, where `system_model` is a type code.
+    #[serde(default)]
+    pub system_version: Option<String>,
+    #[serde(default)]
+    pub bios_version: Option<String>,
+    /// `YYYY-MM-DD`.
+    #[serde(default)]
+    pub bios_date: Option<String>,
+}
+
+impl Firmware {
+    /// "Dell Inc. Latitude 7440", with Lenovo's marketing name in brackets —
+    /// the same rendering loadbearer's own `info` uses.
+    pub fn system_name(&self) -> Option<String> {
+        let mut name = [self.system_vendor.as_deref(), self.system_model.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lenovo = self
+            .system_vendor
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("lenovo"));
+        if let (true, Some(v)) = (lenovo, &self.system_version) {
+            name = if name.is_empty() {
+                v.clone()
+            } else {
+                format!("{name} ({v})")
+            };
+        }
+        (!name.is_empty()).then_some(name)
+    }
+}
+
+/// One NVMe drive's SMART / health log.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Nvme {
+    #[serde(default)]
+    pub device: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub power_on_hours: u64,
+    #[serde(default)]
+    pub power_cycles: u64,
+    #[serde(default)]
+    pub unsafe_shutdowns: u64,
+    /// The vendor's estimate of rated endurance used. Can pass 100.
+    #[serde(default)]
+    pub percentage_used: u8,
+    #[serde(default)]
+    pub available_spare_pct: u8,
+    #[serde(default)]
+    pub data_written_tb: f64,
+    #[serde(default)]
+    pub media_errors: u64,
+    /// Non-zero means the drive itself is reporting a problem.
+    #[serde(default)]
+    pub critical_warning: u8,
+}
+
+/// The age estimate. Dates are `YYYY-MM`, spans whole months, all as of the
+/// run. loadbearer's `VERSIONING.md` says the *values* come from a data table
+/// that changes between releases and `cpu_family` is descriptive, so this keys
+/// on `cpu_launched`, never the wording.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Age {
+    #[serde(default)]
+    pub as_of: String,
+    #[serde(default)]
+    pub cpu_family: Option<String>,
+    /// When the CPU's generation launched — the machine can't be older.
+    #[serde(default)]
+    pub cpu_launched: Option<String>,
+    /// Upper bound on the machine's age at the run.
+    #[serde(default)]
+    pub max_age_months: Option<u32>,
+    #[serde(default)]
+    pub firmware_dated: Option<String>,
+    #[serde(default)]
+    pub firmware_after_launch_months: Option<u32>,
+    /// The firmware is probably what the machine shipped with, which dates the
+    /// machine to about `firmware_dated`.
+    #[serde(default)]
+    pub firmware_likely_original: Option<bool>,
+    #[serde(default)]
+    pub drive_power_on_hours: Option<u64>,
+    #[serde(default)]
+    pub battery_cycles: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -61,6 +61,20 @@ pub struct RunRef {
     pub comparability: Comparability,
     pub overall_score: Option<f64>,
     pub overall_grade: String,
+    /// The age evidence recorded with this run (loadbearer 1.6.0+), so a
+    /// comparison can set machine age beside performance. All `None` for an
+    /// older run.
+    pub system_model: Option<String>,
+    pub cpu_family: Option<String>,
+    pub cpu_launched: Option<String>,
+    /// Recorded by loadbearer, or derived here from `cpu_model`.
+    pub age_source: Option<crate::analytics::AgeSource>,
+    /// Upper bound on the machine's age today, in months.
+    pub max_age_months_now: Option<i64>,
+    pub firmware_dated: Option<String>,
+    pub drive_power_on_hours: Option<i64>,
+    pub drive_wear_pct: Option<i64>,
+    pub battery_cycles: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -292,12 +306,17 @@ fn first_duplicate(ids: &[i64]) -> Option<i64> {
 fn load_run(conn: &Connection, run_id: i64) -> Result<RunRef> {
     let row = conn.query_row(
         "SELECT machine_key, hostname, taken_at, cpu_model, preset, profile, baseline,
-                build_isa, overall_score, overall_grade
+                build_isa, overall_score, overall_grade, system_model, cpu_family,
+                cpu_launched, firmware_dated, drive_power_on_hours, drive_wear_pct,
+                battery_cycles
            FROM run WHERE id = ?1",
         [run_id],
         |r| {
             let machine_key: String = r.get(0)?;
             let hostname: Option<String> = r.get(1)?;
+            let cpu_model: String = r.get(3)?;
+            let (cpu_launched, cpu_family, age_source) =
+                crate::analytics::resolve_launch(r.get(12)?, r.get(11)?, &cpu_model);
             Ok(RunRef {
                 run_id,
                 label: hostname
@@ -305,7 +324,7 @@ fn load_run(conn: &Connection, run_id: i64) -> Result<RunRef> {
                     .unwrap_or_else(|| machine_key.clone()),
                 machine_key,
                 taken_at: r.get(2)?,
-                cpu_model: r.get(3)?,
+                cpu_model,
                 comparability: Comparability {
                     preset: r.get(4)?,
                     profile: r.get(5)?,
@@ -314,6 +333,17 @@ fn load_run(conn: &Connection, run_id: i64) -> Result<RunRef> {
                 },
                 overall_score: r.get(8)?,
                 overall_grade: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                system_model: r.get(10)?,
+                cpu_family,
+                age_source,
+                max_age_months_now: cpu_launched.as_deref().and_then(|l| {
+                    crate::analytics::months_since(l, time::OffsetDateTime::now_utc())
+                }),
+                cpu_launched,
+                firmware_dated: r.get(13)?,
+                drive_power_on_hours: r.get(14)?,
+                drive_wear_pct: r.get(15)?,
+                battery_cycles: r.get(16)?,
             })
         },
     );

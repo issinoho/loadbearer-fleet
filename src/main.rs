@@ -15,6 +15,7 @@ mod auth;
 mod compare;
 mod config;
 mod index;
+mod launch;
 mod metrics;
 mod ratelimit;
 mod reference;
@@ -643,6 +644,9 @@ fn print_comparison(c: &compare::Comparison) {
             r.comparability.preset,
             r.cpu_model
         );
+        if let Some(line) = age_line(r) {
+            println!("      {line}");
+        }
     }
     println!();
     let heads: String = c
@@ -676,6 +680,32 @@ fn print_comparison(c: &compare::Comparison) {
     for w in &c.warnings {
         println!("  - {w}");
     }
+}
+
+/// "built 2023-01 or later, at most 3.8 years old · drive 12,881 h" — the age
+/// evidence for one run, or `None` for a run from before loadbearer recorded
+/// it.
+fn age_line(r: &compare::RunRef) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(l) = &r.cpu_launched {
+        parts.push(match r.max_age_months_now {
+            Some(m) => format!(
+                "built {l} or later, at most {:.1} years old",
+                m as f64 / 12.0
+            ),
+            None => format!("built {l} or later"),
+        });
+        if r.age_source == Some(analytics::AgeSource::Derived) {
+            parts.push("from the CPU model".to_string());
+        }
+    }
+    if let Some(h) = r.drive_power_on_hours {
+        parts.push(format!("drive {h} h"));
+    }
+    if let Some(c) = r.battery_cycles {
+        parts.push(format!("battery {c} cycles"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// A column is ten characters wide; a hostname often is not.

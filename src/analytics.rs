@@ -209,6 +209,27 @@ pub struct MachineView {
     pub on_ac: Option<bool>,
     pub battery_health: Option<f64>,
     pub battery_cycles: Option<i64>,
+    /// "Dell Inc. Latitude 7440", from the firmware.
+    pub system_model: Option<String>,
+    /// The machine-age evidence loadbearer recorded — see `schema::Age`. All
+    /// `None` for a run from before loadbearer 1.6.0.
+    pub cpu_family: Option<String>,
+    /// `YYYY-MM`: the machine was built this month or later.
+    pub cpu_launched: Option<String>,
+    /// Where `cpu_launched` and `cpu_family` came from. `None` when there
+    /// is no launch date at all.
+    pub age_source: Option<AgeSource>,
+    /// Upper bound on the machine's age **at the run**, in months. For its age
+    /// today, count from `cpu_launched`.
+    pub max_age_months: Option<i64>,
+    pub firmware_dated: Option<String>,
+    pub firmware_likely_original: Option<bool>,
+    pub drive_power_on_hours: Option<i64>,
+    pub drive_wear_pct: Option<i64>,
+    /// Upper bound on the machine's age **today**, in months: `cpu_launched`
+    /// to the snapshot. The field to rank or compare machines by — unlike
+    /// `max_age_months` it doesn't depend on when each was last measured.
+    pub max_age_months_now: Option<i64>,
     pub low_confidence_cpu_subtests: i64,
     pub tags: BTreeMap<String, String>,
     pub components: Vec<ComponentView>,
@@ -352,6 +373,53 @@ fn mad(sorted: &[f64], med: f64) -> f64 {
 fn age_days(taken_at: &str, now: OffsetDateTime) -> Option<f64> {
     let then = OffsetDateTime::parse(taken_at, &Rfc3339).ok()?;
     Some((now - then).as_seconds_f64() / 86_400.0)
+}
+
+/// Where a machine's launch date came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgeSource {
+    /// loadbearer recorded it in the run's `machine.age` (1.6.0+).
+    Recorded,
+    /// The run predates that, so this build worked it out from `cpu_model`
+    /// with its copy of the launch table — see `launch`.
+    Derived,
+}
+
+/// The CPU's launch month and family for a run: what loadbearer recorded if
+/// it recorded anything, otherwise derived from the CPU model.
+///
+/// A run that recorded an age block but no launch (a CPU loadbearer didn't
+/// know) is still derived from here, so a correction to this table reaches it
+/// too.
+pub fn resolve_launch(
+    recorded: Option<String>,
+    recorded_family: Option<String>,
+    cpu_model: &str,
+) -> (Option<String>, Option<String>, Option<AgeSource>) {
+    if recorded.is_some() {
+        return (recorded, recorded_family, Some(AgeSource::Recorded));
+    }
+    match crate::launch::cpu_launch(cpu_model) {
+        Some(l) => (
+            Some(l.year_month()),
+            Some(l.family),
+            Some(AgeSource::Derived),
+        ),
+        None => (None, None, None),
+    }
+}
+
+/// Whole months from a `YYYY-MM` to `now`; `None` if unreadable or in the
+/// future.
+pub fn months_since(year_month: &str, now: OffsetDateTime) -> Option<i64> {
+    let year: i64 = year_month.get(0..4)?.parse().ok()?;
+    let month: i64 = year_month.get(5..7)?.parse().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let months = (now.year() as i64 * 12 + u8::from(now.month()) as i64) - (year * 12 + month);
+    (months >= 0).then_some(months)
 }
 
 fn pct_delta(value: f64, reference: f64) -> Option<f64> {
@@ -508,7 +576,9 @@ fn load_latest(
         "SELECT id, machine_key, key_kind, hostname, taken_at, tool_version, preset, profile,
                 baseline, build_isa, overall_score, overall_grade, cpu_model, cpu_cores,
                 ram_bytes, os, arch, serial, asset_tag, on_ac, thermal_limited,
-                battery_health, battery_cycles, partial, caveats, source_path
+                battery_health, battery_cycles, partial, caveats, source_path,
+                system_model, cpu_family, cpu_launched, max_age_months, firmware_dated,
+                firmware_likely_original, drive_power_on_hours, drive_wear_pct
            FROM run WHERE id IN ({LATEST}) ORDER BY machine_key"
     ))?;
 
@@ -525,7 +595,22 @@ fn load_latest(
         };
         let caveats: String = r.get(24)?;
         let seen = counts.get(key.as_str()).copied();
+        let cpu_model: String = r.get(12)?;
+        let (cpu_launched, cpu_family, age_source) =
+            resolve_launch(r.get(28)?, r.get(27)?, &cpu_model);
+        // At the run, for a derived launch too, so the field means the same
+        // thing whichever way the launch was found.
+        let max_age_months: Option<i64> = match age_source {
+            Some(AgeSource::Derived) => cpu_launched
+                .as_deref()
+                .and_then(|l| months_since(l, OffsetDateTime::parse(&taken_at, &Rfc3339).ok()?)),
+            _ => r.get(29)?,
+        };
         Ok(MachineView {
+            max_age_months_now: cpu_launched.as_deref().and_then(|l| months_since(l, now)),
+            max_age_months,
+            age_source,
+            cpu_family,
             cohort: cohort_id(&r.get::<_, String>(12)?, &cmp),
             age_days: age_days(&taken_at, now),
             runs: seen.map_or(1, |s| s.0),
@@ -538,7 +623,7 @@ fn load_latest(
             comparability: cmp,
             score: r.get(10)?,
             grade: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
-            cpu_model: r.get(12)?,
+            cpu_model,
             cpu_cores: r.get(13)?,
             ram_bytes: r.get(14)?,
             os: r.get(15)?,
@@ -556,6 +641,12 @@ fn load_latest(
                 .map(str::to_string)
                 .collect(),
             source_path: r.get(25)?,
+            system_model: r.get(26)?,
+            cpu_launched,
+            firmware_dated: r.get(30)?,
+            firmware_likely_original: r.get(31)?,
+            drive_power_on_hours: r.get(32)?,
+            drive_wear_pct: r.get(33)?,
             low_confidence_cpu_subtests: low_conf.get(&run_id).copied().unwrap_or(0),
             tags: tags.remove(&run_id).unwrap_or_default(),
             components: components.remove(&run_id).unwrap_or_default(),
@@ -1113,6 +1204,7 @@ impl Filter {
                 m.serial.as_deref(),
                 m.asset_tag.as_deref(),
                 Some(m.cpu_model.as_str()),
+                m.system_model.as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -1715,6 +1807,102 @@ mod tests {
             "one machine, several findings: {:?}",
             codes(&s)
         );
+    }
+
+    /// loadbearer 1.6.0's age evidence reaches the machine view; a document
+    /// from before it leaves every field empty rather than guessing.
+    #[test]
+    fn age_evidence_is_carried_through_to_the_machine() {
+        let mut e = Estate::new();
+        e.add("PC-OLD-CLIENT", 1000.0, "2026-09-01T10:00:00Z");
+        e.add_with("PC-NEW-CLIENT", 1000.0, "2026-10-28T10:00:00Z", |d| {
+            d["machine"]["firmware"] = json!({
+                "system_vendor": "LENOVO", "system_model": "20XW004BUK",
+                "system_version": "ThinkPad X1 Carbon Gen 9",
+                "bios_version": "1.15.0", "bios_date": "2021-06-02"
+            });
+            d["machine"]["nvme"] = json!([{
+                "device": "nvme0", "power_on_hours": 12881, "power_cycles": 667,
+                "unsafe_shutdowns": 195, "percentage_used": 19, "available_spare_pct": 100,
+                "data_written_tb": 60.11, "media_errors": 0, "critical_warning": 0
+            }]);
+            d["machine"]["age"] = json!({
+                "as_of": "2026-10",
+                "cpu_family": "11th-gen Intel Core (mobile)",
+                "cpu_launched": "2020-09",
+                "max_age_months": 73,
+                "firmware_dated": "2021-06",
+                "firmware_after_launch_months": 9,
+                "firmware_likely_original": true,
+                "drive_power_on_hours": 12881,
+                "some_future_field": "ignored"
+            });
+        });
+
+        let s = e.snap();
+        let m = machine(&s, "PC-NEW-CLIENT");
+        assert_eq!(
+            m.system_model.as_deref(),
+            Some("LENOVO 20XW004BUK (ThinkPad X1 Carbon Gen 9)")
+        );
+        assert_eq!(
+            m.cpu_family.as_deref(),
+            Some("11th-gen Intel Core (mobile)")
+        );
+        assert_eq!(m.cpu_launched.as_deref(), Some("2020-09"));
+        assert_eq!(m.max_age_months, Some(73));
+        assert_eq!(m.firmware_dated.as_deref(), Some("2021-06"));
+        assert_eq!(m.firmware_likely_original, Some(true));
+        assert_eq!(m.drive_power_on_hours, Some(12881));
+        assert_eq!(m.drive_wear_pct, Some(19));
+        // Counted to the snapshot, not the run: older for every month that
+        // passes without a new result.
+        let later = e.snap_at(OffsetDateTime::parse("2027-01-15T00:00:00Z", &Rfc3339).unwrap());
+        assert_eq!(
+            machine(&later, "PC-NEW-CLIENT").max_age_months_now,
+            Some(76)
+        );
+
+        assert_eq!(m.age_source, Some(AgeSource::Recorded));
+
+        // An older client recorded nothing, so the launch is derived from its
+        // CPU (the fixture's i7-1370P); what only the client can see — the
+        // firmware, the drive — stays empty rather than guessed.
+        let old = machine(&s, "PC-OLD-CLIENT");
+        assert_eq!(old.age_source, Some(AgeSource::Derived));
+        assert_eq!(old.cpu_launched.as_deref(), Some("2023-01"));
+        assert_eq!(
+            old.cpu_family.as_deref(),
+            Some("13th-gen Intel Core (mobile)")
+        );
+        assert_eq!(old.max_age_months, Some(44)); // to the run, 2026-09
+        assert!(old.max_age_months_now.is_some());
+        assert_eq!(old.firmware_dated, None);
+        assert_eq!(old.drive_power_on_hours, None);
+        assert_eq!(old.system_model, None);
+    }
+
+    #[test]
+    fn an_unknown_cpu_gets_no_age_rather_than_a_guess() {
+        let mut e = Estate::new();
+        e.add_with("PC-VM", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["machine"]["cpu_model"] = json!("QEMU Virtual CPU version 2.5+");
+        });
+        let s = e.snap();
+        let m = machine(&s, "PC-VM");
+        assert_eq!(m.age_source, None);
+        assert_eq!(m.cpu_launched, None);
+        assert_eq!(m.max_age_months_now, None);
+    }
+
+    #[test]
+    fn months_since_counts_whole_months_and_refuses_the_future() {
+        let now = OffsetDateTime::parse("2026-10-28T00:00:00Z", &Rfc3339).unwrap();
+        assert_eq!(months_since("2023-01", now), Some(45));
+        assert_eq!(months_since("2026-10", now), Some(0));
+        assert_eq!(months_since("2026-11", now), None);
+        assert_eq!(months_since("garbage", now), None);
+        assert_eq!(months_since("2026-13", now), None);
     }
 
     #[test]

@@ -106,6 +106,43 @@ function ago(days) {
   return `${(days / 365).toFixed(1)} years ago`;
 }
 
+/** "Jan 2023" from a `YYYY-MM`. */
+function monthYear(ym) {
+  const [y, mo] = (ym || '').split('-').map(Number);
+  if (!y || !mo) return ym || '—';
+  return new Date(Date.UTC(y, mo - 1, 1)).toLocaleDateString(undefined, {
+    month: 'short', year: 'numeric', timeZone: 'UTC',
+  });
+}
+
+/** "≤ 3.8 yr" — an upper bound, because the CPU's launch only says the machine
+ *  can't be older. */
+function maxAge(months) {
+  if (months === null || months === undefined) return '—';
+  return months < 12 ? `≤ ${months} mo` : `≤ ${(months / 12).toFixed(1)} yr`;
+}
+
+/** The age facts for a machine or a run, from loadbearer 1.6.0's age
+ *  evidence. Each line is null when its source wasn't recorded. */
+function ageFacts(m) {
+  const built = m.cpu_launched
+    ? `${maxAge(m.max_age_months_now)} — built ${monthYear(m.cpu_launched)} or later`
+      + (m.cpu_family ? ` · ${m.cpu_family}` : '')
+      + (m.age_source === 'derived' ? ' · from the CPU model' : '')
+    : null;
+  let firmware = null;
+  if (m.firmware_dated) {
+    firmware = `dated ${monthYear(m.firmware_dated)}`;
+    if (m.firmware_likely_original === true) firmware += ' — probably as shipped, so the machine likely dates from about then';
+    if (m.firmware_likely_original === false) firmware += ' — updated since it shipped';
+  }
+  const drive = m.drive_power_on_hours === null || m.drive_power_on_hours === undefined
+    ? null
+    : `${nf0.format(m.drive_power_on_hours)} h powered`
+      + (m.drive_wear_pct === null || m.drive_wear_pct === undefined ? '' : ` · ${m.drive_wear_pct}% of rated endurance used`);
+  return { built, firmware, drive };
+}
+
 function debounce(fn, ms) {
   let t;
   return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
@@ -1203,6 +1240,7 @@ export function renderMachines(main) {
       deltaCell(m.cohort_delta_pct),
       deltaCell(m.trend_pct),
       flagCount.get(m.key) || 0,
+      maxAge(m.max_age_months_now),
       ago(m.age_days),
       ...tagKeys.map((k) => m.tags?.[k] ?? '—'),
     ],
@@ -1210,7 +1248,7 @@ export function renderMachines(main) {
     // null after everything, ascending or descending, so "sort by owner" does
     // not bury the assigned machines under the unassigned ones.
     sort: [m.hostname || m.key, m.cpu_model, m.score, m.grade, m.cohort_delta_pct, m.trend_pct,
-      flagCount.get(m.key) || 0, -(m.age_days ?? 1e9),
+      flagCount.get(m.key) || 0, m.max_age_months_now ?? null, -(m.age_days ?? 1e9),
       ...tagKeys.map((k) => m.tags?.[k]?.toLowerCase() ?? null)],
   }));
 
@@ -1220,7 +1258,7 @@ export function renderMachines(main) {
     dataTable({
       columns: [{ label: 'Machine' }, { label: 'CPU' }, { label: 'Score', num: true }, { label: 'Grade' },
         { label: 'vs peers', num: true }, { label: 'vs own history', num: true },
-        { label: 'Findings', num: true }, { label: 'Measured' },
+        { label: 'Findings', num: true }, { label: 'Age', num: true }, { label: 'Measured' },
         ...tagKeys.map((k) => ({ label: k }))],
       rows,
       sortable: true,
@@ -1238,8 +1276,16 @@ export async function renderMachine(main, key) {
   }
   const { machine: m, flags, cohort, history, subtests } = payload;
 
+  const age = ageFacts(m);
   const facts = [
+    ...(m.system_model ? [['System', m.system_model]] : []),
     ['CPU', m.cpu_model],
+    ['Age', age.built || 'unknown — the CPU isn’t in the launch table'],
+    ...(age.firmware ? [['Firmware', age.firmware]] : []),
+    ...(age.drive ? [['Drive', age.drive]] : []),
+    ...(m.battery_cycles === null || m.battery_cycles === undefined ? [] : [['Battery',
+      `${m.battery_cycles} cycles`
+        + (m.battery_health === null || m.battery_health === undefined ? '' : ` · ${nf0.format(m.battery_health)}% of design capacity`)]]),
     ['Cores', `${m.cpu_cores} logical`],
     ['Memory', gib(m.ram_bytes)],
     ['OS', m.os || 'unknown'],
@@ -1507,6 +1553,31 @@ function compareTable(data) {
   ])));
   const table = el('table', { class: 'data compare' });
   const rows = [];
+
+  // What each machine is, before how it performs: age is the usual reason two
+  // machines differ, so it sits above the ratios rather than off to one side.
+  // Text, not ratios — "younger" isn't a direction a ratio can carry.
+  const facts = data.runs.map(ageFacts);
+  const machineRows = [
+    ['System', data.runs.map((r) => r.system_model || '—')],
+    ['Max age', data.runs.map((r) => maxAge(r.max_age_months_now))],
+    ['Built', data.runs.map((r) => (r.cpu_launched ? `${monthYear(r.cpu_launched)} or later` : '—'))],
+    ['Firmware', data.runs.map((r) => (r.firmware_dated ? monthYear(r.firmware_dated) : '—'))],
+    ['Drive', facts.map((f) => f.drive || '—')],
+    ['Battery', data.runs.map((r) => (r.battery_cycles === null || r.battery_cycles === undefined ? '—' : `${r.battery_cycles} cycles`))],
+  ].filter(([, cells]) => cells.some((c) => c !== '—'));
+  if (machineRows.length) {
+    rows.push(el('tr', { class: 'compare-component' }, [
+      el('th', { scope: 'row' }, [el('span', { text: 'Machine' })]),
+      ...data.runs.map(() => el('td', {})),
+    ]));
+    for (const [label, cells] of machineRows) {
+      rows.push(el('tr', {}, [
+        el('th', { scope: 'row', class: 'compare-subtest' }, [el('span', { text: label })]),
+        ...cells.map((c) => el('td', { class: 'num', text: c })),
+      ]));
+    }
+  }
 
   // The first run is the reference, so its ratio is 1.00× in every single row.
   // A column of constants is a column of noise: the baseline shows its
