@@ -5,6 +5,71 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.7.0 - Wed, 28 Oct 2026
+
+**How old each machine is**, which is usually the first thing asked of an
+estate: the machine page says, the machine table sorts by it, and Compare puts
+it beside the ratios. **There is nothing to do to get it** — every machine in
+the index has an age on the first start after upgrading, including those whose
+runs came from loadbearer 1.5 and earlier, which recorded nothing about age.
+The new columns are added to the existing index in place: no rebuild, no
+`scan --reindex`.
+
+### Added
+
+- **An Age row on every machine page**, in the facts list:
+  `≤ 3.8 yr — built Jan 2023 or later · 13th-gen Intel Core (mobile)`. A
+  machine can't be older than its CPU, so the launch of the CPU's generation is
+  a floor on when it was built, and the figure is an upper bound on its age —
+  counted to today, so a machine keeps ageing between runs and machines
+  measured months apart still rank fairly.
+
+- **An Age column on the machine table**, sortable. Machines with no age sort
+  last whichever way it is sorted.
+
+- **Age in Compare.** A Machine section above the ratios sets each run's
+  system, maximum age, build-date floor, firmware date, drive hours and battery
+  cycles side by side; `loadbearer-fleet compare` prints the same line under
+  each run.
+
+- **System, Firmware, Drive and Battery facts** on the machine page, where the
+  run recorded them: the model as the firmware names it ("Dell Inc. Latitude
+  7440", or Lenovo's marketing name beside its type code), the firmware's date
+  and whether it is probably what the machine shipped with, and the boot
+  drive's power-on hours and wear. These need loadbearer 1.6.0 or later on the
+  machine. Search also matches the system model.
+
+- **The same fields in the API**, additively: `max_age_months_now`,
+  `cpu_launched`, `cpu_family`, `age_source`, `system_model`,
+  `firmware_dated`, `firmware_likely_original`, `drive_power_on_hours`,
+  `drive_wear_pct` and `drive_hours_undercounted` on machines in
+  `/api/snapshot` and `/api/machine/{key}`, and the age fields on each run in
+  `/api/compare`.
+
+### How the age is found
+
+- **Recorded where it can be, derived where it can't.** loadbearer 1.6.0
+  records the CPU's launch with each run, and that is used as it stands.
+  For a run that predates it, the launch is worked out here from the CPU model,
+  using a copy of loadbearer's launch table. `age_source` says which —
+  `recorded` or `derived` — and the page adds "from the CPU model" to a derived
+  one.
+
+- **Derived when read, not when indexed.** That is what lets runs already in
+  the index have an age without a rescan, and it means a correction to the
+  table reaches every run at once.
+
+- **No guesses.** A CPU the table doesn't know — Xeons, Core 2, most server
+  parts — shows no age rather than an invented one, and what only the machine
+  can read (the firmware, the drive) stays empty for an older run.
+
+- **Drive hours that measure working time are marked.** Some SATA SSDs stop
+  counting in their low-power idle states; one laptop's reported 175 hours over
+  4,314 power cycles. A drive that averages under fifteen minutes per power
+  cycle is flagged `drive_hours_undercounted` and shown as "likely
+  undercounted". The hours column keeps the reported figure, so anything
+  ranking machines by it should consult the flag.
+
 ## 0.6.1 - Fri, 11 Sep 2026
 
 A security pass over the upload path that 0.6.0 added, and four fixes from it.

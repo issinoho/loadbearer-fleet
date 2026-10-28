@@ -95,7 +95,7 @@ dependencies.
 **Windows** — take the `-x86_64-pc-windows-msvc.zip`, unzip it anywhere, then:
 
 ```powershell
-$V = "0.6.1"
+$V = "0.7.0"
 cd "loadbearer-fleet-$V-x86_64-pc-windows-msvc"
 .\loadbearer-fleet.exe serve C:\loadbearer\results
 ```
@@ -103,7 +103,7 @@ cd "loadbearer-fleet-$V-x86_64-pc-windows-msvc"
 **Linux** — take the `-x86_64-unknown-linux-gnu.tar.gz`:
 
 ```bash
-V=0.6.1
+V=0.7.0
 A=loadbearer-fleet-$V-x86_64-unknown-linux-gnu
 U=https://github.com/issinoho/loadbearer-fleet/releases/download/v$V
 curl -LO "$U/$A.tar.gz"
@@ -522,6 +522,28 @@ thirty measurements, and that should not read like one built on all thirty — s
 the count travels with the result and the verdict leads with the caveat when
 the basis is thin. The full shape, JSON included, is in
 [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API#comparing-runs).
+
+### How old a machine is
+
+Usually the first question about an estate, and nothing on a PC records the
+answer. What does carry a date is the CPU: every generation has a launch, and
+a machine can't be older than its CPU. So the **Age** on a machine page —
+`≤ 3.8 yr — built Jan 2023 or later` — is an upper bound, counted to today
+rather than to the last run, and the machine table sorts by it. That sort is
+the replacement list.
+
+loadbearer 1.6.0 and later record the evidence with each run: the CPU's
+launch, the firmware's date and whether it's probably what the machine
+shipped with, and the boot drive's power-on hours and wear. Older runs record
+none of it, so the launch is derived here from the CPU model instead, and the
+page says so ("from the CPU model"). What only the machine itself can read —
+the firmware, the drive — stays empty for those rather than guessed. A CPU the
+launch table doesn't know, such as a Xeon, shows no age at all.
+
+Drive hours are kept as the drive reports them, with one caveat surfaced:
+some SATA SSDs stop counting while idle, so a drive that averages minutes per
+power cycle is marked **likely undercounted** — its hours measure time spent
+working, not time in service.
 
 ## The dashboard
 
