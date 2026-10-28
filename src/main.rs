@@ -701,15 +701,28 @@ fn age_line(r: &compare::RunRef) -> Option<String> {
     }
     if let Some(h) = r.drive_power_on_hours {
         parts.push(if r.drive_hours_undercounted == Some(true) {
-            format!("drive reports {h} h (likely undercounted)")
+            format!("drive reports {} h (likely undercounted)", thousands(h))
         } else {
-            format!("drive {h} h")
+            format!("drive {} h", thousands(h))
         });
     }
     if let Some(c) = r.battery_cycles {
         parts.push(format!("battery {c} cycles"));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// "12,881": counts in the thousands are read, not parsed.
+fn thousands(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0 { format!("-{out}") } else { out }
 }
 
 /// A column is ten characters wide; a hostname often is not.
@@ -801,5 +814,20 @@ fn print_report(snap: &analytics::Snapshot, show_info: bool) {
             "\n{} informational flag(s) hidden — pass --all to see them.",
             s.info
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thousands;
+
+    #[test]
+    fn thousands_separators() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(4_314), "4,314");
+        assert_eq!(thousands(56_507), "56,507");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+        assert_eq!(thousands(-1_000), "-1,000");
     }
 }
