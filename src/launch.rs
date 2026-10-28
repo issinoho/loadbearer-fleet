@@ -197,7 +197,7 @@ fn intel_core_series(t: &[String]) -> Option<Launch> {
     }
     let (series, date) = match &digits[..1] {
         "1" => (1, (2024, 1)),
-        "2" => (2, (2025, 1)),
+        "2" => (2, (2024, 10)), // Raptor Lake refresh, Core 200H/U
         _ => return None,
     };
     launch(format!("Intel Core Series {series}"), date)
@@ -266,7 +266,7 @@ fn amd_threadripper(t: &[String]) -> Option<Launch> {
         "3" => (2019, 11),
         "5" => (2022, 3),
         "7" => (2023, 10),
-        "9" => (2024, 7),
+        "9" => (2025, 7),
         _ => return None,
     };
     launch(format!("AMD Ryzen Threadripper {}000", &digits[..1]), date)
@@ -450,6 +450,21 @@ mod tests {
         let l = cpu_launch("Intel(R) Core(TM) Ultra 7 165H").unwrap();
         assert_eq!(l.family, "Intel Core Ultra Series 1");
         assert_eq!(l.year_month(), "2023-12");
+    }
+
+    /// Dates checked against launch coverage on 2026-10-28 after two were
+    /// found wrong: Threadripper 9000 shipped in July 2025, not 2024, and the
+    /// Core 200H/U parts were announced in October 2024, not January 2025.
+    #[test]
+    fn corrected_launch_dates() {
+        assert_eq!(
+            at("AMD Ryzen Threadripper 9980X 64-Cores"),
+            Some(("AMD Ryzen Threadripper 9000".to_string(), 2025, 7))
+        );
+        assert_eq!(
+            at("Intel(R) Core(TM) 7 250H"),
+            Some(("Intel Core Series 2".to_string(), 2024, 10))
+        );
     }
 
     #[test]
