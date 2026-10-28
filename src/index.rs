@@ -207,8 +207,8 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         ("run", "uploaded_by", "TEXT"),
         ("run", "uploaded_at", "TEXT"),
         // The machine-age evidence, from loadbearer 1.6.0's `machine.age`,
-        // `firmware` and `nvme` blocks. NULL for older documents, which carry
-        // none of it. The drive columns are the first NVMe drive's, the one
+        // `firmware` and `drives` blocks. NULL for older documents, which carry
+        // none of it. The drive columns are the first drive's, the one
         // loadbearer's own age estimate reads.
         ("run", "system_model", "TEXT"),
         ("run", "cpu_family", "TEXT"),
@@ -834,7 +834,7 @@ impl Index {
         let ident = doc.machine.identity.clone().unwrap_or_default();
         let caveats = doc.quality_caveats().join(" | ");
         let age = doc.machine.age.clone().unwrap_or_default();
-        let drive = doc.machine.nvme.first();
+        let drive = doc.machine.drives.first();
         let tx = self.conn.transaction()?;
 
         tx.execute(
@@ -883,7 +883,7 @@ impl Index {
                 age.firmware_dated,
                 age.firmware_likely_original,
                 drive.map(|d| d.power_on_hours as i64),
-                drive.map(|d| d.percentage_used),
+                drive.and_then(|d| d.percentage_used),
             ],
         )?;
         let run_id = tx.last_insert_rowid();

@@ -1821,8 +1821,8 @@ mod tests {
                 "system_version": "ThinkPad X1 Carbon Gen 9",
                 "bios_version": "1.15.0", "bios_date": "2021-06-02"
             });
-            d["machine"]["nvme"] = json!([{
-                "device": "nvme0", "power_on_hours": 12881, "power_cycles": 667,
+            d["machine"]["drives"] = json!([{
+                "device": "nvme0", "interface": "nvme", "power_on_hours": 12881, "power_cycles": 667,
                 "unsafe_shutdowns": 195, "percentage_used": 19, "available_spare_pct": 100,
                 "data_written_tb": 60.11, "media_errors": 0, "critical_warning": 0
             }]);
@@ -1864,6 +1864,19 @@ mod tests {
         );
 
         assert_eq!(m.age_source, Some(AgeSource::Recorded));
+
+        // A SATA drive: hours, but none of the NVMe-only fields, and no wear
+        // figure on a hard disk.
+        e.add_with("PC-SATA", 1000.0, "2026-10-28T10:00:00Z", |d| {
+            d["machine"]["drives"] = json!([{
+                "device": "sda", "interface": "sata", "power_on_hours": 40000,
+                "power_cycles": 3100
+            }]);
+        });
+        let s = e.snap();
+        let sata = machine(&s, "PC-SATA");
+        assert_eq!(sata.drive_power_on_hours, Some(40000));
+        assert_eq!(sata.drive_wear_pct, None);
 
         // An older client recorded nothing, so the launch is derived from its
         // CPU (the fixture's i7-1370P); what only the client can see — the

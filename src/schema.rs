@@ -14,7 +14,7 @@
 //!   no `deny_unknown_fields` anywhere in this file.
 //! * **Nearly everything is optional.** `gates`, `notes`, `tags`,
 //!   `machine.identity`, `telemetry`, `battery`, and `machine.firmware` /
-//!   `nvme` / `age` are all omitted when empty
+//!   `drives` / `age` are all omitted when empty
 //!   or unsupported, and older files predate them entirely — a 1.2.4 result has
 //!   no identity block at all.
 //! * **Open enumerations stay `String`.** `grade`, `confidence` and
@@ -98,10 +98,10 @@ pub struct Machine {
     /// System model and firmware. 1.6.0+.
     #[serde(default)]
     pub firmware: Option<Firmware>,
-    /// Health counters for each NVMe drive loadbearer could query — absent on
-    /// a run without admin / root. 1.6.0+.
+    /// Health counters for each NVMe or SATA drive loadbearer could query —
+    /// absent on a run without admin / root. 1.6.0+.
     #[serde(default)]
-    pub nvme: Vec<Nvme>,
+    pub drives: Vec<Drive>,
     /// loadbearer's estimate of how old the machine is. 1.6.0+.
     #[serde(default)]
     pub age: Option<Age>,
@@ -147,31 +147,36 @@ impl Firmware {
     }
 }
 
-/// One NVMe drive's SMART / health log.
+/// One drive's health counters: an NVMe health log or a SATA drive's Device
+/// Statistics. Everything but the hours is optional, because SATA can't fill
+/// the NVMe-only fields and a hard disk has no wear figure.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Nvme {
+pub struct Drive {
     #[serde(default)]
     pub device: String,
+    /// `"nvme"` or `"sata"`; open, so kept as text.
+    #[serde(default)]
+    pub interface: String,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub power_on_hours: u64,
     #[serde(default)]
-    pub power_cycles: u64,
+    pub power_cycles: Option<u64>,
     #[serde(default)]
-    pub unsafe_shutdowns: u64,
+    pub unsafe_shutdowns: Option<u64>,
     /// The vendor's estimate of rated endurance used. Can pass 100.
     #[serde(default)]
-    pub percentage_used: u8,
+    pub percentage_used: Option<u8>,
     #[serde(default)]
-    pub available_spare_pct: u8,
+    pub available_spare_pct: Option<u8>,
     #[serde(default)]
-    pub data_written_tb: f64,
+    pub data_written_tb: Option<f64>,
     #[serde(default)]
-    pub media_errors: u64,
-    /// Non-zero means the drive itself is reporting a problem.
+    pub media_errors: Option<u64>,
+    /// Non-zero means the drive itself is reporting a problem. NVMe only.
     #[serde(default)]
-    pub critical_warning: u8,
+    pub critical_warning: Option<u8>,
 }
 
 /// The age estimate. Dates are `YYYY-MM`, spans whole months, all as of the
