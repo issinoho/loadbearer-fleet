@@ -226,6 +226,9 @@ pub struct MachineView {
     pub firmware_likely_original: Option<bool>,
     pub drive_power_on_hours: Option<i64>,
     pub drive_wear_pct: Option<i64>,
+    /// The drive's hours look like time spent working, not time in service —
+    /// see `schema::Age::drive_hours_undercounted`.
+    pub drive_hours_undercounted: Option<bool>,
     /// Upper bound on the machine's age **today**, in months: `cpu_launched`
     /// to the snapshot. The field to rank or compare machines by — unlike
     /// `max_age_months` it doesn't depend on when each was last measured.
@@ -578,7 +581,8 @@ fn load_latest(
                 ram_bytes, os, arch, serial, asset_tag, on_ac, thermal_limited,
                 battery_health, battery_cycles, partial, caveats, source_path,
                 system_model, cpu_family, cpu_launched, max_age_months, firmware_dated,
-                firmware_likely_original, drive_power_on_hours, drive_wear_pct
+                firmware_likely_original, drive_power_on_hours, drive_wear_pct,
+                drive_hours_undercounted
            FROM run WHERE id IN ({LATEST}) ORDER BY machine_key"
     ))?;
 
@@ -647,6 +651,7 @@ fn load_latest(
             firmware_likely_original: r.get(31)?,
             drive_power_on_hours: r.get(32)?,
             drive_wear_pct: r.get(33)?,
+            drive_hours_undercounted: r.get(34)?,
             low_confidence_cpu_subtests: low_conf.get(&run_id).copied().unwrap_or(0),
             tags: tags.remove(&run_id).unwrap_or_default(),
             components: components.remove(&run_id).unwrap_or_default(),
@@ -1877,6 +1882,23 @@ mod tests {
         let sata = machine(&s, "PC-SATA");
         assert_eq!(sata.drive_power_on_hours, Some(40000));
         assert_eq!(sata.drive_wear_pct, None);
+        assert_eq!(sata.drive_hours_undercounted, None);
+
+        // A drive that only counts working time keeps its hours, flagged.
+        e.add_with("PC-IDLE-CLOCK", 1000.0, "2026-10-28T10:00:00Z", |d| {
+            d["machine"]["drives"] = json!([{
+                "device": "sda", "interface": "sata", "power_on_hours": 175,
+                "power_cycles": 4314, "percentage_used": 7
+            }]);
+            d["machine"]["age"] = json!({
+                "as_of": "2026-10", "drive_power_on_hours": 175,
+                "drive_hours_undercounted": true
+            });
+        });
+        let s = e.snap();
+        let idle = machine(&s, "PC-IDLE-CLOCK");
+        assert_eq!(idle.drive_power_on_hours, Some(175));
+        assert_eq!(idle.drive_hours_undercounted, Some(true));
 
         // An older client recorded nothing, so the launch is derived from its
         // CPU (the fixture's i7-1370P); what only the client can see — the

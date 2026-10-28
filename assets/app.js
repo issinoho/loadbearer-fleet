@@ -139,6 +139,9 @@ function ageFacts(m) {
   const drive = m.drive_power_on_hours === null || m.drive_power_on_hours === undefined
     ? null
     : `${nf0.format(m.drive_power_on_hours)} h powered`
+      + (m.drive_hours_undercounted
+        ? ' (likely undercounted: the drive seems to stop counting when idle)'
+        : '')
       + (m.drive_wear_pct === null || m.drive_wear_pct === undefined ? '' : ` · ${m.drive_wear_pct}% of rated endurance used`);
   return { built, firmware, drive };
 }

@@ -74,6 +74,7 @@ pub struct RunRef {
     pub firmware_dated: Option<String>,
     pub drive_power_on_hours: Option<i64>,
     pub drive_wear_pct: Option<i64>,
+    pub drive_hours_undercounted: Option<bool>,
     pub battery_cycles: Option<i64>,
 }
 
@@ -308,7 +309,7 @@ fn load_run(conn: &Connection, run_id: i64) -> Result<RunRef> {
         "SELECT machine_key, hostname, taken_at, cpu_model, preset, profile, baseline,
                 build_isa, overall_score, overall_grade, system_model, cpu_family,
                 cpu_launched, firmware_dated, drive_power_on_hours, drive_wear_pct,
-                battery_cycles
+                battery_cycles, drive_hours_undercounted
            FROM run WHERE id = ?1",
         [run_id],
         |r| {
@@ -344,6 +345,7 @@ fn load_run(conn: &Connection, run_id: i64) -> Result<RunRef> {
                 drive_power_on_hours: r.get(14)?,
                 drive_wear_pct: r.get(15)?,
                 battery_cycles: r.get(16)?,
+                drive_hours_undercounted: r.get(17)?,
             })
         },
     );

@@ -700,7 +700,11 @@ fn age_line(r: &compare::RunRef) -> Option<String> {
         }
     }
     if let Some(h) = r.drive_power_on_hours {
-        parts.push(format!("drive {h} h"));
+        parts.push(if r.drive_hours_undercounted == Some(true) {
+            format!("drive reports {h} h (likely undercounted)")
+        } else {
+            format!("drive {h} h")
+        });
     }
     if let Some(c) = r.battery_cycles {
         parts.push(format!("battery {c} cycles"));

@@ -205,6 +205,11 @@ pub struct Age {
     pub firmware_likely_original: Option<bool>,
     #[serde(default)]
     pub drive_power_on_hours: Option<u64>,
+    /// The drive averages minutes per power cycle, so its hours measure time
+    /// spent working rather than time in service — some SATA SSDs stop the
+    /// clock when idle. The hours are as reported; don't read them as age.
+    #[serde(default)]
+    pub drive_hours_undercounted: Option<bool>,
     #[serde(default)]
     pub battery_cycles: Option<u32>,
 }

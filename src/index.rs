@@ -194,7 +194,7 @@ fn content_hash(text: &str) -> String {
 /// Rows written before the column existed keep `NULL`, which is the honest
 /// answer — see `scan --reindex` for filling them in from the documents.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    const ADDED: [(&str, &str, &str); 13] = [
+    const ADDED: [(&str, &str, &str); 14] = [
         ("subtest", "label", "TEXT"),
         ("subtest", "direction", "TEXT"),
         // Component ids are short and lower-case — `cpu`, `memory` — so a
@@ -218,6 +218,7 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         ("run", "firmware_likely_original", "INTEGER"),
         ("run", "drive_power_on_hours", "INTEGER"),
         ("run", "drive_wear_pct", "INTEGER"),
+        ("run", "drive_hours_undercounted", "INTEGER"),
     ];
 
     for (table, column, decl) in ADDED {
@@ -845,10 +846,10 @@ impl Index {
                  battery_health, battery_cycles, partial, caveats, source_path,
                  content_hash, system_model, cpu_family, cpu_launched, max_age_months,
                  firmware_dated, firmware_likely_original, drive_power_on_hours,
-                 drive_wear_pct, ingested_at
+                 drive_wear_pct, drive_hours_undercounted, ingested_at
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
                        ?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,
-                       datetime('now'))",
+                       ?35, datetime('now'))",
             params![
                 key.value,
                 key.kind.as_str(),
@@ -884,6 +885,7 @@ impl Index {
                 age.firmware_likely_original,
                 drive.map(|d| d.power_on_hours as i64),
                 drive.and_then(|d| d.percentage_used),
+                age.drive_hours_undercounted,
             ],
         )?;
         let run_id = tx.last_insert_rowid();
