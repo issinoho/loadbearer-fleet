@@ -5,6 +5,59 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.8.0 - Thu, 29 Oct 2026
+
+**What power each run had.** A laptop measured on battery or in a power-saving
+mode comes in slow for reasons that have nothing to do with its hardware, and
+until now the index only knew about battery when the collector had asked
+loadbearer's mains gate to check. loadbearer 1.7.0 records the power settings
+with every run, and this reads them. **Upgrading also fixes five rustls
+advisories** — see Security. The new columns are added to the existing index in
+place: no rebuild, no `scan --reindex`.
+
+### Added
+
+- **A Power row on every machine page**, in the facts list, and in Compare's
+  Machine section: `on mains · Balanced plan · Best performance mode`, or on
+  Linux `on mains · balanced profile`, followed by whatever held the run back —
+  `held back by energy saver on, Best power efficiency mode`. On Windows the
+  mode is the one for the source the run was on, plugged in or battery.
+
+- **A "Held back by its power settings" flag**, in the measurement queue, for a
+  run that had energy saver, Best power efficiency, a capped processor state,
+  boost or turbo off, or a low-power profile in force. loadbearer decides what
+  counts and records the list; this doesn't repeat the rules.
+
+- **The same in the API**, additively: `power_plan`, `power_mode` and
+  `power_held_back` on machines in `/api/snapshot` and `/api/machine/{key}`,
+  and those plus `on_ac` on each run in `/api/compare`.
+
+### Changed
+
+- **A run on battery is flagged whether or not a gate was asked for.** `on_ac`
+  comes from the gates where the collector used `--not-on-battery`, and
+  otherwise from loadbearer 1.7.0's `machine.power`, so "Measured on battery"
+  now catches runs that a collector without the gate let through.
+
+- **A regression on a run held back by its power settings is a warning, not
+  critical** — the same treatment a thermally limited or battery run already
+  gets, since the drop is evidence about the run before it is evidence about
+  the machine.
+
+All of this needs loadbearer 1.7.0 or later on the machine. Runs already in
+the index, and new runs from older loadbearer, carry no power settings and show
+no Power row; nothing is guessed for them.
+
+### Security
+
+- **rustls 0.23.46**, for GHSA-2mjx-qc3c-rqvc and GHSA-c8m5-c952-6cm4
+  (moderate) and GHSA-h2v8-394m-p7vv, GHSA-w44r-93j7-qv28 and
+  GHSA-vp88-798v-h67f (low). loadbearer-fleet uses rustls only as a client,
+  for the identity provider at sign-in, and doesn't use the affected features
+  (encrypted client hello, Brotli certificate compression, debug-printing a
+  session), so the practical exposure was small — an attacker able to
+  intercept that connection.
+
 ## 0.7.0 - Wed, 28 Oct 2026
 
 **How old each machine is**, which is usually the first thing asked of an
