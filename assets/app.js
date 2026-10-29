@@ -146,6 +146,25 @@ function ageFacts(m) {
   return { built, firmware, drive };
 }
 
+/** The power settings a run had, from loadbearer 1.7.0's `machine.power`:
+ *  "on mains · Balanced plan · Best performance mode", and what held the run
+ *  back. Null when nothing was recorded. A mode with no plan beside it is a
+ *  Linux platform profile. */
+function powerFact(m) {
+  const parts = [];
+  if (m.on_ac === true) parts.push('on mains');
+  if (m.on_ac === false) parts.push('on battery');
+  if (m.power_plan) parts.push(`${m.power_plan} plan`);
+  if (m.power_mode) {
+    parts.push(m.power_plan
+      ? `${m.power_mode[0].toUpperCase()}${m.power_mode.slice(1)} mode`
+      : `${m.power_mode} profile`);
+  }
+  if (!parts.length) return null;
+  const held = Array.isArray(m.power_held_back) ? m.power_held_back.join(', ') : m.power_held_back;
+  return parts.join(' · ') + (held ? ` — held back by ${held}` : '');
+}
+
 function debounce(fn, ms) {
   let t;
   return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
@@ -1286,6 +1305,7 @@ export async function renderMachine(main, key) {
     ['Age', age.built || 'unknown — the CPU isn’t in the launch table'],
     ...(age.firmware ? [['Firmware', age.firmware]] : []),
     ...(age.drive ? [['Drive', age.drive]] : []),
+    ...(powerFact(m) ? [['Power', powerFact(m)]] : []),
     ...(m.battery_cycles === null || m.battery_cycles === undefined ? [] : [['Battery',
       `${m.battery_cycles} cycles`
         + (m.battery_health === null || m.battery_health === undefined ? '' : ` · ${nf0.format(m.battery_health)}% of design capacity`)]]),
@@ -1568,6 +1588,7 @@ function compareTable(data) {
     ['Firmware', data.runs.map((r) => (r.firmware_dated ? monthYear(r.firmware_dated) : '—'))],
     ['Drive', facts.map((f) => f.drive || '—')],
     ['Battery', data.runs.map((r) => (r.battery_cycles === null || r.battery_cycles === undefined ? '—' : `${r.battery_cycles} cycles`))],
+    ['Power', data.runs.map((r) => powerFact(r) || '—')],
   ].filter(([, cells]) => cells.some((c) => c !== '—'));
   if (machineRows.length) {
     rows.push(el('tr', { class: 'compare-component' }, [

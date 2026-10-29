@@ -105,6 +105,65 @@ pub struct Machine {
     /// loadbearer's estimate of how old the machine is. 1.6.0+.
     #[serde(default)]
     pub age: Option<Age>,
+    /// Mains or battery and the power settings in force. 1.7.0+.
+    #[serde(default)]
+    pub power: Option<Power>,
+}
+
+/// The power settings a run had. Windows records a power mode for plugged in
+/// and on battery; Linux has no such split and records the platform profile
+/// in force instead.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Power {
+    /// `mains` or `battery`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The power plan's name, in the machine's display language (Windows).
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub plugged_in: Option<PowerColumn>,
+    #[serde(default)]
+    pub on_battery: Option<PowerColumn>,
+    /// e.g. `balanced`, `low-power` (Linux).
+    #[serde(default)]
+    pub platform_profile: Option<String>,
+    /// The settings in force that would hold a benchmark back, battery power
+    /// aside. Descriptive text — loadbearer's `VERSIONING.md` says to key on
+    /// whether it's empty, not on the wording.
+    #[serde(default)]
+    pub held_back: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PowerColumn {
+    /// `best power efficiency`, `balanced` or `best performance`.
+    #[serde(default)]
+    pub power_mode: Option<String>,
+}
+
+impl Power {
+    pub fn on_ac(&self) -> Option<bool> {
+        match self.source.as_deref() {
+            Some("mains") => Some(true),
+            Some("battery") => Some(false),
+            _ => None,
+        }
+    }
+
+    /// The Windows power mode for the power source the run was on, or the
+    /// Linux platform profile.
+    pub fn mode_in_force(&self) -> Option<String> {
+        let column = if self.on_ac() == Some(false) {
+            &self.on_battery
+        } else {
+            &self.plugged_in
+        };
+        column
+            .as_ref()
+            .and_then(|c| c.power_mode.clone())
+            .or_else(|| self.platform_profile.clone())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -526,6 +585,15 @@ impl ResultFile {
 
     /// Reasons this run's numbers should not be compared at face value, drawn
     /// from the signals loadbearer already records.
+    /// Whether the run was on mains: the gates' reading where one was asked
+    /// for, otherwise what loadbearer 1.7.0+ records in `machine.power`.
+    pub fn on_ac(&self) -> Option<bool> {
+        self.gates
+            .as_ref()
+            .and_then(|g| g.on_ac)
+            .or_else(|| self.machine.power.as_ref().and_then(Power::on_ac))
+    }
+
     pub fn quality_caveats(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(t) = &self.telemetry
@@ -533,10 +601,16 @@ impl ResultFile {
         {
             out.push("clocks fell during the run; peak figures may not have reached boost".into());
         }
-        if let Some(g) = &self.gates
-            && g.on_ac == Some(false)
-        {
+        if self.on_ac() == Some(false) {
             out.push("measured on battery, where clocks are usually capped".into());
+        }
+        if let Some(p) = &self.machine.power
+            && !p.held_back.is_empty()
+        {
+            out.push(format!(
+                "power settings held it back: {}",
+                p.held_back.join(", ")
+            ));
         }
         for c in &self.raw {
             for n in &c.notes {

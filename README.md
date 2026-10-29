@@ -480,7 +480,7 @@ means an estate owner reads a thermal caveat as a failing asset:
 | Queue | Means | Examples |
 | --- | --- | --- |
 | **machine** | a hardware decision — repair, replace, reassign | low grade, cohort outlier, regression, one weak component, worn battery |
-| **measurement** | the number can't be trusted until collection is fixed | thermally limited, run on battery, partial run, RAM-backed disk target, unstable CPU timings |
+| **measurement** | the number can't be trusted until collection is fixed | thermally limited, run on battery, held back by its power settings, partial run, RAM-backed disk target, unstable CPU timings |
 | **coverage** | about the data we hold, not about the machine | stale result, attributed by hostname only, no peer group |
 
 Every threshold lives in one struct with its reasoning attached, so tuning the
@@ -544,6 +544,19 @@ Drive hours are kept as the drive reports them, with one caveat surfaced:
 some SATA SSDs stop counting while idle, so a drive that averages minutes per
 power cycle is marked **likely undercounted** — its hours measure time spent
 working, not time in service.
+
+### What power the run had
+
+loadbearer 1.7.0 and later record whether a run was on mains or battery and
+the power settings in force: on Windows the plan and the power mode for the
+source it was on (Best power efficiency / Balanced / Best performance), on
+Linux the platform profile. The machine page and a comparison show it as
+**Power**. A run taken on battery is flagged whether or not the collector asked
+for loadbearer's mains gate, and one whose settings held it back — energy
+saver, Best power efficiency, a capped processor state, a low-power profile —
+is flagged **held back by its power settings**; a drop in score on such a run
+is reported as a warning to re-measure rather than a critical regression.
+Older runs record none of it.
 
 ## The dashboard
 

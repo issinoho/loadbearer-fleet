@@ -76,6 +76,12 @@ pub struct RunRef {
     pub drive_wear_pct: Option<i64>,
     pub drive_hours_undercounted: Option<bool>,
     pub battery_cycles: Option<i64>,
+    /// The power plan and mode the run had (loadbearer 1.7.0+) and what in
+    /// them held it back.
+    pub on_ac: Option<bool>,
+    pub power_plan: Option<String>,
+    pub power_mode: Option<String>,
+    pub power_held_back: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -309,7 +315,8 @@ fn load_run(conn: &Connection, run_id: i64) -> Result<RunRef> {
         "SELECT machine_key, hostname, taken_at, cpu_model, preset, profile, baseline,
                 build_isa, overall_score, overall_grade, system_model, cpu_family,
                 cpu_launched, firmware_dated, drive_power_on_hours, drive_wear_pct,
-                battery_cycles, drive_hours_undercounted
+                battery_cycles, drive_hours_undercounted, on_ac, power_plan, power_mode,
+                power_held_back
            FROM run WHERE id = ?1",
         [run_id],
         |r| {
@@ -346,6 +353,12 @@ fn load_run(conn: &Connection, run_id: i64) -> Result<RunRef> {
                 drive_wear_pct: r.get(15)?,
                 battery_cycles: r.get(16)?,
                 drive_hours_undercounted: r.get(17)?,
+                on_ac: r.get(18)?,
+                power_plan: r.get(19)?,
+                power_mode: r.get(20)?,
+                power_held_back: r
+                    .get::<_, Option<String>>(21)?
+                    .map(|h| h.replace(" | ", ", ")),
             })
         },
     );

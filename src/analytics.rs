@@ -233,6 +233,14 @@ pub struct MachineView {
     /// to the snapshot. The field to rank or compare machines by — unlike
     /// `max_age_months` it doesn't depend on when each was last measured.
     pub max_age_months_now: Option<i64>,
+    /// The power plan's name (Windows), in the machine's language.
+    pub power_plan: Option<String>,
+    /// The power mode for the source the run was on (Windows), or the
+    /// platform profile (Linux).
+    pub power_mode: Option<String>,
+    /// The settings in force that held the run back, battery power aside.
+    /// Empty for a run from before loadbearer 1.7.0.
+    pub power_held_back: Vec<String>,
     pub low_confidence_cpu_subtests: i64,
     pub tags: BTreeMap<String, String>,
     pub components: Vec<ComponentView>,
@@ -582,7 +590,7 @@ fn load_latest(
                 battery_health, battery_cycles, partial, caveats, source_path,
                 system_model, cpu_family, cpu_launched, max_age_months, firmware_dated,
                 firmware_likely_original, drive_power_on_hours, drive_wear_pct,
-                drive_hours_undercounted
+                drive_hours_undercounted, power_plan, power_mode, power_held_back
            FROM run WHERE id IN ({LATEST}) ORDER BY machine_key"
     ))?;
 
@@ -652,6 +660,15 @@ fn load_latest(
             drive_power_on_hours: r.get(32)?,
             drive_wear_pct: r.get(33)?,
             drive_hours_undercounted: r.get(34)?,
+            power_plan: r.get(35)?,
+            power_mode: r.get(36)?,
+            power_held_back: r
+                .get::<_, Option<String>>(37)?
+                .unwrap_or_default()
+                .split(" | ")
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .collect(),
             low_confidence_cpu_subtests: low_conf.get(&run_id).copied().unwrap_or(0),
             tags: tags.remove(&run_id).unwrap_or_default(),
             components: components.remove(&run_id).unwrap_or_default(),
@@ -809,7 +826,9 @@ fn evaluate(
             // A run that was throttled or on battery is expected to come in
             // low, so the drop is evidence about the run before it is evidence
             // about the machine.
-            let explained = m.thermal_limited == Some(true) || m.on_ac == Some(false);
+            let explained = m.thermal_limited == Some(true)
+                || m.on_ac == Some(false)
+                || !m.power_held_back.is_empty();
             push(
                 if explained {
                     Severity::Warning
@@ -826,8 +845,9 @@ fn evaluate(
                     score / (1.0 + trend / 100.0),
                     m.runs.saturating_sub(1),
                     if explained {
-                        " This run was thermally limited or taken on battery, which may account \
-                         for some of it — re-measure before acting."
+                        " This run was thermally limited, taken on battery or held back by its \
+                         power settings, which may account for some of it — re-measure before \
+                         acting."
                     } else {
                         ""
                     }
@@ -911,6 +931,21 @@ fn evaluate(
                  mains-powered ones. The unattended-run gates exist to stop this; a run that \
                  got through them anyway was forced past them."
                     .to_string(),
+            );
+        }
+
+        if !m.power_held_back.is_empty() {
+            push(
+                Severity::Warning,
+                FlagKind::Measurement,
+                "power_limited",
+                "Held back by its power settings".to_string(),
+                format!(
+                    "The run had {} in force, which caps clocks, so it isn't comparable with \
+                     runs at full power. Worth changing on the machine if that's how it's \
+                     normally used — and re-measuring either way.",
+                    m.power_held_back.join(", ")
+                ),
             );
         }
 
@@ -1915,6 +1950,71 @@ mod tests {
         assert_eq!(old.firmware_dated, None);
         assert_eq!(old.drive_power_on_hours, None);
         assert_eq!(old.system_model, None);
+    }
+
+    /// loadbearer 1.7.0's power settings reach the machine view: the mode for
+    /// the source the run was on, battery power without a gate having been
+    /// asked for, and a flag for settings that held the run back.
+    #[test]
+    fn power_settings_are_carried_through_to_the_machine() {
+        let mut e = Estate::new();
+        e.add("PC-OLD-CLIENT", 1000.0, "2026-09-01T10:00:00Z");
+        e.add_with("PC-FULL-POWER", 1000.0, "2026-10-29T10:00:00Z", |d| {
+            d["machine"]["power"] = json!({
+                "source": "mains", "energy_saver": false, "plan": "Balanced",
+                "plan_guid": "381b4222-f694-41f0-9685-ff5bb260df2e",
+                "plugged_in": {"power_mode": "best performance", "max_processor_pct": 100},
+                "on_battery": {"power_mode": "best power efficiency"}
+            });
+        });
+        e.add_with("PC-SAVER", 1000.0, "2026-10-29T10:00:00Z", |d| {
+            d["machine"]["power"] = json!({
+                "source": "battery", "plan": "Balanced",
+                "plugged_in": {"power_mode": "balanced"},
+                "on_battery": {"power_mode": "best power efficiency"},
+                "held_back": ["energy saver on", "Best power efficiency mode"]
+            });
+        });
+        e.add_with("PC-LINUX", 1000.0, "2026-10-29T10:00:00Z", |d| {
+            d["machine"]["power"] = json!({
+                "source": "mains", "platform_profile": "low-power",
+                "governor": "powersave", "energy_preference": "power", "turbo": true,
+                "held_back": ["low-power platform profile", "energy preference \"power\""]
+            });
+        });
+
+        let s = e.snap();
+        let full = machine(&s, "PC-FULL-POWER");
+        assert_eq!(full.on_ac, Some(true));
+        assert_eq!(full.power_plan.as_deref(), Some("Balanced"));
+        assert_eq!(full.power_mode.as_deref(), Some("best performance"));
+        assert!(full.power_held_back.is_empty());
+
+        // On battery, so the battery column's mode; and on_ac comes from
+        // `machine.power` with no gate in the document.
+        let saver = machine(&s, "PC-SAVER");
+        assert_eq!(saver.on_ac, Some(false));
+        assert_eq!(saver.power_mode.as_deref(), Some("best power efficiency"));
+        assert_eq!(
+            saver.power_held_back,
+            ["energy saver on", "Best power efficiency mode"]
+        );
+
+        let linux = machine(&s, "PC-LINUX");
+        assert_eq!(linux.power_plan, None);
+        assert_eq!(linux.power_mode.as_deref(), Some("low-power"));
+
+        let flagged: Vec<_> = flags_for(&s, "power_limited")
+            .iter()
+            .filter_map(|f| f.hostname.clone())
+            .collect();
+        assert_eq!(flagged, ["PC-LINUX", "PC-SAVER"]);
+        assert_eq!(flags_for(&s, "on_battery").len(), 1);
+
+        let old = machine(&s, "PC-OLD-CLIENT");
+        assert_eq!(old.power_plan, None);
+        assert_eq!(old.power_mode, None);
+        assert!(old.power_held_back.is_empty());
     }
 
     #[test]

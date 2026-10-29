@@ -194,7 +194,7 @@ fn content_hash(text: &str) -> String {
 /// Rows written before the column existed keep `NULL`, which is the honest
 /// answer — see `scan --reindex` for filling them in from the documents.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    const ADDED: [(&str, &str, &str); 14] = [
+    const ADDED: [(&str, &str, &str); 17] = [
         ("subtest", "label", "TEXT"),
         ("subtest", "direction", "TEXT"),
         // Component ids are short and lower-case — `cpu`, `memory` — so a
@@ -219,6 +219,12 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         ("run", "drive_power_on_hours", "INTEGER"),
         ("run", "drive_wear_pct", "INTEGER"),
         ("run", "drive_hours_undercounted", "INTEGER"),
+        // loadbearer 1.7.0's `machine.power`: the plan, the power mode (or
+        // Linux platform profile) for the source the run was on, and the
+        // settings that held it back, " | "-joined like `caveats`.
+        ("run", "power_plan", "TEXT"),
+        ("run", "power_mode", "TEXT"),
+        ("run", "power_held_back", "TEXT"),
     ];
 
     for (table, column, decl) in ADDED {
@@ -836,6 +842,7 @@ impl Index {
         let caveats = doc.quality_caveats().join(" | ");
         let age = doc.machine.age.clone().unwrap_or_default();
         let drive = doc.machine.drives.first();
+        let power = doc.machine.power.clone().unwrap_or_default();
         let tx = self.conn.transaction()?;
 
         tx.execute(
@@ -846,10 +853,11 @@ impl Index {
                  battery_health, battery_cycles, partial, caveats, source_path,
                  content_hash, system_model, cpu_family, cpu_launched, max_age_months,
                  firmware_dated, firmware_likely_original, drive_power_on_hours,
-                 drive_wear_pct, drive_hours_undercounted, ingested_at
+                 drive_wear_pct, drive_hours_undercounted, power_plan, power_mode,
+                 power_held_back, ingested_at
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
                        ?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,
-                       ?35, datetime('now'))",
+                       ?35,?36,?37,?38, datetime('now'))",
             params![
                 key.value,
                 key.kind.as_str(),
@@ -869,7 +877,7 @@ impl Index {
                 doc.machine.arch,
                 ident.serial,
                 ident.asset_tag,
-                doc.gates.as_ref().and_then(|g| g.on_ac),
+                doc.on_ac(),
                 doc.telemetry.as_ref().map(|t| t.thermal_limited),
                 doc.machine.battery.as_ref().and_then(|b| b.health_pct),
                 doc.machine.battery.as_ref().and_then(|b| b.cycle_count),
@@ -886,6 +894,9 @@ impl Index {
                 drive.map(|d| d.power_on_hours as i64),
                 drive.and_then(|d| d.percentage_used),
                 age.drive_hours_undercounted,
+                power.plan,
+                power.mode_in_force(),
+                Some(power.held_back.join(" | ")).filter(|h| !h.is_empty()),
             ],
         )?;
         let run_id = tx.last_insert_rowid();
