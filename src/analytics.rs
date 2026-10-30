@@ -1180,7 +1180,8 @@ pub struct Filter {
     /// Only machines measured within this many days.
     pub max_age_days: Option<f64>,
     pub cohort: Option<String>,
-    /// Case-insensitive substring of hostname, key, serial, asset tag or CPU.
+    /// Case-insensitive substring of hostname, key, serial, asset tag, system
+    /// model, CPU, power plan, power mode or any tag value.
     pub search: Option<String>,
     /// Only machines carrying a flag with this code.
     pub flag: Option<String>,
@@ -1245,6 +1246,8 @@ impl Filter {
                 m.asset_tag.as_deref(),
                 Some(m.cpu_model.as_str()),
                 m.system_model.as_deref(),
+                m.power_plan.as_deref(),
+                m.power_mode.as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -2239,6 +2242,55 @@ mod tests {
             by_key.summary.machines, 0,
             "a tag key is not a value and must not match every machine that has one"
         );
+    }
+
+    /// "Which machines are on Best power efficiency" should be answerable from
+    /// the search box. It matches the mode in force, the one the index holds:
+    /// a machine plugged in on Best performance is not found by its battery
+    /// setting.
+    #[test]
+    fn search_finds_a_machine_by_its_power_mode() {
+        let mut e = Estate::new();
+        e.add("PC-OLD-CLIENT", 1000.0, "2026-09-01T10:00:00Z");
+        e.add_with("PC-FULL-POWER", 1000.0, "2026-10-29T10:00:00Z", |d| {
+            d["machine"]["power"] = json!({
+                "source": "mains", "plan": "Balanced",
+                "plugged_in": {"power_mode": "best performance"},
+                "on_battery": {"power_mode": "best power efficiency"}
+            });
+        });
+        e.add_with("PC-SAVER", 1000.0, "2026-10-29T10:00:00Z", |d| {
+            d["machine"]["power"] = json!({
+                "source": "battery", "plan": "Balanced",
+                "plugged_in": {"power_mode": "balanced"},
+                "on_battery": {"power_mode": "best power efficiency"}
+            });
+        });
+        e.add_with("PC-LINUX", 1000.0, "2026-10-29T10:00:00Z", |d| {
+            d["machine"]["power"] = json!({ "source": "mains", "platform_profile": "low-power" });
+        });
+        let all = e.snap();
+        let th = Thresholds::default();
+        let hosts = |q: &str| -> Vec<String> {
+            let s = all.filtered(
+                &Filter {
+                    search: Some(q.into()),
+                    ..Default::default()
+                },
+                &th,
+            );
+            let mut h: Vec<_> = s
+                .machines
+                .iter()
+                .filter_map(|m| m.hostname.clone())
+                .collect();
+            h.sort();
+            h
+        };
+
+        assert_eq!(hosts("Power Efficiency"), ["PC-SAVER"]);
+        assert_eq!(hosts("low-power"), ["PC-LINUX"]);
+        assert_eq!(hosts("best"), ["PC-FULL-POWER", "PC-SAVER"]);
     }
 
     /// The property tag-scoped authorization rests on. The viewer's own filter
