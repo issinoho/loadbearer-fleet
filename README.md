@@ -292,6 +292,27 @@ token_sha256 = "57be38ae…"
 A plain `token = "…"` of at least 32 characters still works, for configs that
 predate this.
 
+**loadbearer 1.8.0 and later send it themselves.** Deploy the secret once as a
+file only administrators can read, then add two switches to the run:
+
+```
+loadbearer.exe run --no-gpu --plain --duration short ^
+  --output "%ProgramData%\loadbearer\%COMPUTERNAME%.json" ^
+  --tag site=glasgow ^
+  --upload https://fleet.example.com/api/upload ^
+  --upload-token-file "%ProgramData%\loadbearer\fleet-token"
+```
+
+The token is read from that file (or `LOADBEARER_UPLOAD_TOKEN`) and never
+taken on the command line or in the URL, where process listings, proxy logs
+and the deployment tool's history would keep it. The result is posted after
+`--output` is written, as the same bytes, so a failed upload — exit `4` —
+loses nothing, and a result that also reaches the folder from a share is
+stored once. The `--tag` has to match the token's `tags`. See loadbearer's
+[Fleet use](https://github.com/issinoho/loadbearer#fleet-use).
+
+Anything else can post one with the same header:
+
 ```bash
 curl -sS https://fleet.example.com/api/upload \
   -H 'Authorization: Bearer <token>' \
@@ -308,8 +329,9 @@ same way a grant scopes a person, and revoking it is deleting the entry and
 restarting. Past its `expires` date it is refused as expired, which the log
 and `loadbearer_fleet_ingest_tokens_refused_total{reason="expired"}` both say,
 so a rotation nobody carried out shows up as that rather than as machines that
-went quiet. Nothing in loadbearer itself sends one: what runs the benchmark and
-what is trusted to publish its results are deliberately different things.
+went quiet. loadbearer sends one only when `--upload` is given, and only to
+the URL given: it refuses plain `http://` to anything but loopback and does
+not follow redirects, so the token cannot be steered somewhere else.
 
 **And one credential can only write so fast.** `upload_limit_per_minute` (120
 by default, zero for none) caps submissions per person and per token, and a
