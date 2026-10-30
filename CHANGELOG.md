@@ -5,6 +5,17 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.8.2 - Fri, 30 Oct 2026
+
+### Changed
+
+- **Search matches the power plan and power mode**, so typing
+  `power efficiency` lists the machines on Best power efficiency, and
+  `low-power` the Linux machines on that profile. It is the mode the latest
+  run had, for the source it was on: a laptop measured plugged in on Best
+  performance is not found by its battery setting. The search box's hint now
+  names every field it looks in.
+
 ## 0.8.1 - Fri, 30 Oct 2026
 
 ### Changed
