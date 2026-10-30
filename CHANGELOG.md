@@ -5,7 +5,7 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
-## Unreleased
+## 0.8.1 - Fri, 30 Oct 2026
 
 ### Changed
 
