@@ -1239,6 +1239,17 @@ impl Filter {
         }
         if let Some(q) = &self.search {
             let q = q.to_lowercase();
+            // Labelled the way the machine page words them, so "balanced
+            // plan" and "balanced mode" tell apart what "balanced" alone
+            // cannot. A mode with no plan beside it is a Linux profile.
+            let plan = m.power_plan.as_ref().map(|p| format!("{p} plan"));
+            let mode = m.power_mode.as_ref().map(|p| {
+                if plan.is_some() {
+                    format!("{p} mode")
+                } else {
+                    format!("{p} profile")
+                }
+            });
             let hit = [
                 Some(m.key.as_str()),
                 m.hostname.as_deref(),
@@ -1246,8 +1257,8 @@ impl Filter {
                 m.asset_tag.as_deref(),
                 Some(m.cpu_model.as_str()),
                 m.system_model.as_deref(),
-                m.power_plan.as_deref(),
-                m.power_mode.as_deref(),
+                plan.as_deref(),
+                mode.as_deref(),
             ]
             .into_iter()
             .flatten()
@@ -2247,7 +2258,7 @@ mod tests {
     /// "Which machines are on Best power efficiency" should be answerable from
     /// the search box. It matches the mode in force, the one the index holds:
     /// a machine plugged in on Best performance is not found by its battery
-    /// setting.
+    /// setting. "plan", "mode" and "profile" are searchable after the name.
     #[test]
     fn search_finds_a_machine_by_its_power_mode() {
         let mut e = Estate::new();
@@ -2264,6 +2275,12 @@ mod tests {
                 "source": "battery", "plan": "Balanced",
                 "plugged_in": {"power_mode": "balanced"},
                 "on_battery": {"power_mode": "best power efficiency"}
+            });
+        });
+        e.add_with("PC-BALANCED", 1000.0, "2026-10-29T10:00:00Z", |d| {
+            d["machine"]["power"] = json!({
+                "source": "mains", "plan": "High performance",
+                "plugged_in": {"power_mode": "balanced"}
             });
         });
         e.add_with("PC-LINUX", 1000.0, "2026-10-29T10:00:00Z", |d| {
@@ -2291,6 +2308,18 @@ mod tests {
         assert_eq!(hosts("Power Efficiency"), ["PC-SAVER"]);
         assert_eq!(hosts("low-power"), ["PC-LINUX"]);
         assert_eq!(hosts("best"), ["PC-FULL-POWER", "PC-SAVER"]);
+
+        // "Balanced" is both a plan and a mode. Alone it finds either; the
+        // word after it says which was meant.
+        assert_eq!(
+            hosts("balanced"),
+            ["PC-BALANCED", "PC-FULL-POWER", "PC-SAVER"]
+        );
+        assert_eq!(hosts("Balanced plan"), ["PC-FULL-POWER", "PC-SAVER"]);
+        assert_eq!(hosts("balanced mode"), ["PC-BALANCED"]);
+        // Linux has a profile, worded as the machine page words it.
+        assert_eq!(hosts("low-power profile"), ["PC-LINUX"]);
+        assert!(hosts("low-power mode").is_empty());
     }
 
     /// The property tag-scoped authorization rests on. The viewer's own filter
