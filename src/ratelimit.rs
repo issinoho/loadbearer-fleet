@@ -55,6 +55,9 @@ struct Bucket {
     /// continuous — a bucket does not have to wait for a tick boundary.
     allowance: f64,
     last: Instant,
+    /// Its own, because a token can carry a limit other than the server's,
+    /// and the sweep has to judge each bucket full against the right one.
+    per_minute: f64,
 }
 
 impl Limiter {
@@ -67,18 +70,20 @@ impl Limiter {
     }
 
     /// Take one submission's worth of allowance, or say how long until there
-    /// is some.
-    pub fn check(&self, key: &str) -> Result<(), Duration> {
-        self.check_at(key, Instant::now())
+    /// is some. `per_minute` is a credential's own limit in place of this
+    /// one's, for a token that has one; zero is off, as it is server-wide.
+    pub fn check(&self, key: &str, per_minute: Option<u32>) -> Result<(), Duration> {
+        self.check_at(key, per_minute, Instant::now())
     }
 
     /// The same, at a stated moment, so the refill is testable without
     /// sleeping through it.
-    fn check_at(&self, key: &str, now: Instant) -> Result<(), Duration> {
-        if self.per_minute == 0 {
+    fn check_at(&self, key: &str, per_minute: Option<u32>, now: Instant) -> Result<(), Duration> {
+        let per_minute = per_minute.unwrap_or(self.per_minute);
+        if per_minute == 0 {
             return Ok(());
         }
-        let capacity = f64::from(self.per_minute);
+        let capacity = f64::from(per_minute);
         let per_second = capacity / 60.0;
 
         let mut buckets = self.buckets.lock().expect("rate limiter lock");
@@ -86,14 +91,15 @@ impl Limiter {
             // A bucket that has refilled to capacity is indistinguishable from
             // one that was never created, so dropping it changes no answer
             // this can give.
-            buckets.retain(|_, b| refilled(b, now, per_second, capacity) < capacity);
+            buckets.retain(|_, b| refilled(b, now) < b.per_minute);
         }
 
         let bucket = buckets.entry(key.to_string()).or_insert(Bucket {
             allowance: capacity,
             last: now,
+            per_minute: capacity,
         });
-        bucket.allowance = refilled(bucket, now, per_second, capacity);
+        bucket.allowance = refilled(bucket, now);
         bucket.last = now;
 
         if bucket.allowance >= 1.0 {
@@ -107,9 +113,9 @@ impl Limiter {
     }
 }
 
-fn refilled(bucket: &Bucket, now: Instant, per_second: f64, capacity: f64) -> f64 {
+fn refilled(bucket: &Bucket, now: Instant) -> f64 {
     let elapsed = now.saturating_duration_since(bucket.last).as_secs_f64();
-    (bucket.allowance + elapsed * per_second).min(capacity)
+    (bucket.allowance + elapsed * bucket.per_minute / 60.0).min(bucket.per_minute)
 }
 
 #[cfg(test)]
@@ -122,12 +128,12 @@ mod tests {
         let t0 = Instant::now();
         for i in 0..60 {
             assert!(
-                limiter.check_at("token:deploy", t0).is_ok(),
+                limiter.check_at("token:deploy", None, t0).is_ok(),
                 "submission {i} of a full minute's worth"
             );
         }
         let wait = limiter
-            .check_at("token:deploy", t0)
+            .check_at("token:deploy", None, t0)
             .expect_err("the sixty-first in the same instant");
         assert_eq!(wait, Duration::from_secs(1), "one per second refills");
     }
@@ -137,23 +143,25 @@ mod tests {
         let limiter = Limiter::new(60);
         let t0 = Instant::now();
         for _ in 0..60 {
-            limiter.check_at("token:deploy", t0).expect("the burst");
+            limiter
+                .check_at("token:deploy", None, t0)
+                .expect("the burst");
         }
-        assert!(limiter.check_at("token:deploy", t0).is_err());
+        assert!(limiter.check_at("token:deploy", None, t0).is_err());
 
         // Half a second is half a submission at 60/minute: still short.
         let half = t0 + Duration::from_millis(500);
-        assert!(limiter.check_at("token:deploy", half).is_err());
+        assert!(limiter.check_at("token:deploy", None, half).is_err());
 
         assert!(
             limiter
-                .check_at("token:deploy", t0 + Duration::from_secs(1))
+                .check_at("token:deploy", None, t0 + Duration::from_secs(1))
                 .is_ok(),
             "a second buys exactly one"
         );
         assert!(
             limiter
-                .check_at("token:deploy", t0 + Duration::from_secs(1))
+                .check_at("token:deploy", None, t0 + Duration::from_secs(1))
                 .is_err(),
             "and only one"
         );
@@ -167,14 +175,16 @@ mod tests {
         let limiter = Limiter::new(60);
         let t0 = Instant::now();
         for _ in 0..60 {
-            limiter.check_at("token:deploy", t0).expect("the burst");
+            limiter
+                .check_at("token:deploy", None, t0)
+                .expect("the burst");
         }
         for _ in 0..1000 {
-            assert!(limiter.check_at("token:deploy", t0).is_err());
+            assert!(limiter.check_at("token:deploy", None, t0).is_err());
         }
         assert!(
             limiter
-                .check_at("token:deploy", t0 + Duration::from_secs(1))
+                .check_at("token:deploy", None, t0 + Duration::from_secs(1))
                 .is_ok(),
             "a thousand refusals later, one second is still worth one submission"
         );
@@ -184,13 +194,15 @@ mod tests {
     fn the_bucket_never_fills_past_its_capacity() {
         let limiter = Limiter::new(60);
         let t0 = Instant::now();
-        limiter.check_at("token:deploy", t0).expect("one");
+        limiter.check_at("token:deploy", None, t0).expect("one");
         // An hour of idleness is not an hour of credit.
         let later = t0 + Duration::from_secs(3600);
         for _ in 0..60 {
-            limiter.check_at("token:deploy", later).expect("a minute");
+            limiter
+                .check_at("token:deploy", None, later)
+                .expect("a minute");
         }
-        assert!(limiter.check_at("token:deploy", later).is_err());
+        assert!(limiter.check_at("token:deploy", None, later).is_err());
     }
 
     #[test]
@@ -198,12 +210,51 @@ mod tests {
         let limiter = Limiter::new(60);
         let t0 = Instant::now();
         for _ in 0..60 {
-            limiter.check_at("token:noisy", t0).expect("the burst");
+            limiter
+                .check_at("token:noisy", None, t0)
+                .expect("the burst");
         }
-        assert!(limiter.check_at("token:noisy", t0).is_err());
+        assert!(limiter.check_at("token:noisy", None, t0).is_err());
         assert!(
-            limiter.check_at("token:quiet", t0).is_ok(),
+            limiter.check_at("token:quiet", None, t0).is_ok(),
             "the limit is the credential's, not the server's"
+        );
+    }
+
+    /// A site's token carries its own limit, because every machine at the
+    /// site shares its bucket. The sweep has to judge that bucket against its
+    /// own capacity: measured against the server's, half of 600 looks full,
+    /// and sweeping it would hand back 300 submissions nobody waited for.
+    #[test]
+    fn a_token_with_its_own_limit_is_held_to_that_one() {
+        let limiter = Limiter::new(60);
+        let t0 = Instant::now();
+        for i in 0..600 {
+            limiter
+                .check_at("token:site", Some(600), t0)
+                .unwrap_or_else(|_| panic!("submission {i} of the site's 600"));
+        }
+        assert!(limiter.check_at("token:site", Some(600), t0).is_err());
+
+        // Thirty seconds is half way back: 300 of 600, which is more than the
+        // server's 60 and so looks full to anything judging by the wrong one.
+        let half = t0 + Duration::from_secs(30);
+        for i in 0..=SWEEP_ABOVE {
+            limiter
+                .check_at(&format!("user:{i}"), None, half)
+                .expect("one each");
+        }
+        limiter
+            .check_at("user:trigger", None, half)
+            .expect("sweeps");
+        for i in 0..300 {
+            limiter
+                .check_at("token:site", Some(600), half)
+                .unwrap_or_else(|_| panic!("thirty seconds at 600/minute is 300, not {i}"));
+        }
+        assert!(
+            limiter.check_at("token:site", Some(600), half).is_err(),
+            "and the sweep did not refill it"
         );
     }
 
@@ -213,7 +264,7 @@ mod tests {
         let t0 = Instant::now();
         for _ in 0..10_000 {
             limiter
-                .check_at("token:deploy", t0)
+                .check_at("token:deploy", None, t0)
                 .expect("no limit at all");
         }
     }
@@ -227,14 +278,14 @@ mod tests {
         let t0 = Instant::now();
         for i in 0..=SWEEP_ABOVE {
             limiter
-                .check_at(&format!("user:{i}"), t0)
+                .check_at(&format!("user:{i}"), None, t0)
                 .expect("one each");
         }
         assert_eq!(limiter.buckets.lock().expect("lock").len(), SWEEP_ABOVE + 1);
 
         // A minute later they have all refilled, so the next call sweeps them.
         let later = t0 + Duration::from_secs(60);
-        limiter.check_at("user:new", later).expect("one");
+        limiter.check_at("user:new", None, later).expect("one");
         assert_eq!(
             limiter.buckets.lock().expect("lock").len(),
             1,
@@ -243,9 +294,11 @@ mod tests {
 
         // And the swept-away caller is exactly where it was: full.
         for _ in 0..60 {
-            limiter.check_at("user:0", later).expect("a full minute");
+            limiter
+                .check_at("user:0", None, later)
+                .expect("a full minute");
         }
-        assert!(limiter.check_at("user:0", later).is_err());
+        assert!(limiter.check_at("user:0", None, later).is_err());
     }
 
     /// Somebody still mid-burst is *not* swept, in the same sweep that drops
@@ -257,18 +310,22 @@ mod tests {
         let limiter = Limiter::new(60);
         let t0 = Instant::now();
         for _ in 0..60 {
-            limiter.check_at("token:deploy", t0).expect("the burst");
+            limiter
+                .check_at("token:deploy", None, t0)
+                .expect("the burst");
         }
         for i in 0..=SWEEP_ABOVE {
             limiter
-                .check_at(&format!("user:{i}"), t0)
+                .check_at(&format!("user:{i}"), None, t0)
                 .expect("one each");
         }
 
         // Half a minute on, the callers that spent one each are full again;
         // the one that emptied its bucket is only half way back.
         let half = t0 + Duration::from_secs(30);
-        limiter.check_at("user:trigger", half).expect("sweeps");
+        limiter
+            .check_at("user:trigger", None, half)
+            .expect("sweeps");
         assert_eq!(
             limiter.buckets.lock().expect("lock").len(),
             2,
@@ -277,11 +334,11 @@ mod tests {
 
         for i in 0..30 {
             limiter
-                .check_at("token:deploy", half)
+                .check_at("token:deploy", None, half)
                 .unwrap_or_else(|_| panic!("thirty seconds is worth thirty, not {i}"));
         }
         assert!(
-            limiter.check_at("token:deploy", half).is_err(),
+            limiter.check_at("token:deploy", None, half).is_err(),
             "and not a sixtieth: being swept past must not refill a bucket"
         );
     }

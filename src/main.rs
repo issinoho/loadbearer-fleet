@@ -154,6 +154,11 @@ enum Command {
     },
     /// Print a starter configuration file, placeholders included.
     InitConfig,
+    /// Ingest tokens: the credentials machines submit their own results with.
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
     /// Print the command-line and configuration reference as Markdown.
     ///
     /// Generated from the definitions in this binary, so it describes the
@@ -167,6 +172,34 @@ enum Command {
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TokenAction {
+    /// Generate an ingest token: the secret, once, for the machines, and an
+    /// `[[ingest.tokens]]` entry for the config that holds only its digest.
+    ///
+    /// Nothing is written anywhere. The server reads tokens at startup, so
+    /// paste the entry into the config and restart it.
+    New {
+        /// What the token is for — a site, a ring, a deployment tool. It is
+        /// what the log shows against everything the token submits, and what
+        /// you revoke it by.
+        #[arg(long, value_name = "NAME")]
+        name: String,
+        /// Only accept results carrying this tag, as KEY=VALUE. Repeat for
+        /// more than one. loadbearer must be run with the same `--tag`.
+        #[arg(long = "tag", value_name = "KEY=VALUE")]
+        tags: Vec<String>,
+        /// The last day, UTC, the token is accepted, as YYYY-MM-DD.
+        #[arg(long, value_name = "DATE")]
+        expires: Option<String>,
+        /// Submissions a minute for this token, in place of the server's
+        /// `upload_limit_per_minute`. A token shared by a whole site wants
+        /// roughly the number of its machines that finish in the same minute.
+        #[arg(long, value_name = "N")]
+        limit_per_minute: Option<u32>,
     },
 }
 
@@ -316,6 +349,22 @@ fn main() -> Result<()> {
             print!("{}", reference::markdown(Cli::command()));
             return Ok(());
         }
+        // No config needed: generating a token reads nothing and writes
+        // nothing, so it works on a workstation as well as on the server.
+        Command::Token {
+            action:
+                TokenAction::New {
+                    name,
+                    tags,
+                    expires,
+                    limit_per_minute,
+                },
+        } => {
+            let (secret, entry) =
+                new_token_entry(&name, &tags, expires.as_deref(), limit_per_minute)?;
+            print!("{}", token_instructions(&secret, &entry));
+            return Ok(());
+        }
         _ => {}
     }
     // CLI over file over default, so a service can be configured in a file and
@@ -381,7 +430,9 @@ fn main() -> Result<()> {
     );
 
     match &cli.command {
-        Command::InitConfig | Command::Reference => unreachable!("handled above"),
+        Command::InitConfig | Command::Reference | Command::Token { .. } => {
+            unreachable!("handled above")
+        }
         Command::Scan { dir, reindex } => {
             // The config names the folder this serves, and a `scan` that has
             // just read that config should not have to be told it again —
@@ -817,9 +868,155 @@ fn print_report(snap: &analytics::Snapshot, show_info: bool) {
     }
 }
 
+/// A freshly generated secret, and the `[[ingest.tokens]]` entry that
+/// recognises it.
+///
+/// The entry is serialised from the same struct the loader reads, and then
+/// validated by the loader's own rules, so what this prints is something the
+/// server will accept rather than something that merely looks like it.
+fn new_token_entry(
+    name: &str,
+    tags: &[String],
+    expires: Option<&str>,
+    limit_per_minute: Option<u32>,
+) -> Result<(String, String)> {
+    let mut tag_map = std::collections::BTreeMap::new();
+    for tag in tags {
+        let Some((k, v)) = tag.split_once('=') else {
+            anyhow::bail!("--tag {tag:?} wants KEY=VALUE, as in --tag site=glasgow");
+        };
+        let (k, v) = (k.trim(), v.trim());
+        if k.is_empty() || v.is_empty() {
+            anyhow::bail!("--tag {tag:?} has an empty key or value");
+        }
+        tag_map.insert(k.to_string(), v.to_string());
+    }
+    let expires = expires
+        .map(|d| {
+            d.parse::<toml::value::Datetime>()
+                .map_err(|_| anyhow::anyhow!("--expires {d:?} wants a date, as in 2027-06-30"))
+        })
+        .transpose()?;
+
+    let (secret, digest) = auth::Authenticator::new_ingest_token();
+    let token = config::IngestToken {
+        name: name.trim().to_string(),
+        token: None,
+        token_sha256: Some(digest),
+        tags: tag_map,
+        limit_per_minute,
+        expires,
+    };
+
+    #[derive(serde::Serialize)]
+    struct Entry {
+        ingest: config::Ingest,
+    }
+    let probe = Config {
+        server: config::Server {
+            collection_dir: Some("collection".into()),
+            upload_dir: Some("collection/uploaded".into()),
+            ..config::Server::default()
+        },
+        ingest: config::Ingest {
+            tokens: vec![token.clone()],
+        },
+        ..Config::default()
+    };
+    probe.validate()?;
+    if token
+        .expires_on()
+        .is_some_and(|d| d < OffsetDateTime::now_utc().date())
+    {
+        anyhow::bail!("--expires is in the past, so the token would never be accepted");
+    }
+
+    let entry = toml::to_string(&Entry {
+        ingest: config::Ingest {
+            tokens: vec![token],
+        },
+    })
+    .context("writing the config entry")?;
+    Ok((secret, entry))
+}
+
+fn token_instructions(secret: &str, entry: &str) -> String {
+    format!(
+        "The secret, for the machines that submit with it. It is shown once and kept nowhere:\n\
+         \n    {secret}\n\n\
+         Give it to loadbearer in a file only administrators can read, not on its command line,\n\
+         where process listings and deployment logs would show it.\n\
+         \n\
+         The entry for the server's config, which holds only the secret's digest. Paste it in\n\
+         and restart the server:\n\
+         \n{entry}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::thousands;
+
+    /// What `token new` prints has to be something the server accepts, and
+    /// the secret it prints has to be the one that entry recognises.
+    #[test]
+    fn a_new_token_round_trips_through_the_loader() {
+        let (secret, entry) = super::new_token_entry(
+            "site-glasgow",
+            &["site=glasgow".to_string()],
+            Some("2099-06-30"),
+            Some(600),
+        )
+        .expect("generated");
+        assert!(secret.starts_with("lbf_"), "{secret}");
+        assert!(secret.len() >= 32);
+        assert!(
+            !entry.contains(&secret),
+            "the entry must not carry the secret"
+        );
+
+        let text = format!(
+            "[server]\nbind = \"127.0.0.1:8787\"\npublic_url = \"http://localhost:8787\"\nindex = \"i.db\"\n\
+             collection_dir = \"/srv/c\"\nupload_dir = \"/srv/c/uploaded\"\n{entry}"
+        );
+        let config: super::Config = toml::from_str(&text).expect("the printed entry is TOML");
+        config.validate().expect("and the loader accepts it");
+        let t = &config.ingest.tokens[0];
+        assert_eq!(t.name, "site-glasgow");
+        assert_eq!(t.tags.get("site").map(String::as_str), Some("glasgow"));
+        assert_eq!(t.limit_per_minute, Some(600));
+        assert!(t.expires_on().is_some());
+
+        let tokens = super::auth::IngestTokens::new(&config);
+        let accepted = tokens
+            .lookup(&secret, time::macros::date!(2027 - 01 - 01))
+            .unwrap_or_else(|_| panic!("the printed secret is accepted"));
+        assert_eq!(accepted.principal.subject, "token:site-glasgow");
+        assert_eq!(accepted.limit_per_minute, Some(600));
+
+        let (other, _) = super::new_token_entry("x", &[], None, None).expect("generated");
+        assert_ne!(secret, other, "two tokens are two secrets");
+    }
+
+    #[test]
+    fn a_new_token_refuses_what_the_server_would() {
+        for (tags, expires, want) in [
+            (vec!["site".to_string()], None, "KEY=VALUE"),
+            (vec!["site=".to_string()], None, "empty"),
+            (vec![], Some("next tuesday"), "wants a date"),
+            (vec![], Some("2027-06-30T09:00:00Z"), "plain date"),
+            (vec![], Some("2001-01-01"), "in the past"),
+        ] {
+            let err = super::new_token_entry("site-glasgow", &tags, expires, None)
+                .expect_err("refused")
+                .to_string();
+            assert!(err.contains(want), "{tags:?} {expires:?}: {err}");
+        }
+        let err = super::new_token_entry("  ", &[], None, None)
+            .expect_err("no name")
+            .to_string();
+        assert!(err.contains("no name"), "{err}");
+    }
 
     #[test]
     fn thousands_separators() {

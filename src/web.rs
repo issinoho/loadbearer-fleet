@@ -118,8 +118,8 @@ impl AppState {
     /// extractor that takes the body runs before the handler does: checking
     /// here is what makes a refusal cost the headers rather than 16 MB of
     /// buffered body per attempt.
-    pub fn allow_upload(&self, subject: &str) -> Result<(), Duration> {
-        let outcome = self.uploads.check(subject);
+    pub fn allow_upload(&self, subject: &str, limit: Option<u32>) -> Result<(), Duration> {
+        let outcome = self.uploads.check(subject, limit);
         if outcome.is_err() {
             self.runtime
                 .lock()
@@ -127,6 +127,45 @@ impl AppState {
                 .uploads_limited_total += 1;
         }
         outcome
+    }
+
+    /// Count a refused ingest token, and say so in the log — at most once a
+    /// minute, with how many there were.
+    ///
+    /// Logged because a token in every machine's deployment step is the
+    /// credential most likely to be wrong, revoked or out of date, and the
+    /// machines presenting it are not being watched. Throttled because the
+    /// same machines are also the likeliest to retry in a loop, and a log that
+    /// fills a disk is a second outage.
+    pub(crate) fn token_refused(&self, why: crate::auth::TokenRefused) {
+        let mut runtime = self.runtime.lock().expect("runtime lock");
+        match why {
+            crate::auth::TokenRefused::Unknown => runtime.tokens_unknown_total += 1,
+            crate::auth::TokenRefused::Expired(_) => runtime.tokens_expired_total += 1,
+        }
+        runtime.tokens_refused_unlogged += 1;
+        let now = std::time::Instant::now();
+        if runtime
+            .tokens_refused_logged_at
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(60))
+        {
+            return;
+        }
+        let count = std::mem::take(&mut runtime.tokens_refused_unlogged);
+        runtime.tokens_refused_logged_at = Some(now);
+        drop(runtime);
+        match why {
+            crate::auth::TokenRefused::Unknown => tracing::warn!(
+                count,
+                "ingest token refused: not one this server knows (revoked, mistyped, or from \
+                 another server)"
+            ),
+            crate::auth::TokenRefused::Expired(last) => tracing::warn!(
+                count,
+                expired = %last,
+                "ingest token refused: expired"
+            ),
+        }
     }
 
     /// The current fleet-wide analysis, rebuilt first if another process has
@@ -1637,12 +1676,151 @@ mod tests {
     fn token(name: &str, secret: &str, tags: &[(&str, &str)]) -> IngestToken {
         IngestToken {
             name: name.to_string(),
-            token: secret.to_string(),
+            token: Some(secret.to_string()),
+            token_sha256: None,
             tags: tags
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
+            limit_per_minute: None,
+            expires: None,
         }
+    }
+
+    /// The same token, held the way `token new` writes it: as its digest.
+    fn hashed(name: &str, secret: &str) -> IngestToken {
+        use sha2::{Digest, Sha256};
+        let hex: String = Sha256::digest(secret.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        IngestToken {
+            token: None,
+            token_sha256: Some(hex),
+            ..token(name, secret, &[])
+        }
+    }
+
+    /// The server holds a digest and the machine holds the secret, and the
+    /// two meet at the upload endpoint exactly as a plaintext entry did.
+    #[tokio::test]
+    async fn a_token_held_as_its_digest_submits_like_any_other() {
+        let dir = std::env::temp_dir().join(format!("lbf-tokenhash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.ingest.tokens = vec![hashed("site-glasgow", "lbf_s3cret")];
+        let state = state_for(&config);
+
+        let sent = post_token(&state, &a_later_run(serde_json::json!({})), "lbf_s3cret").await;
+        assert_eq!(sent.status, StatusCode::OK, "{}", sent.body);
+        assert_eq!(sent.json()["outcome"], "added");
+
+        // The digest is not itself a credential: holding a copy of the config
+        // is not the same as holding the token.
+        let digest = config.ingest.tokens[0].token_sha256.clone().expect("hex");
+        let replay = post_token(&state, &a_later_run(serde_json::json!({})), &digest).await;
+        assert_eq!(replay.status, StatusCode::UNAUTHORIZED, "{}", replay.body);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past its last day a token is refused, as expired rather than unknown,
+    /// and the refusal is counted where an alert can see it.
+    #[tokio::test]
+    async fn an_expired_token_is_refused_and_counted() {
+        let dir = std::env::temp_dir().join(format!("lbf-tokenexp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.metrics.enabled = true;
+        config.ingest.tokens = vec![
+            IngestToken {
+                expires: Some("2001-01-01".parse().expect("date")),
+                ..token("old", "s3cret-old", &[])
+            },
+            IngestToken {
+                expires: Some("2999-12-31".parse().expect("date")),
+                ..token("current", "s3cret-new", &[])
+            },
+        ];
+        let state = state_for(&config);
+
+        let old = post_token(&state, &a_later_run(serde_json::json!({})), "s3cret-old").await;
+        assert_eq!(old.status, StatusCode::UNAUTHORIZED, "{}", old.body);
+        assert!(
+            old.body.contains("expired after 2001-01-01"),
+            "{}",
+            old.body
+        );
+        assert_eq!(std::fs::read_dir(&dir).expect("dir").count(), 0);
+
+        let unknown = post_token(&state, &a_later_run(serde_json::json!({})), "nope").await;
+        assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
+
+        let current = post_token(&state, &a_later_run(serde_json::json!({})), "s3cret-new").await;
+        assert_eq!(current.status, StatusCode::OK, "{}", current.body);
+
+        let metrics = get(&state, "/metrics", None).await.body;
+        for line in [
+            r#"loadbearer_fleet_ingest_tokens_refused_total{reason="expired"} 1"#,
+            r#"loadbearer_fleet_ingest_tokens_refused_total{reason="unknown"} 1"#,
+        ] {
+            assert!(metrics.contains(line), "{line} in:\n{metrics}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One token per site is one bucket for every machine at the site, so a
+    /// token can be given a limit of its own — which applies to it, and not
+    /// to everybody else.
+    #[tokio::test]
+    async fn a_token_with_its_own_limit_is_held_to_it() {
+        let dir = std::env::temp_dir().join(format!("lbf-tokenlim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.server.upload_limit_per_minute = 1;
+        config.ingest.tokens = vec![
+            IngestToken {
+                limit_per_minute: Some(3),
+                ..token("site", "s3cret-site", &[])
+            },
+            token("other", "s3cret-other", &[]),
+        ];
+        let state = state_for(&config);
+        let body = a_later_run(serde_json::json!({}));
+
+        for i in 0..3 {
+            let sent = post_token(&state, &body, "s3cret-site").await;
+            assert_eq!(sent.status, StatusCode::OK, "submission {i}: {}", sent.body);
+        }
+        let fourth = post_token(&state, &body, "s3cret-site").await;
+        assert_eq!(fourth.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            fourth.header(header::RETRY_AFTER).as_deref(),
+            Some("20"),
+            "three a minute is one every twenty seconds"
+        );
+
+        // The server-wide one still applies to a token without its own.
+        assert_eq!(
+            post_token(&state, &body, "s3cret-other").await.status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_token(&state, &body, "s3cret-other").await.status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The whole point of a token, and its whole limit: a machine with no
@@ -1873,6 +2051,11 @@ mod tests {
         assert!(
             second.body.contains("idempotent"),
             "a client that stops retrying loses the result: {}",
+            second.body
+        );
+        assert!(
+            !second.body.contains("  "),
+            "one sentence, not the source file's indentation: {:?}",
             second.body
         );
         assert_eq!(
