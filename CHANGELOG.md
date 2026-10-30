@@ -5,6 +5,49 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.9.0 - Fri, 30 Oct 2026
+
+**Ingest tokens you generate rather than invent, and that the server never has
+to hold.** This is the server half of machines posting their own results,
+for loadbearer's upcoming `run --upload`; a script with `curl` can use them
+today, as before. Existing
+`[[ingest.tokens]]` entries keep working unchanged.
+
+### Added
+
+- **`loadbearer-fleet token new --name site-glasgow --tag site=glasgow`**
+  generates a token — `lbf_` and 32 random bytes — prints the secret once, for
+  the machines, and prints an `[[ingest.tokens]]` entry to paste into the
+  config. It writes nothing; restart the server to pick the entry up.
+
+- **`token_sha256`**, in place of `token`: the entry `token new` prints holds
+  only the secret's SHA-256, and the digest is not itself accepted, so the
+  config and every backup of it are no longer something anyone can submit
+  with. A plain `token` still works.
+
+- **`expires = 2027-06-30`** on a token: the last day it is accepted. After it,
+  a submission is refused with `that ingest token expired after 2027-06-30`,
+  and the server warns about it at startup.
+
+- **`limit_per_minute`** on a token, in place of
+  `server.upload_limit_per_minute`. One token per site is one bucket for every
+  machine there, so give it roughly the number that finish in the same minute.
+
+- **`loadbearer_fleet_ingest_tokens_refused_total{reason}`**, `unknown` or
+  `expired`, and a log warning — at most one a minute, with a count — when a
+  token is refused. Either rising means machines whose results are not
+  arriving.
+
+### Fixed
+
+- **The 429 an over-limit credential gets** read "try again in 30" followed by
+  twenty spaces before "second(s)". It is one sentence again.
+
+### Security
+
+- Token comparison now looks at every byte of the digests rather than
+  stopping at the first difference.
+
 ## 0.8.3 - Fri, 30 Oct 2026
 
 ### Changed
