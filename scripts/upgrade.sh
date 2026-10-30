@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Upgrades a systemd-installed loadbearer-fleet to a release: downloads it,
-# checks it against SHA256SUMS, stops the service, replaces the binary and
-# starts it again. There is no migration step — the index updates itself on
-# first start.
+# checks it against SHA256SUMS, stops the service, replaces the binary,
+# regenerates the unit if it has changed, and starts it again. There is no
+# migration step — the index updates itself on first start.
 #
 #   sudo scripts/upgrade.sh            # the latest release
 #   sudo scripts/upgrade.sh 0.8.0      # a given one
 #
-# BIN and SERVICE override where the binary lives and what the unit is called.
+# BIN, CONFIG and SERVICE override where the binary and config live and what
+# the unit is called.
 set -euo pipefail
 
 REPO=issinoho/loadbearer-fleet
 BIN=${BIN:-/usr/local/bin/loadbearer-fleet}
+CONFIG=${CONFIG:-/etc/loadbearer-fleet/fleet.toml}
 SERVICE=${SERVICE:-loadbearer-fleet}
 
 die() { echo "upgrade: $*" >&2; exit 1; }
@@ -53,6 +55,21 @@ tar xzf "$A.tar.gz"
 
 systemctl stop "$SERVICE"
 install -m755 "$A/loadbearer-fleet" "$BIN"
+
+# Regenerate the unit too: its ReadWritePaths come from the config as it was
+# when the unit was written, so a directory added since stays read-only until
+# it is. Written to a file first — a refusal must not leave an empty unit.
+unit=$(systemctl show -p FragmentPath --value "$SERVICE")
+if [[ -n $unit ]] && "$BIN" --config "$CONFIG" service unit >"$work/unit"; then
+    if ! cmp -s "$work/unit" "$unit"; then
+        install -m644 "$work/unit" "$unit"
+        systemctl daemon-reload
+        echo "unit regenerated: $unit"
+    fi
+else
+    echo "upgrade: couldn't regenerate the unit; keeping the installed one" >&2
+fi
+
 systemctl start "$SERVICE"
 
 sleep 3
