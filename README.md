@@ -840,6 +840,21 @@ sudo install -m755 loadbearer-fleet /usr/local/bin/loadbearer-fleet
 sudo systemctl start loadbearer-fleet
 ```
 
+or let [`scripts/upgrade.sh`](scripts/upgrade.sh) do all of it — download,
+check against `SHA256SUMS`, stop, replace, start, and confirm it stayed up:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/issinoho/loadbearer-fleet/main/scripts/upgrade.sh
+chmod +x upgrade.sh
+sudo ./upgrade.sh          # the latest release
+sudo ./upgrade.sh 0.8.0    # or a given one
+```
+
+It does nothing if that version is already installed, and refuses before
+stopping the service if the checksum fails or the new binary won't run.
+`BIN` and `SERVICE` override `/usr/local/bin/loadbearer-fleet` and
+`loadbearer-fleet`.
+
 **Run by hand:** stop it, unpack the new archive over the old one, start it.
 The service registration and the unit file both point at a path, so replacing
 the file at that path is the whole job — there is nothing to re-install unless
