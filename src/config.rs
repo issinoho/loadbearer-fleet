@@ -1495,7 +1495,7 @@ mod tests {
         assert_eq!(t.expires_on(), Some(time::macros::date!(2027 - 06 - 30)));
         assert_eq!(t.limit_per_minute, Some(600));
 
-        for (extra, want) in [
+        for (case, (extra, want)) in [
             (
                 format!("token = \"{secret}\"\ntoken_sha256 = \"{hex}\"\n"),
                 "both",
@@ -1507,11 +1507,16 @@ mod tests {
                 format!("token_sha256 = \"{hex}\"\nexpires = 2027-06-30T12:00:00Z\n"),
                 "plain date",
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Cases by number, not by text: the text holds a secret, and an
+            // assertion message is a log line.
             let err = load(&entry(&extra))
-                .expect_err(&format!("refused: {extra}"))
+                .expect_err(&format!("case {case} refused"))
                 .to_string();
-            assert!(err.contains(want), "{extra}: {err}");
+            assert!(err.contains(want), "case {case}: {err}");
         }
     }
 

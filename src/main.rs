@@ -968,7 +968,10 @@ mod tests {
             Some(600),
         )
         .expect("generated");
-        assert!(secret.starts_with("lbf_"), "{secret}");
+        assert!(
+            secret.starts_with("lbf_"),
+            "the prefix secret scanners look for"
+        );
         assert!(secret.len() >= 32);
         assert!(
             !entry.contains(&secret),
