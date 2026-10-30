@@ -85,12 +85,18 @@ provider are kept after a sign-in. `client_secret` exists in the config for
 providers that require one, but the intended shape is a public client with
 PKCE, so the field is normally empty.
 
-Two bearer credentials **do** live in the configuration file in plain text when
-they are used: `[metrics] token`, and each `[[ingest.tokens]]` entry. They are
-compared by digesting both sides, so neither its length nor a prefix leaks
-through timing, but the file itself is the store — treat it as one. `640
+Two bearer credentials **can** live in the configuration file in plain text:
+`[metrics] token`, and an `[[ingest.tokens]]` entry written with `token`. An
+ingest token written with `token_sha256` — the form `loadbearer-fleet token
+new` prints — holds only the secret's SHA-256, and the digest is not itself
+accepted, so a copy of the config leaks nothing anyone can submit with. A
+plain digest rather than a slow one is enough because the secret is 32 random
+bytes, not something a person chose. Every comparison is over digests and
+looks at every byte, so neither a token's length nor a prefix leaks through
+timing. The file is still the store for the rest — treat it as one. `640
 root:<service account>` is what the runbook installs it as, and revoking is
-deleting the entry and restarting.
+deleting the entry and restarting; `expires` makes a token stop on a date
+without anyone having to remember.
 
 ## Before you report: known, by-design behaviour
 
@@ -129,6 +135,12 @@ deleting the entry and restarting.
   and never looks at an `Authorization` header — so a token leaking out of a
   deployment script leaks a write path rather than the estate. It is also,
   deliberately, always a `contributor` and never more.
+- **An ingest token is a secret shared by every machine that holds it.** One
+  token per site is the intended shape, so anyone who is a local administrator
+  on one of those machines can read it and submit as that site — the
+  containment above, not prevention. Refusals of unknown or expired tokens are
+  counted in `/metrics` and logged, at most once a minute so a client retrying
+  in a loop cannot fill the disk with them.
 - **The rate limit counts submissions, not bytes.** At the default of 120 a
   minute, a credential submitting *maximum-sized* documents rather than the
   usual 40 KB ones can still write faster than the "40 KB at a time" framing

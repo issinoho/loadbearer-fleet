@@ -44,6 +44,11 @@ const PLACEHOLDER: &str = "PUT-";
 /// a length rule without a way to satisfy it just gets worked around.
 const MIN_INGEST_TOKEN_LEN: usize = 32;
 
+/// What `token new` prefixes a secret with. Recognisable on sight, and to the
+/// secret scanners that look for exactly this kind of marker in a repository
+/// or a paste — which is where a deployment credential usually turns up.
+pub const INGEST_TOKEN_PREFIX: &str = "lbf_";
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -79,14 +84,57 @@ pub struct IngestToken {
     /// What this token is for, in the log and against every run it submits.
     /// Names are unique, so revoking one is unambiguous.
     pub name: String,
-    /// The secret itself. Generate it rather than inventing it:
-    /// `openssl rand -hex 32`.
-    pub token: String,
+    /// The secret itself. Prefer `token_sha256`: exactly one of the two.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// SHA-256 of the secret, in hex — what `loadbearer-fleet token new`
+    /// prints. The server only ever needs to recognise a token, never to
+    /// produce one, so it need not hold it: a copy of this file, a backup or a
+    /// support bundle then leaks nothing anyone can submit with. A plain
+    /// digest rather than a slow one is enough, because the secret is 256
+    /// random bits rather than something a person chose.
+    #[serde(default)]
+    pub token_sha256: Option<String>,
     /// Optional, and it means what the same key means on a grant: this token
     /// may only submit results carrying these tags. Absent means the whole
     /// fleet.
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
+    /// Submissions a minute for this token, in place of
+    /// `server.upload_limit_per_minute`. The limit is per credential, and one
+    /// token per site is one bucket for every machine there — so a site that
+    /// runs at 09:00 wants more than a person clicking Add results does.
+    #[serde(default)]
+    pub limit_per_minute: Option<u32>,
+    /// The last day, UTC, this token is accepted: `expires = 2027-06-30`.
+    /// Rotation that is scheduled happens; rotation that is remembered does
+    /// not.
+    #[serde(default)]
+    pub expires: Option<toml::value::Datetime>,
+}
+
+impl IngestToken {
+    /// The digest a presented secret is compared against. Only meaningful on
+    /// a validated entry, where exactly one of the two forms is set and the
+    /// hex is well formed.
+    pub fn digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        if let Some(hex) = &self.token_sha256 {
+            let mut out = [0u8; 32];
+            for (i, byte) in out.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
+            }
+            return out;
+        }
+        Sha256::digest(self.token.as_deref().unwrap_or_default().as_bytes()).into()
+    }
+
+    /// The `expires` date, if there is one and it is a date.
+    pub fn expires_on(&self) -> Option<time::Date> {
+        let d = self.expires.as_ref()?.date?;
+        let month = time::Month::try_from(d.month).ok()?;
+        time::Date::from_calendar_date(i32::from(d.year), month, d.day).ok()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -473,7 +521,7 @@ impl Config {
         )
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.server.public_url.trim().is_empty() {
             bail!("server.public_url is empty; it is what the sign-in redirect is built from");
         }
@@ -554,15 +602,50 @@ impl Config {
             if t.name.trim().is_empty() {
                 bail!("an [[ingest.tokens]] entry has no name; the name is what you revoke");
             }
-            check_placeholder(&format!("ingest.tokens.{}.token", t.name), &t.token)?;
-            if t.token.len() < MIN_INGEST_TOKEN_LEN {
-                bail!(
-                    "the ingest token {:?} is {} characters; {} is the minimum. It is a bearer \
-                     credential that lets a machine write to the fleet, so generate one rather \
-                     than choosing it: openssl rand -hex 32",
+            match (&t.token, &t.token_sha256) {
+                (Some(_), Some(_)) => bail!(
+                    "the ingest token {:?} sets both token and token_sha256; keep token_sha256 \
+                     and delete the secret, which is the point of having the digest",
+                    t.name
+                ),
+                (None, None) => bail!(
+                    "the ingest token {:?} has neither token nor token_sha256; \
+                     `loadbearer-fleet token new --name {}` prints an entry to paste",
                     t.name,
-                    t.token.len(),
-                    MIN_INGEST_TOKEN_LEN
+                    t.name
+                ),
+                (Some(secret), None) => {
+                    check_placeholder(&format!("ingest.tokens.{}.token", t.name), secret)?;
+                    if secret.len() < MIN_INGEST_TOKEN_LEN {
+                        bail!(
+                            "the ingest token {:?} is {} characters; {} is the minimum. It is a \
+                             bearer credential that lets a machine write to the fleet, so \
+                             generate one rather than choosing it: loadbearer-fleet token new",
+                            t.name,
+                            secret.len(),
+                            MIN_INGEST_TOKEN_LEN
+                        );
+                    }
+                }
+                (None, Some(hex)) => {
+                    check_placeholder(&format!("ingest.tokens.{}.token_sha256", t.name), hex)?;
+                    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        bail!(
+                            "the ingest token {:?} has a token_sha256 that is not 64 hex \
+                             characters. It is the digest `loadbearer-fleet token new` prints, \
+                             not the secret itself",
+                            t.name
+                        );
+                    }
+                }
+            }
+            if let Some(expires) = &t.expires
+                && t.expires_on().is_none_or(|_| expires.time.is_some())
+            {
+                bail!(
+                    "the ingest token {:?} has expires = {expires}; it wants a plain date, the \
+                     last day the token is accepted, such as expires = 2027-06-30",
+                    t.name
                 );
             }
             if named.contains(&t.name.as_str()) {
@@ -852,8 +935,15 @@ role = "viewer"   # read the dashboard
 # read - it is accepted on that endpoint and nowhere else - so a credential
 # sitting in a deployment script cannot be used to enumerate the estate.
 #
-# Generate one, do not invent one:  openssl rand -hex 32
-# Anything shorter than 32 characters is refused at startup.
+# Generate one, do not invent one:
+#
+#   loadbearer-fleet token new --name site-glasgow --tag site=glasgow
+#
+# prints the secret once, for the machines, and an entry for this file that
+# holds only its SHA-256. The server never needs the secret itself, so this
+# file, and every backup of it, leaks nothing anyone could submit with.
+# A plain `token = "..."` still works, but anything shorter than 32 characters
+# is refused at startup.
 #
 # Needs upload_dir set above: tokens with nowhere to put a result are refused
 # at startup rather than at the first submission. To revoke, delete the entry
@@ -862,13 +952,25 @@ role = "viewer"   # read the dashboard
 #
 # [[ingest.tokens]]
 # name = "deployment-tool"
-# token = "PUT-A-GENERATED-INGEST-TOKEN-HERE"
+# token_sha256 = "PUT-THE-DIGEST-FROM-TOKEN-NEW-HERE"
 #
 # Optional, and it means what the same key means on a grant: this token may
 # only submit results carrying these tags, and loadbearer has to be run with
 # the matching --tag. Absent means the whole fleet.
 #
 # tags = { site = "glasgow" }
+#
+# Optional. Submissions a minute for this token, in place of
+# upload_limit_per_minute above. One token per site is one bucket for every
+# machine at that site, so raise it to roughly the number that finish in the
+# same minute, or spread them with loadbearer's --jitter.
+#
+# limit_per_minute = 600
+#
+# Optional. The last day, UTC, the token is accepted. Afterwards a submission
+# is refused as expired, so rotation happens because it was scheduled.
+#
+# expires = 2027-06-30
 "##;
         example.to_string()
     }
@@ -1285,8 +1387,11 @@ mod tests {
         };
         let tok = |name: &str, secret: &str| IngestToken {
             name: name.to_string(),
-            token: secret.to_string(),
+            token: Some(secret.to_string()),
+            token_sha256: None,
             tags: BTreeMap::new(),
+            limit_per_minute: None,
+            expires: None,
         };
         let good = "0123456789abcdef0123456789abcdef";
         let uploads = Some("/srv/collection/uploaded");
@@ -1309,7 +1414,7 @@ mod tests {
             .to_string();
         assert!(err.contains("7 characters"), "{err}");
         assert!(
-            err.contains("openssl rand -hex 32"),
+            err.contains("loadbearer-fleet token new"),
             "a length rule with no way to satisfy it gets worked around: {err}"
         );
 
@@ -1338,6 +1443,76 @@ mod tests {
             .expect_err("refused")
             .to_string();
         assert!(err.contains("no server.upload_dir"), "{err}");
+    }
+
+    /// The digest form, as `token new` writes it, and the ways an entry can
+    /// be half right.
+    #[test]
+    fn an_ingest_token_may_be_held_as_its_digest() {
+        let entry = |extra: &str| {
+            format!(
+                "[server]\nbind = \"127.0.0.1:8787\"\npublic_url = \"http://localhost:8787\"\nindex = \"i.db\"\n\
+                 collection_dir = \"/srv/c\"\nupload_dir = \"/srv/c/uploaded\"\n\
+                 [[ingest.tokens]]\nname = \"site-glasgow\"\n{extra}"
+            )
+        };
+        let load = |text: &str| -> Result<Config> {
+            let config: Config = toml::from_str(text)?;
+            config.validate()?;
+            Ok(config)
+        };
+        let secret = "lbf_0123456789abcdef0123456789abcdef";
+        let hex: String = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(secret.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+
+        let by_digest = load(&entry(&format!(
+            "token_sha256 = \"{hex}\"\nexpires = 2027-06-30\nlimit_per_minute = 600\n"
+        )))
+        .expect("the form token new prints");
+        let by_secret = load(&entry(&format!("token = \"{secret}\"\n"))).expect("plaintext");
+        let t = &by_digest.ingest.tokens[0];
+        assert_eq!(
+            t.digest(),
+            by_secret.ingest.tokens[0].digest(),
+            "the two forms of one secret are one token"
+        );
+        assert_eq!(
+            by_digest.ingest.tokens[0].digest(),
+            load(&entry(&format!(
+                "token_sha256 = \"{}\"\n",
+                hex.to_uppercase()
+            )))
+            .expect("upper-case hex")
+            .ingest
+            .tokens[0]
+                .digest(),
+        );
+        assert_eq!(t.expires_on(), Some(time::macros::date!(2027 - 06 - 30)));
+        assert_eq!(t.limit_per_minute, Some(600));
+
+        for (extra, want) in [
+            (
+                format!("token = \"{secret}\"\ntoken_sha256 = \"{hex}\"\n"),
+                "both",
+            ),
+            (String::new(), "neither"),
+            ("token_sha256 = \"abc123\"\n".to_string(), "64 hex"),
+            (format!("token_sha256 = \"{secret}\"\n"), "64 hex"),
+            (
+                format!("token_sha256 = \"{hex}\"\nexpires = 2027-06-30T12:00:00Z\n"),
+                "plain date",
+            ),
+        ] {
+            let err = load(&entry(&extra))
+                .expect_err(&format!("refused: {extra}"))
+                .to_string();
+            assert!(err.contains(want), "{extra}: {err}");
+        }
     }
 
     #[test]

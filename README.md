@@ -269,15 +269,28 @@ page has the whole of it, including `POST /api/upload` for scripting.
 
 **A machine with nobody at it uses an ingest token.** A person uploading
 through the dashboard covers the laptop somebody emailed you a result from; it
-does not cover a deployment tool running overnight. For that, name a bearer
+does not cover a deployment tool running overnight. For that, generate a bearer
 credential:
+
+```
+loadbearer-fleet token new --name site-glasgow --tag site=glasgow
+```
+
+It prints the secret once, for the machines, and an entry for the config that
+holds only the secret's SHA-256 — the server never needs the secret itself, so
+neither the config nor any backup of it is something anyone can submit with:
 
 ```toml
 [[ingest.tokens]]
-name = "deployment-tool"
-token = "<openssl rand -hex 32>"
+name = "site-glasgow"
+token_sha256 = "57be38ae…"
 # tags = { site = "glasgow" }   # optional: what it may submit for
+# limit_per_minute = 600        # optional: in place of upload_limit_per_minute
+# expires = 2027-06-30          # optional: the last day it is accepted
 ```
+
+A plain `token = "…"` of at least 32 characters still works, for configs that
+predate this.
 
 ```bash
 curl -sS https://fleet.example.com/api/upload \
@@ -292,11 +305,17 @@ as looks at an `Authorization` header — so a credential sitting in a
 deployment script cannot be used to enumerate the estate. It is a contributor
 and cannot be configured into anything else, its optional `tags` scope it the
 same way a grant scopes a person, and revoking it is deleting the entry and
-restarting. Nothing in loadbearer itself sends one: what runs the benchmark and
+restarting. Past its `expires` date it is refused as expired, which the log
+and `loadbearer_fleet_ingest_tokens_refused_total{reason="expired"}` both say,
+so a rotation nobody carried out shows up as that rather than as machines that
+went quiet. Nothing in loadbearer itself sends one: what runs the benchmark and
 what is trusted to publish its results are deliberately different things.
 
 **And one credential can only write so fast.** `upload_limit_per_minute` (120
 by default, zero for none) caps submissions per person and per token, and a
+token's own `limit_per_minute` replaces it for that token. One token per site
+is one bucket for every machine there, so give it roughly the number that
+finish in the same minute, or spread them with loadbearer's `--jitter`. A
 refusal is a `429` carrying a `Retry-After` — which is safe to act on, because
 ingest is idempotent by content, so a resend of something that did land is
 answered `already indexed`. It is a safety valve rather than a defence: what it

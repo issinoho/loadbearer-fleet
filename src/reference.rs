@@ -439,8 +439,11 @@ mod tests {
             ingest: crate::config::Ingest {
                 tokens: vec![crate::config::IngestToken {
                     name: "deployment-tool".into(),
-                    token: "t".into(),
+                    token: Some("t".into()),
+                    token_sha256: Some("t".into()),
                     tags: Default::default(),
+                    limit_per_minute: Some(600),
+                    expires: Some("2027-06-30".parse().expect("literal")),
                 }],
             },
             log: crate::config::Log {

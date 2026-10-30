@@ -42,6 +42,12 @@ pub struct Runtime {
     pub scan_failures_total: u64,
     pub uploads_total: u64,
     pub uploads_limited_total: u64,
+    pub tokens_unknown_total: u64,
+    pub tokens_expired_total: u64,
+    /// Refusals since the last one that was logged, and when that was: the
+    /// log line is throttled, the counters are not.
+    pub tokens_refused_unlogged: u64,
+    pub tokens_refused_logged_at: Option<std::time::Instant>,
     pub last_scan: Option<ScanStamp>,
 }
 
@@ -53,6 +59,10 @@ impl Runtime {
             scan_failures_total: 0,
             uploads_total: 0,
             uploads_limited_total: 0,
+            tokens_unknown_total: 0,
+            tokens_expired_total: 0,
+            tokens_refused_unlogged: 0,
+            tokens_refused_logged_at: None,
             last_scan: None,
         }
     }
@@ -283,6 +293,23 @@ pub fn render(snapshot: &Snapshot, runtime: &Runtime, now: OffsetDateTime) -> St
          or a credential worth revoking — nothing here is a normal occurrence.",
         runtime.uploads_limited_total as f64,
     );
+    out.family(
+        "ingest_tokens_refused_total",
+        "Submissions refused because their ingest token was not accepted. `unknown` is a \
+         revoked, mistyped or foreign token; `expired` is a rotation nobody carried out. Either \
+         one rising means machines whose results are not arriving.",
+        "counter",
+        &[
+            (
+                vec![("reason", "unknown")],
+                runtime.tokens_unknown_total as f64,
+            ),
+            (
+                vec![("reason", "expired")],
+                runtime.tokens_expired_total as f64,
+            ),
+        ],
+    );
     if let Some(scan) = &runtime.last_scan {
         out.gauge(
             "scan_last_success_timestamp_seconds",
@@ -346,6 +373,10 @@ mod tests {
             scan_failures_total: 1,
             uploads_total: 7,
             uploads_limited_total: 0,
+            tokens_unknown_total: 2,
+            tokens_expired_total: 0,
+            tokens_refused_unlogged: 0,
+            tokens_refused_logged_at: None,
             last_scan: Some(ScanStamp {
                 at: now() - Duration::minutes(5),
                 seen: 3,

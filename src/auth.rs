@@ -198,6 +198,20 @@ impl Authenticator {
             .collect()
     }
 
+    /// A new ingest secret, and the digest that goes in the config in its
+    /// place: `lbf_` and 32 random bytes, base64url. The same source of
+    /// randomness as a session token, and nothing about the machine or the
+    /// person asking goes into it.
+    pub fn new_ingest_token() -> (String, String) {
+        let secret = format!(
+            "{}{}",
+            crate::config::INGEST_TOKEN_PREFIX,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
+        );
+        let digest = Self::key(&secret);
+        (secret, digest)
+    }
+
     fn key(token: &str) -> String {
         Sha256::digest(token.as_bytes())
             .iter()
@@ -705,7 +719,20 @@ impl FromRequestParts<Arc<AppState>> for Caller {
 /// whatever the inputs were, so neither the length nor any prefix of the real
 /// token is recoverable from how long the answer took.
 pub(crate) fn token_matches(presented: &str, configured: &str) -> bool {
-    Sha256::digest(presented.as_bytes()) == Sha256::digest(configured.as_bytes())
+    digests_match(
+        &Sha256::digest(presented.as_bytes()).into(),
+        &Sha256::digest(configured.as_bytes()).into(),
+    )
+}
+
+/// Equality over two digests that looks at every byte whatever it finds.
+///
+/// An ordinary `==` may stop at the first difference. Over digests that leaks
+/// little — an attacker cannot steer what the hash of their guess is — but
+/// "little" is an argument, and this is three lines.
+fn digests_match(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
 }
 
 /// The token from an `Authorization: Bearer` header, if there is one.
@@ -723,30 +750,73 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
 /// both of them in the module somebody would think to audit, rather than one
 /// here and one wherever the endpoint happens to live.
 pub struct IngestTokens {
-    tokens: Vec<IngestToken>,
+    /// Each with its digest worked out once, rather than per request.
+    tokens: Vec<(IngestToken, [u8; 32])>,
+}
+
+/// Why a presented token was not accepted. Kept apart because the fixes are:
+/// an unknown token is a typo or a revocation, an expired one is a rotation
+/// nobody carried out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenRefused {
+    Unknown,
+    Expired(time::Date),
+}
+
+/// A token's principal, and the limit it was given in place of the server's.
+pub(crate) struct Accepted {
+    pub principal: Principal,
+    pub limit_per_minute: Option<u32>,
 }
 
 impl IngestTokens {
     pub fn new(config: &Config) -> Self {
+        let today = OffsetDateTime::now_utc().date();
+        for t in &config.ingest.tokens {
+            if let Some(last) = t.expires_on()
+                && last < today
+            {
+                // Said at startup as well as at the first refusal, because the
+                // first refusal is on a machine nobody is watching.
+                tracing::warn!(token = %t.name, expired = %last, "ingest token has expired");
+            }
+        }
         Self {
-            tokens: config.ingest.tokens.clone(),
+            tokens: config
+                .ingest
+                .tokens
+                .iter()
+                .map(|t| (t.clone(), t.digest()))
+                .collect(),
         }
     }
 
-    /// The principal a token stands for, or `None` if it is not one of ours.
+    /// The principal a token stands for, or why it does not stand for one.
     ///
     /// Every configured token is compared, including after a match, so the
     /// answer takes the same time whether the presented secret is first in the
     /// list, last, or absent from it.
-    fn lookup(&self, presented: &str) -> Option<Principal> {
+    pub(crate) fn lookup(
+        &self,
+        presented: &str,
+        today: time::Date,
+    ) -> Result<Accepted, TokenRefused> {
+        let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
         let mut found = None;
-        for t in &self.tokens {
-            if token_matches(presented, &t.token) {
+        for (t, known) in &self.tokens {
+            if digests_match(&digest, known) {
                 found = Some(t);
             }
         }
-        let t = found?;
-        Some(Principal {
+        let t = found.ok_or(TokenRefused::Unknown)?;
+        // `expires` is the last day it works, so the day after is the first
+        // it doesn't.
+        if let Some(last) = t.expires_on()
+            && last < today
+        {
+            return Err(TokenRefused::Expired(last));
+        }
+        let principal = Principal {
             // Namespaced, so a token can never collide with a subject the
             // identity provider issued, and so `uploaded_by` on the run reads
             // as what it was rather than as a person.
@@ -763,6 +833,10 @@ impl IngestTokens {
                 vec![t.tags.clone()]
             },
             authenticated: true,
+        };
+        Ok(Accepted {
+            principal,
+            limit_per_minute: t.limit_per_minute,
         })
     }
 }
@@ -786,6 +860,7 @@ pub struct Submitter(pub Principal);
 /// Why a submission was not accepted, before anything about the body is read.
 pub enum NotASubmitter {
     BadToken,
+    ExpiredToken(time::Date),
     NoSession(NotSignedIn),
     /// Over the per-credential rate limit, with how long until it is not.
     TooFast(StdDuration),
@@ -803,13 +878,27 @@ impl IntoResponse for NotASubmitter {
                 r#"{"error":"that ingest token is not one this server knows"}"#,
             )
                 .into_response(),
+            // Saying it expired, and when, tells the holder of a real token
+            // nothing they could not read off the server's config — and it
+            // turns "uploads stopped on the first of the month" into one line.
+            Self::ExpiredToken(last) => (
+                StatusCode::UNAUTHORIZED,
+                [(header::CONTENT_TYPE, "application/json")],
+                format!(
+                    r#"{{"error":"that ingest token expired after {last}; ask for a new one"}}"#
+                ),
+            )
+                .into_response(),
             Self::NoSession(no) => no.into_response(),
             // The wait is a header as well as prose: the thing being refused
             // is usually a script, and a script reads headers.
             Self::TooFast(wait) => {
                 let seconds = wait.as_secs().max(1);
                 let body = format!(
-                    "too many submissions from this credential; try again in {seconds}                      second(s). Resending is safe — ingest is idempotent by content, so a                      document that did land is answered as already indexed rather than                      stored twice."
+                    "too many submissions from this credential; try again in {seconds} \
+                     second(s). Resending is safe — ingest is idempotent by content, so a \
+                     document that did land is answered as already indexed rather than \
+                     stored twice."
                 );
                 let mut response = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
                 if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
@@ -828,23 +917,34 @@ impl FromRequestParts<Arc<AppState>> for Submitter {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let principal = match bearer(&parts.headers) {
-            Some(presented) => state
-                .ingest()
-                .lookup(presented)
-                .ok_or(NotASubmitter::BadToken)?,
+        let (principal, limit) = match bearer(&parts.headers) {
+            Some(presented) => {
+                match state
+                    .ingest()
+                    .lookup(presented, OffsetDateTime::now_utc().date())
+                {
+                    Ok(accepted) => (accepted.principal, accepted.limit_per_minute),
+                    Err(refused) => {
+                        state.token_refused(refused);
+                        return Err(match refused {
+                            TokenRefused::Unknown => NotASubmitter::BadToken,
+                            TokenRefused::Expired(last) => NotASubmitter::ExpiredToken(last),
+                        });
+                    }
+                }
+            }
             None => {
-                Caller::from_request_parts(parts, state)
+                let caller = Caller::from_request_parts(parts, state)
                     .await
-                    .map_err(NotASubmitter::NoSession)?
-                    .0
+                    .map_err(NotASubmitter::NoSession)?;
+                (caller.0, None)
             }
         };
         // Before the body, which is the whole point of doing it here: this
         // runs while only the headers have been read, so a caller in a loop
         // cannot make the server buffer a document per attempt.
         state
-            .allow_upload(&principal.subject)
+            .allow_upload(&principal.subject, limit)
             .map_err(NotASubmitter::TooFast)?;
         Ok(Submitter(principal))
     }
@@ -1546,22 +1646,33 @@ mod tests {
     /// Where sign-in is switched off there is still exactly one authorization
     /// path — the caller is simply a local administrator.
     fn one_token(name: &str, secret: &str, tags: &[(&str, &str)]) -> IngestTokens {
+        let t = IngestToken {
+            name: name.to_string(),
+            token: Some(secret.to_string()),
+            token_sha256: None,
+            tags: tags
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            limit_per_minute: None,
+            expires: None,
+        };
+        let digest = t.digest();
         IngestTokens {
-            tokens: vec![IngestToken {
-                name: name.to_string(),
-                token: secret.to_string(),
-                tags: tags
-                    .iter()
-                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                    .collect(),
-            }],
+            tokens: vec![(t, digest)],
         }
+    }
+
+    const TODAY: time::Date = time::macros::date!(2026 - 10 - 30);
+
+    fn accepted(list: &IngestTokens, presented: &str) -> Option<Principal> {
+        list.lookup(presented, TODAY).ok().map(|a| a.principal)
     }
 
     #[test]
     fn an_ingest_token_is_a_contributor_named_after_itself() {
         let list = one_token("deploy", "s3cret", &[]);
-        let p = list.lookup("s3cret").expect("a known token");
+        let p = accepted(&list, "s3cret").expect("a known token");
         assert_eq!(p.role, Role::Contributor);
         assert!(p.may_upload());
         assert!(!p.may_rescan(), "a script is not an administrator");
@@ -1576,7 +1687,7 @@ mod tests {
     #[test]
     fn a_tokens_tags_become_its_scope() {
         let list = one_token("glasgow", "s3cret", &[("site", "glasgow")]);
-        let p = list.lookup("s3cret").expect("a known token");
+        let p = accepted(&list, "s3cret").expect("a known token");
         assert_eq!(p.scopes.len(), 1);
         assert_eq!(p.scopes[0]["site"], "glasgow");
     }
@@ -1584,13 +1695,43 @@ mod tests {
     #[test]
     fn an_unknown_token_is_nobody() {
         let list = one_token("deploy", "s3cret", &[]);
-        assert!(list.lookup("s3crev").is_none());
-        assert!(list.lookup("s3cret ").is_none());
-        assert!(list.lookup("").is_none(), "and neither is an empty one");
+        assert!(accepted(&list, "s3crev").is_none());
+        assert!(accepted(&list, "s3cret ").is_none());
+        assert!(accepted(&list, "").is_none(), "and neither is an empty one");
         assert!(
-            IngestTokens { tokens: Vec::new() }.lookup("").is_none(),
+            accepted(&IngestTokens { tokens: Vec::new() }, "").is_none(),
             "least of all against a server with no tokens configured"
         );
+    }
+
+    /// `expires` is the last day it works: still good on the day, refused
+    /// the day after, and refused as expired rather than as unknown.
+    #[test]
+    fn a_token_works_through_its_last_day_and_not_after() {
+        let mut list = one_token("deploy", "s3cret", &[]);
+        list.tokens[0].0.expires = Some("2026-10-30".parse().expect("date"));
+        assert!(list.lookup("s3cret", TODAY).is_ok(), "the last day counts");
+        assert_eq!(
+            list.lookup("s3cret", TODAY.next_day().expect("tomorrow"))
+                .err(),
+            Some(TokenRefused::Expired(TODAY))
+        );
+        assert_eq!(
+            list.lookup("wrong", TODAY.next_day().expect("tomorrow"))
+                .err(),
+            Some(TokenRefused::Unknown),
+            "a wrong secret is unknown, whatever the date"
+        );
+    }
+
+    #[test]
+    fn a_generated_ingest_token_is_long_prefixed_and_its_digest_recognises_it() {
+        let (secret, digest) = Authenticator::new_ingest_token();
+        assert!(secret.starts_with("lbf_"));
+        assert_eq!(secret.len(), 4 + 43, "32 bytes of base64url");
+        assert_eq!(digest.len(), 64);
+        assert_eq!(digest, Authenticator::key(&secret));
+        assert_ne!(secret, Authenticator::new_ingest_token().0);
     }
 
     #[test]
