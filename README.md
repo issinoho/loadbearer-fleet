@@ -95,7 +95,7 @@ dependencies.
 **Windows** — take the `-x86_64-pc-windows-msvc.zip`, unzip it anywhere, then:
 
 ```powershell
-$V = "0.8.2"
+$V = "0.8.3"
 cd "loadbearer-fleet-$V-x86_64-pc-windows-msvc"
 .\loadbearer-fleet.exe serve C:\loadbearer\results
 ```
@@ -103,7 +103,7 @@ cd "loadbearer-fleet-$V-x86_64-pc-windows-msvc"
 **Linux** — take the `-x86_64-unknown-linux-gnu.tar.gz`:
 
 ```bash
-V=0.8.2
+V=0.8.3
 A=loadbearer-fleet-$V-x86_64-unknown-linux-gnu
 U=https://github.com/issinoho/loadbearer-fleet/releases/download/v$V
 curl -LO "$U/$A.tar.gz"
@@ -848,7 +848,7 @@ changed, start, and confirm it stayed up:
 curl -fsSLO https://raw.githubusercontent.com/issinoho/loadbearer-fleet/main/scripts/upgrade.sh
 chmod +x upgrade.sh
 sudo ./upgrade.sh          # the latest release
-sudo ./upgrade.sh 0.8.2    # or a given one
+sudo ./upgrade.sh 0.8.3    # or a given one
 ```
 
 It does nothing if that version is already installed, and refuses before

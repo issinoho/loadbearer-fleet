@@ -5,6 +5,15 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.8.3 - Fri, 30 Oct 2026
+
+### Changed
+
+- **Search tells a power plan from a power mode.** "Balanced" is both a
+  Windows plan and a mode, so typing it finds either. Add the word the
+  machine page uses after it to say which you meant: `balanced plan`,
+  `balanced mode`, or on Linux `low-power profile`.
+
 ## 0.8.2 - Fri, 30 Oct 2026
 
 ### Changed
