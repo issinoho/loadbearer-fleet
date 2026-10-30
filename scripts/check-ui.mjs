@@ -484,6 +484,26 @@ renderView('overview', (h) => mod.renderOverview(h));
 renderView('cohorts', (h) => mod.renderCohorts(h));
 renderView('machines', (h) => mod.renderMachines(h));
 
+// The machines table opens best first: score descending, unscored last.
+{
+  const h = host(1200);
+  mod.renderMachines(h);
+  const scores = [];
+  walk(h, (n) => {
+    if (String(n.tagName).toLowerCase() !== 'tr') return;
+    const cells = n.children.filter((c) => String(c.tagName).toLowerCase() === 'td');
+    if (cells.length > 2) scores.push(Number(textOf(cells[2]).replace(/[^\d.-]/g, '')) || null);
+  });
+  const scored = scores.filter((s) => s !== null);
+  check('machines', scores.length === snapshot.machines.length, `${scores.length} row(s) for `
+    + `${snapshot.machines.length} machine(s)`);
+  check('machines', scored.every((s, i) => i === 0 || scored[i - 1] >= s),
+    `not sorted by score, best first: ${scores.join(', ')}`);
+  check('machines', scores.indexOf(null) === -1 || scores.slice(scores.indexOf(null)).every((s) => s === null),
+    `an unscored machine sorted above a scored one: ${scores.join(', ')}`);
+  notes.push(`machines: opens in score order ${scores.join(', ')}`);
+}
+
 // Four distinct CPUs means no cohort is large enough to compare against, which
 // is the honest result for the fixtures but leaves the diverging chart - the
 // centrepiece of that view - unexercised. So: one cohort, five members.

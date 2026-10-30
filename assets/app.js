@@ -601,8 +601,10 @@ export function legend(items) {
   ])));
 }
 
-export function dataTable({ columns, rows, onRow, sortable }) {
-  const state = { key: null, dir: 1 };
+export function dataTable({ columns, rows, onRow, sortable, initialSort }) {
+  // initialSort is { key: columnIndex, dir: 1 | -1 }; without one, rows keep
+  // the order they came in until a header is clicked.
+  const state = { key: initialSort?.key ?? null, dir: initialSort?.dir ?? 1 };
   const wrap = el('div', { class: 'table-wrap' });
   const table = el('table', { class: 'data' });
 
@@ -1284,6 +1286,8 @@ export function renderMachines(main) {
         ...tagKeys.map((k) => ({ label: k }))],
       rows,
       sortable: true,
+      // Best first: the fleet's strongest machines at the top, unscored last.
+      initialSort: { key: 2, dir: -1 },
     }),
   ])]));
 }

@@ -5,6 +5,17 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## Unreleased
+
+### Changed
+
+- **The machines table opens best first** — by score, highest to lowest, with
+  unscored machines last. It used to open in machine-key order, which put
+  nothing in particular at the top. Clicking a column still re-sorts.
+- **`scripts/upgrade.sh`** upgrades a systemd install to a release: downloads
+  and checksums it, replaces the binary, regenerates the unit if it has
+  changed, and checks the service came back up.
+
 ## 0.8.0 - Thu, 29 Oct 2026
 
 **What power each run had.** A laptop measured on battery or in a power-saving
