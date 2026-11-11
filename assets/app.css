@@ -143,6 +143,26 @@ a { color: inherit; }
 
 .tabs::-webkit-scrollbar { display: none; }
 
+/* With no scrollbar, a strip that scrolls gives no sign that it does — and a
+   tab out of sight is a view nobody finds. So the edge where tabs continue
+   fades out, set from script (`syncTabStrip`), which is the only thing that
+   knows the scroll offset. A mask rather than an overlay: it fades whatever
+   is under it on either surface, with no colour of its own to theme. */
+.tabs.more-after {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+}
+
+.tabs.more-before {
+  -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent);
+  mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent);
+}
+
+.tabs.more-before.more-after {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent);
+}
+
 .tab {
   font: inherit;
   color: var(--text-secondary);
@@ -357,7 +377,10 @@ table.data th.sortable:hover { color: var(--text-primary); }
 table.data td.num, table.data th.num { text-align: right; }
 table.data tbody tr.clickable { cursor: pointer; }
 table.data tbody tr.clickable:hover { background: var(--plane); }
-table.data td.wrap { white-space: normal; }
+/* A floor under the one column allowed to wrap: beside a dozen `nowrap` ones on
+   a phone it was squeezed to a word per line, and the Lifecycle list ran to
+   13,000px tall. The table scrolls sideways inside its wrapper instead. */
+table.data td.wrap { white-space: normal; min-width: 16em; }
 
 /* ---------- charts ---------- */
 
@@ -411,6 +434,32 @@ table.data td.wrap { white-space: normal; }
 /* "What changed" lists one kind of change after another inside one card, so
    each heading needs the room a card's own top edge would have given it. */
 .change-section { margin-top: 16px; }
+
+/* ---------- lifecycle ---------- */
+
+/* The decision tiles are the overview's tiles made pressable: each picks
+   which decision the table lists, and the pressed one is marked the way the
+   current tab is, so "selected" has one look across the page. */
+.decision-tiles { margin-top: 8px; }
+
+.decision-tile {
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.decision-tile:hover { background: var(--plane); }
+.decision-tile[aria-pressed="true"] { box-shadow: inset 0 -2px 0 var(--series-1); border-color: var(--series-1); }
+.decision-tile .tile-label { display: flex; align-items: center; gap: 6px; }
+
+/* Keep is the healthy majority: there to be counted, not to draw the eye. */
+.decision-quiet .tile-value { color: var(--text-secondary); font-weight: 400; }
+
+.lifecycle-rule { margin: 12px 0 0; }
+
+.decision-cell { display: inline-flex; align-items: center; gap: 6px; }
+.legend-mark { display: block; flex: none; }
 
 .link-button {
   font: inherit;
@@ -553,10 +602,12 @@ table.data td.wrap { white-space: normal; }
      chip buy about 30px of margin instead of 0. */
   .topbar { padding: 10px 12px; }
   .topbar-actions { gap: 6px; }
-  /* Six tabs: as they were, the strip overflowed a 390px phone by 19px and
-     Compare sat behind a swipe nobody would know to make. Tighter padding
-     and the action row's 13px type buy it back; on 320px it still scrolls,
-     as it did with five. */
+  /* Five tabs overflowed a 390px phone by 19px, and Compare sat behind a
+     swipe nobody would know to make; tighter padding and the action row's
+     13px type bought that back. Six do not fit at any padding that leaves
+     them tappable, so on a phone the strip scrolls — with the current tab
+     kept in view and a fade on whichever edge hides more (see `.more-after`
+     above). */
   .tab { font-size: 13px; padding-left: 6px; padding-right: 6px; }
   .topbar-actions .btn { font-size: 12px; padding-left: 8px; padding-right: 8px; }
   .chip { max-width: 35vw; }

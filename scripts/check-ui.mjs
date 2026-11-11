@@ -441,6 +441,100 @@ function host(w = 700) {
   auditChart('lineChart/median-with-a-gap', g);
 }
 
+/*
+ * The scatter: one mark per machine. Nothing to plot, one mark, every mark on
+ * the same spot (where a naive scale divides by a zero range), and five
+ * hundred — at a phone's width as well as a desktop's. Beyond the shared
+ * audit: each point becomes exactly one mark, every mark sits inside the plot,
+ * an outline mark has no fill, and the reference line is where it says.
+ */
+function scatterPoints(n, at) {
+  const shapes = ['circle', 'square', 'triangle'];
+  return Array.from({ length: n }, (_, i) => {
+    const p = at ? { ...at } : { x: (i * 7919) % 131 / 10, y: 200 + ((i * 104729) % 1500) };
+    return {
+      ...p, shape: shapes[i % 3], hollow: i % 2 === 0, layer: i % 3, colour: ['#898781', '#d03b3b', '#fab219'][i % 3],
+    };
+  });
+}
+
+function auditScatter(name, h, points, xRef) {
+  const root = h.children.find((c) => c.tagName === 'svg');
+  if (!root) { check(name, false, 'no <svg> was produced'); return; }
+  auditChart(name, h);
+  const width = Number(root.attrs.width);
+  const height = Number(root.attrs.height);
+  const marks = root.children.filter((c) => (c.tagName === 'circle' && c.attrs.visibility !== 'hidden')
+    || (c.tagName === 'path'));
+  check(name, marks.length === points.length, `${marks.length} mark(s) for ${points.length} point(s)`);
+  for (const mk of marks) {
+    const xs = mk.tagName === 'circle'
+      ? [Number(mk.attrs.cx)]
+      : [...String(mk.attrs.d).matchAll(/-?\d+(?:\.\d+)?/g)].map((v) => Number(v[0])).filter((_, i) => i % 2 === 0);
+    for (const v of xs) check(name, v >= 40 && v <= width - 8, `a mark at x=${v} is outside the plot`);
+    if (mk.tagName === 'circle') {
+      check(name, Number(mk.attrs.cy) >= 16 && Number(mk.attrs.cy) <= height - 40, `a mark at y=${mk.attrs.cy} is outside the plot`);
+    }
+  }
+  const hollow = points.filter((p) => p.hollow).length;
+  check(name, marks.filter((mk) => mk.attrs.fill === 'none').length === hollow,
+    `${hollow} outline mark(s) expected, ${marks.filter((mk) => mk.attrs.fill === 'none').length} drawn without fill`);
+  if (xRef !== undefined) {
+    // Every ink is one hex in the shim, so the line is found by its label: a
+    // vertical hairline 6px from the text that names it.
+    const label = root.children.find((c) => c.tagName === 'text' && textOf(c).startsWith('old from'));
+    const lx = label ? Number(label.attrs.x) + (label.attrs['text-anchor'] === 'start' ? -6 : 6) : NaN;
+    const line = root.children.find((c) => c.tagName === 'line' && c.attrs.x1 === c.attrs.x2
+      && Math.abs(Number(c.attrs.x1) - lx) < 0.01);
+    check(name, !!line, 'no labelled vertical reference line');
+    const plotRight = width - 16;
+    if (label) {
+      const right = label.attrs['text-anchor'] === 'start'
+        ? Number(label.attrs.x) + textOf(label).length * 11 * 0.58
+        : Number(label.attrs.x);
+      check(name, right <= plotRight + 0.5, `the reference label runs past the plot (${right.toFixed(0)} > ${plotRight})`);
+    }
+  }
+  const overlay = root.children.find((c) => c.tagName === 'rect' && c.attrs.tabindex === '0');
+  check(name, !!overlay && String(overlay.attrs['aria-label']).includes(`${points.length} mark(s)`),
+    'the plot is not reachable by keyboard, or does not say how many marks it holds');
+}
+
+for (const [label, points, width] of [
+  ['one', scatterPoints(1, { x: 3.2, y: 900 }), 700],
+  ['one-at-zero', scatterPoints(1, { x: 0, y: 0 }), 700],
+  ['same-point', scatterPoints(40, { x: 6, y: 1000 }), 700],
+  ['five-hundred', scatterPoints(500), 1200],
+  ['five-hundred-phone', scatterPoints(500), 320],
+  ['beyond-the-line', scatterPoints(12).map((p) => ({ ...p, x: p.x + 20 })), 700],
+]) {
+  const h = host(width);
+  mod.scatterChart(h, {
+    points, xTitle: 'Age, years — best estimate', yTitle: 'Score', xRef: 5, xRefLabel: 'old from 5 yr',
+    readout: () => null, onSelect: () => {},
+  });
+  auditScatter(`scatterChart/${label}`, h, points, 5);
+}
+{
+  const h = host();
+  try {
+    mod.scatterChart(h, { points: [], xTitle: 'x', yTitle: 'y', readout: () => null, empty: 'Nothing to place on this chart.' });
+    check('scatterChart/none', !h.children.some((c) => c.tagName === 'svg'), 'an empty frame was drawn for no marks');
+    check('scatterChart/none', textOf(h).includes('Nothing to place'), 'nothing said why the chart is empty');
+  } catch (err) {
+    failures.push(`scatterChart/none: threw ${err.message}`);
+  }
+}
+{
+  // The legend's keys are marks too, so they are held to the marker spec.
+  const legend = mod.markLegend([
+    { label: 'Replace', shape: 'square', colour: '#d03b3b' },
+    { label: 'Repair', shape: 'triangle', colour: '#fab219' },
+    { label: 'At most', shape: 'circle', colour: '#898781', hollow: true },
+  ]);
+  check('markLegend', auditTree('markLegend', legend) === 3, 'not one key per item');
+}
+
 /* ------------------------------------------------------------------- views */
 
 /*
@@ -601,6 +695,94 @@ function renderView(name, fn) {
 renderView('overview', (h) => mod.renderOverview(h));
 renderView('cohorts', (h) => mod.renderCohorts(h));
 renderView('machines', (h) => mod.renderMachines(h));
+
+renderView('lifecycle', (h) => mod.renderLifecycle(h));
+
+/*
+ * The fixtures are four machines with three to watch and one to keep, so the
+ * Lifecycle view is also rendered over a synthetic estate built from them:
+ * every decision, an uncertain one, ages dated and bounded, machines with no
+ * age and no score, and long hostnames. The verdicts are the server's to
+ * decide; what is checked here is that the view lays out what it is given.
+ */
+const lifecycleEstate = (() => {
+  const template = snapshot.machines[0];
+  const verdicts = ['replace', 'repair', 'investigate', 'watch', 'keep'];
+  const machines = Array.from({ length: 64 }, (_, i) => {
+    const verdict = verdicts[i % 5];
+    const aged = i % 9 !== 0;
+    return {
+      ...template,
+      key: `SN-LC-${i}`,
+      hostname: i === 1 ? 'WORKSTATION-WITH-A-VERY-LONG-HOSTNAME-07' : `LC-${String(i).padStart(2, '0')}`,
+      score: i % 17 === 0 ? null : 300 + ((i * 97) % 1300),
+      grade: ['S', 'A', 'B', 'C', 'D', 'F'][i % 6],
+      battery_health: i % 4 === 0 ? 61 : null,
+      worst_drive_wear_pct: i % 3 === 0 ? 93 : null,
+      age_estimate: aged ? { months: 6 + ((i * 13) % 110), basis: i % 4 === 0 ? 'firmware' : 'upper_bound' } : null,
+      tags: { site: ['glasgow', 'edinburgh'][i % 2] },
+      lifecycle: {
+        verdict,
+        reasons: verdict === 'keep' ? [] : ['Graded F against the reference baseline', 'At most 7.7 years old, by its CPU\'s launch date'],
+        uncertain: i % 10 === 0,
+        caveats: i % 10 === 0 ? ['Clocks fell during the run'] : [],
+      },
+    };
+  });
+  const lifecycle = Object.fromEntries(verdicts.map((v) => [v, machines.filter((m) => m.lifecycle.verdict === v).length]));
+  return { ...snapshot, machines, flags: [], summary: { ...snapshot.summary, machines: machines.length, lifecycle } };
+})();
+
+/** The Machine column of the Lifecycle view's candidates table, top to bottom. */
+function candidateRows(h) {
+  let table = null;
+  walk(h, (n) => { if (n.tagName === 'table') table = n; });
+  const body = table?.children.find((c) => c.tagName === 'tbody');
+  return (body?.children || []).map((tr) => textOf(tr.children[0]));
+}
+
+{
+  mod.state.snap = lifecycleEstate;
+  mod.state.decision = null;
+  renderView('lifecycle/synthetic', (h) => mod.renderLifecycle(h));
+  const h = host(1200);
+  mod.renderLifecycle(h);
+  const text = textOf(h);
+  for (const want of ['Age against score', 'Age alone is never a reason', 'against the reference baseline',
+    're-measure first', 'at most', 'about', 'left off', 'not listed; choose Keep']) {
+    check('lifecycle/synthetic', text.includes(want), `missing ${JSON.stringify(want)}`);
+  }
+  const rank = (host) => ['replace', 'repair', 'investigate', 'watch', 'keep']
+    .indexOf(lifecycleEstate.machines.find((m) => (m.hostname || m.key) === host)?.lifecycle.verdict);
+  const rows = candidateRows(h);
+  const listed = lifecycleEstate.machines.filter((m) => m.lifecycle.verdict !== 'keep').length;
+  check('lifecycle/synthetic', rows.length === listed, `${rows.length} row(s) for ${listed} machine(s) to decide about`);
+  check('lifecycle/synthetic', rows.every((r, i) => i === 0
+    || rank(rows[i - 1]) < rank(r) || (rank(rows[i - 1]) === rank(r) && rows[i - 1].localeCompare(r) <= 0)),
+  `not most urgent first, then by name: ${rows.join(', ')}`);
+  check('lifecycle/synthetic', rows.every((r) => rank(r) !== 4), 'a machine to keep was listed unasked');
+
+  // A tile chosen: only that decision, keep included when it is the one.
+  mod.state.decision = 'keep';
+  const k = host(1200);
+  mod.renderLifecycle(k);
+  const kept = candidateRows(k);
+  check('lifecycle/keep', kept.length === lifecycleEstate.summary.lifecycle.keep && kept.every((r) => rank(r) === 4),
+    `choosing Keep listed ${kept.join(', ')}`);
+
+  // Nothing with an age: the chart says so rather than drawing an empty frame.
+  mod.state.decision = null;
+  mod.state.snap = { ...lifecycleEstate, machines: lifecycleEstate.machines.map((m) => ({ ...m, age_estimate: null })) };
+  const none = host(1200);
+  try {
+    mod.renderLifecycle(none);
+    check('lifecycle/no-ages', textOf(none).includes('No machine in view has both an age estimate and a score'),
+      'an estate with no ages did not say why the chart is empty');
+  } catch (err) {
+    failures.push(`lifecycle/no-ages: threw ${err.message}`);
+  }
+  mod.state.snap = snapshot;
+}
 
 // The machines table opens best first: score descending, unscored last.
 {
@@ -818,6 +1000,7 @@ async function renderGroupsWith(name, grouping) {
   if (h) {
     const text = textOf(h);
     check('groups', text.includes('(untagged)'), 'the untagged group is missing');
+    check('groups', text.includes('Replace') && text.includes('Repair'), 'the replace and repair columns are missing');
     check('groups', text.includes('no machine with a peer group'),
       'groups with nothing to compare were not explained');
   }
@@ -940,6 +1123,8 @@ async function renderGroupsWith(name, grouping) {
     await mod.renderMachine(h, m.key);
     const text = textOf(h);
     check('machine', text.includes(m.hostname || m.key), 'the drilldown did not name its machine');
+    check('machine', text.includes('Lifecycle') && (text.includes('Keep —') || text.includes('Watch —')),
+      'the drilldown does not say what the machine calls for');
     check('machine', text.includes('Drives') && text.includes('PhysicalDrive1') && text.includes('0x01'),
       'the drives table is missing a drive');
     check('machine', !text.includes('undefined'), 'the word "undefined" reached the page');
