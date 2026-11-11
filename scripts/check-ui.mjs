@@ -565,6 +565,26 @@ renderView('machines', (h) => mod.renderMachines(h));
         ratio: null, cv: null, confidence: 'low', representative: null, scored: false,
       },
     ],
+    // None of the fixtures was taken with admin rights on loadbearer 1.6.0,
+    // so the drives are synthetic: an NVMe drive with every counter, one
+    // raising a warning, and a SATA disk with almost none - the blank cells.
+    drives: [
+      {
+        position: 0, device: 'PhysicalDrive0', interface: 'nvme', model: 'Boot SSD', power_on_hours: 12881,
+        power_cycles: 667, unsafe_shutdowns: 195, percentage_used: 104, available_spare_pct: 100,
+        data_written_tb: 60.11, media_errors: 0, critical_warning: 0,
+      },
+      {
+        position: 1, device: 'PhysicalDrive1', interface: 'nvme', model: null, power_on_hours: 300,
+        power_cycles: 12, unsafe_shutdowns: 0, percentage_used: 1, available_spare_pct: 9,
+        data_written_tb: 0.2, media_errors: 3, critical_warning: 1,
+      },
+      {
+        position: 2, device: 'sda', interface: 'sata', model: null, power_on_hours: 40000,
+        power_cycles: null, unsafe_shutdowns: null, percentage_used: null, available_spare_pct: null,
+        data_written_tb: null, media_errors: null, critical_warning: null,
+      },
+    ],
   };
   globalThis.fetch = () => Promise.resolve({
     ok: true, json: () => Promise.resolve(payload), text: () => Promise.resolve(''),
@@ -574,6 +594,8 @@ renderView('machines', (h) => mod.renderMachines(h));
     await mod.renderMachine(h, m.key);
     const text = textOf(h);
     check('machine', text.includes(m.hostname || m.key), 'the drilldown did not name its machine');
+    check('machine', text.includes('Drives') && text.includes('PhysicalDrive1') && text.includes('0x01'),
+      'the drives table is missing a drive');
     check('machine', !text.includes('undefined'), 'the word "undefined" reached the page');
     check('machine', !text.includes('NaN'), 'the word "NaN" reached the page');
     notes.push(`machine: ${auditTree('machine', h)} chart(s), ${text.length} chars of text`);

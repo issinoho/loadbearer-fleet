@@ -95,6 +95,30 @@ pub struct Thresholds {
     /// this is not just throttling reported twice — and 8 on the seventh. The
     /// threshold sits in that gap.
     pub unstable_cpu_subtests: i64,
+    /// A drive's `percentage_used` at or above which it is worn. That figure
+    /// is the vendor's estimate of rated write endurance used, not a failure
+    /// prediction — drives routinely outlive it — so this is a warning to
+    /// plan for; 100, where the rating is spent, is critical regardless.
+    pub drive_wear_pct: f64,
+    /// Available spare below which a drive is worn. The spare is the pool of
+    /// blocks worn cells are remapped to; the drive's own critical warning
+    /// typically trips at 10%, so this is set to say so before it does.
+    pub drive_spare_pct: f64,
+    /// Free space, as a percentage of the fullest fixed volume, below which
+    /// the disk is nearly full. A percentage rather than bytes on purpose: an
+    /// SSD slows as it fills whatever its size, and slow is what this tool
+    /// measures.
+    pub disk_free_pct: f64,
+    /// The same, below which nearly full is critical.
+    pub disk_free_critical_pct: f64,
+    /// How far behind the newest firmware seen on the same system model a
+    /// machine's has to be before it's named. A vendor typically ships a
+    /// handful of releases a year; less than a quarter apart is a rollout in
+    /// progress rather than a machine that was missed.
+    pub firmware_behind_days: f64,
+    /// Firmware older than this at the time of the run is named even when no
+    /// peer of the same model shows a newer one.
+    pub firmware_old_years: f64,
 }
 
 impl Default for Thresholds {
@@ -108,6 +132,12 @@ impl Default for Thresholds {
             stale_days: 90.0,
             battery_health_pct: 70.0,
             unstable_cpu_subtests: 2,
+            drive_wear_pct: 80.0,
+            drive_spare_pct: 20.0,
+            disk_free_pct: 10.0,
+            disk_free_critical_pct: 5.0,
+            firmware_behind_days: 90.0,
+            firmware_old_years: 4.0,
         }
     }
 }
@@ -180,6 +210,155 @@ pub struct ComponentView {
     pub graded: bool,
 }
 
+/// One drive's health counters, as recorded with a run. Everything but the
+/// hours is optional: SATA drives can't fill the NVMe-only fields and a hard
+/// disk has no wear figure, and an absent figure is never read as zero.
+#[derive(Debug, Clone, Serialize)]
+pub struct DriveView {
+    pub position: i64,
+    pub device: String,
+    pub interface: String,
+    pub model: Option<String>,
+    pub power_on_hours: i64,
+    pub power_cycles: Option<i64>,
+    /// Indexed, shown, and deliberately not a rule — see `evaluate`.
+    pub unsafe_shutdowns: Option<i64>,
+    pub percentage_used: Option<i64>,
+    pub available_spare_pct: Option<i64>,
+    pub data_written_tb: Option<f64>,
+    pub media_errors: Option<i64>,
+    pub critical_warning: Option<i64>,
+}
+
+impl DriveView {
+    /// What to call it in a finding: the model if the drive reported one, the
+    /// OS's device name otherwise.
+    fn name(&self) -> &str {
+        self.model.as_deref().unwrap_or(&self.device)
+    }
+
+    fn from_row(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Self> {
+        Ok(DriveView {
+            position: r.get(at)?,
+            device: r.get(at + 1)?,
+            interface: r.get(at + 2)?,
+            model: r.get(at + 3)?,
+            power_on_hours: r.get(at + 4)?,
+            power_cycles: r.get(at + 5)?,
+            unsafe_shutdowns: r.get(at + 6)?,
+            percentage_used: r.get(at + 7)?,
+            available_spare_pct: r.get(at + 8)?,
+            data_written_tb: r.get(at + 9)?,
+            media_errors: r.get(at + 10)?,
+            critical_warning: r.get(at + 11)?,
+        })
+    }
+}
+
+/// The columns `DriveView::from_row` reads, in its order.
+const DRIVE_COLUMNS: &str = "d.position, d.device, d.interface, d.model, d.power_on_hours, \
+     d.power_cycles, d.unsafe_shutdowns, d.percentage_used, d.available_spare_pct, \
+     d.data_written_tb, d.media_errors, d.critical_warning";
+
+/// NVMe's critical-warning bits, in words. Bits past these are reserved or
+/// newer than this table, and are reported by number rather than guessed at.
+fn critical_warning_words(bits: i64) -> Vec<String> {
+    const MEANING: [&str; 5] = [
+        "spare capacity below the drive's own threshold",
+        "temperature outside its safe range",
+        "reliability degraded by media or internal errors",
+        "media switched to read-only",
+        "volatile-memory backup failed",
+    ];
+    (0..8)
+        .filter(|b| bits & (1 << b) != 0)
+        .map(|b| match MEANING.get(b) {
+            Some(m) => (*m).to_string(),
+            None => format!("bit {b}"),
+        })
+        .collect()
+}
+
+/// A `YYYY-MM-DD` date, or `None` for anything else — firmware dates come
+/// from SMBIOS, where vendors have been known to write anything.
+fn parse_day(s: &str) -> Option<time::Date> {
+    time::Date::parse(
+        s.trim(),
+        time::macros::format_description!("[year]-[month]-[day]"),
+    )
+    .ok()
+}
+
+/// "12.4 GiB" for small amounts, where "12 GiB" and "0 GiB" would hide the
+/// difference that matters on a nearly full disk; whole GiB above that.
+fn free_bytes(bytes: i64) -> String {
+    let gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if gib < 10.0 {
+        format!("{gib:.1} GiB")
+    } else {
+        format!("{gib:.0} GiB")
+    }
+}
+
+/// The newest firmware seen on one system model.
+#[derive(Debug, Clone)]
+struct NewestFirmware {
+    date: time::Date,
+    version: Option<String>,
+    /// How many machines of the model run firmware of that date.
+    on: usize,
+    /// How many machines of the model have a readable firmware date at all.
+    dated: usize,
+}
+
+/// The newest firmware per system model, over models with at least two
+/// machines carrying a readable date — one machine has nothing to be behind.
+///
+/// Built from every machine in the index, the same as `build_cohorts`, and
+/// for the same reason: what counts as "the newest firmware on this model"
+/// must not change with what the viewer happens to be filtered to, or one
+/// machine would be behind in one view and current in another. The flag that
+/// results names a version and a date — like a cohort median, a property of
+/// the model across the estate — and never the machine it was seen on.
+fn newest_firmware(machines: &[MachineView]) -> HashMap<&str, NewestFirmware> {
+    let mut groups: BTreeMap<&str, Vec<(time::Date, Option<&str>)>> = BTreeMap::new();
+    for m in machines {
+        if let (Some(model), Some(date)) = (
+            m.system_model.as_deref(),
+            m.bios_date.as_deref().and_then(parse_day),
+        ) {
+            groups
+                .entry(model)
+                .or_default()
+                .push((date, m.bios_version.as_deref()));
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|(_, seen)| seen.len() >= 2)
+        .map(|(model, seen)| {
+            let date = seen.iter().map(|s| s.0).max().expect("at least two");
+            // Machines arrive ordered by key, so which version names a date
+            // shared by two releases is stable between refreshes.
+            let version = seen
+                .iter()
+                .find(|s| s.0 == date)
+                .and_then(|s| s.1)
+                .map(str::to_string);
+            let on = seen.iter().filter(|s| s.0 == date).count();
+            (
+                model,
+                NewestFirmware {
+                    date,
+                    version,
+                    on,
+                    dated: seen.len(),
+                },
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineView {
     pub key: String,
@@ -241,6 +420,21 @@ pub struct MachineView {
     /// The settings in force that held the run back, battery power aside.
     /// Empty for a run from before loadbearer 1.7.0.
     pub power_held_back: Vec<String>,
+    /// The firmware's own version string and its `YYYY-MM-DD` date, from
+    /// loadbearer 1.6.0's `machine.firmware`. `None` for older runs and for
+    /// runs indexed before this build until `scan --reindex`.
+    pub bios_version: Option<String>,
+    pub bios_date: Option<String>,
+    /// The fixed volume with the lowest free percentage, its free share and
+    /// its free bytes — see `schema::Machine::fullest_fixed_volume`.
+    pub disk_low_mount: Option<String>,
+    pub disk_low_free_pct: Option<f64>,
+    pub disk_low_free_bytes: Option<i64>,
+    /// Every drive of the latest run, for the rules. Not serialised: the
+    /// snapshot ships every machine, and the drilldown, which wants these,
+    /// gets them from `detail` instead.
+    #[serde(skip)]
+    pub drives: Vec<DriveView>,
     pub low_confidence_cpu_subtests: i64,
     pub tags: BTreeMap<String, String>,
     pub components: Vec<ComponentView>,
@@ -467,7 +661,8 @@ pub fn snapshot(conn: &Connection, th: &Thresholds, now: OffsetDateTime) -> Resu
         }
     }
 
-    let flags = evaluate(&machines, &by_id, th);
+    let firmware = newest_firmware(&machines);
+    let flags = evaluate(&machines, &by_id, &firmware, th);
     let summary = summarise(&machines, &cohorts, &flags, th);
 
     Ok(Snapshot {
@@ -558,6 +753,20 @@ fn load_latest(
         }
     }
 
+    let mut drives: HashMap<i64, Vec<DriveView>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT d.run_id, {DRIVE_COLUMNS} FROM drive d \
+             JOIN ({LATEST}) l ON l.id = d.run_id ORDER BY d.run_id, d.position"
+        ))?;
+        for row in stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, DriveView::from_row(r, 1)?))
+        })? {
+            let (id, d) = row?;
+            drives.entry(id).or_default().push(d);
+        }
+    }
+
     // loadbearer's own confidence verdict, not a cv threshold re-derived here:
     // it already folds in the thermal downgrade, so a run whose clocks fell
     // counts as shaky without this module having to decide that a second time.
@@ -590,7 +799,9 @@ fn load_latest(
                 battery_health, battery_cycles, partial, caveats, source_path,
                 system_model, cpu_family, cpu_launched, max_age_months, firmware_dated,
                 firmware_likely_original, drive_power_on_hours, drive_wear_pct,
-                drive_hours_undercounted, power_plan, power_mode, power_held_back
+                drive_hours_undercounted, power_plan, power_mode, power_held_back,
+                bios_version, bios_date, disk_low_mount, disk_low_free_pct,
+                disk_low_free_bytes
            FROM run WHERE id IN ({LATEST}) ORDER BY machine_key"
     ))?;
 
@@ -669,6 +880,12 @@ fn load_latest(
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string)
                 .collect(),
+            bios_version: r.get(38)?,
+            bios_date: r.get(39)?,
+            disk_low_mount: r.get(40)?,
+            disk_low_free_pct: r.get(41)?,
+            disk_low_free_bytes: r.get(42)?,
+            drives: drives.remove(&run_id).unwrap_or_default(),
             low_confidence_cpu_subtests: low_conf.get(&run_id).copied().unwrap_or(0),
             tags: tags.remove(&run_id).unwrap_or_default(),
             components: components.remove(&run_id).unwrap_or_default(),
@@ -739,6 +956,7 @@ fn build_cohorts(machines: &[MachineView], th: &Thresholds) -> Vec<Cohort> {
 fn evaluate(
     machines: &[MachineView],
     cohorts: &HashMap<&str, &Cohort>,
+    firmware: &HashMap<&str, NewestFirmware>,
     th: &Thresholds,
 ) -> Vec<Flag> {
     let mut flags = Vec::new();
@@ -902,6 +1120,232 @@ fn evaluate(
                         .to_string(),
                 },
             );
+        }
+
+        // Drives are judged across every drive the run recorded, not just the
+        // first — a workstation's second drive is as much the machine's as its
+        // boot drive. One flag per rule per machine, naming the worst drive
+        // and counting the rest, so a machine with three bad drives is one
+        // line in the queue rather than three.
+        //
+        // Deliberately no rule on `unsafe_shutdowns`: a healthy laptop
+        // collects hundreds from lid closes and flat batteries, so a rule on
+        // it would fire on the estate rather than on a fault.
+        let also = |n: usize| match n {
+            0 | 1 => String::new(),
+            2 => " One other drive in this machine reports the same.".to_string(),
+            n => format!(" {} other drives in this machine report the same.", n - 1),
+        };
+
+        // The drive's own verdict, so nothing here is inferred: the most
+        // conditions raised at once is the worst.
+        let failing: Vec<(&DriveView, i64)> = m
+            .drives
+            .iter()
+            .filter_map(|d| d.critical_warning.filter(|w| *w != 0).map(|w| (d, w)))
+            .collect();
+        if let Some(&(d, bits)) = failing
+            .iter()
+            .min_by_key(|(d, w)| (std::cmp::Reverse(w.count_ones()), d.position))
+        {
+            push(
+                Severity::Critical,
+                FlagKind::Machine,
+                "drive_failing",
+                format!("{} is reporting a critical warning", d.name()),
+                format!(
+                    "The drive's own health log has its critical-warning flags set (0x{bits:02x}: \
+                     {}). That is the drive saying it is in trouble, not an inference from a slow \
+                     benchmark. Back up what is on it now and replace it.{}",
+                    critical_warning_words(bits).join("; "),
+                    also(failing.len()),
+                ),
+            );
+        }
+
+        let erroring: Vec<(&DriveView, i64)> = m
+            .drives
+            .iter()
+            .filter_map(|d| d.media_errors.filter(|n| *n > 0).map(|n| (d, n)))
+            .collect();
+        if let Some(&(d, n)) = erroring
+            .iter()
+            .min_by_key(|(d, n)| (std::cmp::Reverse(*n), d.position))
+        {
+            push(
+                Severity::Warning,
+                FlagKind::Machine,
+                "drive_media_errors",
+                format!("{} has recorded {n} media error(s)", d.name()),
+                format!(
+                    "Media and data-integrity errors are reads the drive could not correct — data \
+                     it stored and could not give back intact. A healthy drive's count is zero and \
+                     stays there. Back up what is on it; if the count grows between runs, replace \
+                     it.{}",
+                    also(erroring.len()),
+                ),
+            );
+        }
+
+        // An absent wear or spare figure — SATA, a hard disk — is no flag at
+        // all, never a guess.
+        let worn: Vec<(&DriveView, Severity)> = m
+            .drives
+            .iter()
+            .filter_map(|d| {
+                let wear = d.percentage_used.map(|w| w as f64);
+                let spare = d.available_spare_pct.map(|s| s as f64);
+                if wear.is_some_and(|w| w >= 100.0) {
+                    Some((d, Severity::Critical))
+                } else if wear.is_some_and(|w| w >= th.drive_wear_pct)
+                    || spare.is_some_and(|s| s < th.drive_spare_pct)
+                {
+                    Some((d, Severity::Warning))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if let Some(&(d, sev)) = worn.iter().min_by_key(|(d, sev)| {
+            (
+                *sev,
+                std::cmp::Reverse(d.percentage_used.unwrap_or(-1)),
+                d.available_spare_pct.unwrap_or(i64::MAX),
+                d.position,
+            )
+        }) {
+            let wear = d
+                .percentage_used
+                .filter(|w| *w as f64 >= th.drive_wear_pct || *w >= 100);
+            let spare = d
+                .available_spare_pct
+                .filter(|s| (*s as f64) < th.drive_spare_pct);
+            let mut why = Vec::new();
+            if let Some(w) = wear {
+                why.push(format!(
+                    "The drive estimates it has used {w}% of the writes it is rated for. That is \
+                     the vendor's endurance estimate, not a prediction of failure — it can pass \
+                     100, and drives often run well beyond it — but {}",
+                    if w >= 100 {
+                        "the rating, and usually the warranty's write allowance, is spent. Keep \
+                         its data backed up and replace it."
+                    } else {
+                        "it is most of the way there. Plan a replacement before it reaches 100."
+                    }
+                ));
+            }
+            if let Some(s) = spare {
+                why.push(format!(
+                    "It has {s}% of its spare blocks left — the pool worn-out cells are remapped \
+                     to. When that runs out, a drive typically makes itself read-only."
+                ));
+            }
+            push(
+                sev,
+                FlagKind::Machine,
+                "drive_worn",
+                match (wear, spare) {
+                    (Some(w), _) => format!("{} has used {w}% of its rated endurance", d.name()),
+                    (None, Some(s)) => format!("{} is down to {s}% spare capacity", d.name()),
+                    // Unreachable by construction, but a headline is cheaper
+                    // than a panic in the snapshot.
+                    (None, None) => format!("{} is worn", d.name()),
+                },
+                format!("{}{}", why.join(" "), also(worn.len())),
+            );
+        }
+
+        // Percentage-only by design: an SSD slows down as it fills whatever
+        // its size, and slow is what this tool is about. A byte threshold
+        // would excuse a nearly full 2 TB drive that performs like a nearly
+        // full 256 GB one.
+        if let Some(pct) = m.disk_low_free_pct
+            && pct < th.disk_free_pct
+        {
+            let mount = m.disk_low_mount.as_deref().unwrap_or("a fixed volume");
+            push(
+                if pct < th.disk_free_critical_pct {
+                    Severity::Critical
+                } else {
+                    Severity::Warning
+                },
+                FlagKind::Machine,
+                "disk_nearly_full",
+                format!("Only {pct:.1}% free on {mount}"),
+                format!(
+                    "{}An SSD slows down as it fills — it has fewer free blocks to write into and \
+                     spends more time reclaiming them — so this is judged as a share of the volume \
+                     rather than in gigabytes: a nearly full large drive is as slow as a nearly \
+                     full small one. Updates need room to install, too. Clear space, then \
+                     re-measure; the disk figures from this run may understate the drive.",
+                    m.disk_low_free_bytes
+                        .map(|b| format!("{} free. ", free_bytes(b)))
+                        .unwrap_or_default(),
+                ),
+            );
+        }
+
+        // Against the newest firmware seen on the same model, which is the
+        // strong form of "out of date": the update exists, and other machines
+        // here already run it.
+        let bios_day = m.bios_date.as_deref().and_then(parse_day);
+        let bios_version = m.bios_version.as_deref().unwrap_or("an unrecorded version");
+        let mut behind = false;
+        if let (Some(day), Some(model)) = (bios_day, m.system_model.as_deref())
+            && let Some(newest) = firmware.get(model)
+            && ((newest.date - day).whole_days() as f64) >= th.firmware_behind_days
+        {
+            behind = true;
+            let others = if newest.on == 1 {
+                "one machine of that model here already runs it".to_string()
+            } else {
+                format!("{} machines of that model here already run it", newest.on)
+            };
+            push(
+                Severity::Info,
+                FlagKind::Machine,
+                "firmware_behind_peers",
+                "Firmware older than on other machines of this model".to_string(),
+                format!(
+                    "This machine runs BIOS {bios_version}, dated {day}. The newest seen on a \
+                     {model} in this estate is {}, dated {}, {} days newer — {others}, of {} with \
+                     a recorded firmware date. So the update exists and has been installed \
+                     elsewhere. Firmware updates carry security and stability fixes, and \
+                     sometimes power or thermal changes that move benchmark results, which also \
+                     makes this machine's figures less comparable with its peers' until it is \
+                     updated.",
+                    newest.version.as_deref().unwrap_or("an unrecorded version"),
+                    newest.date,
+                    (newest.date - day).whole_days(),
+                    newest.dated,
+                ),
+            );
+        }
+
+        // Against the run's date rather than today, so the finding is
+        // deterministic and describes the machine as it was measured. The
+        // weaker form, so it gives way to the one above.
+        if !behind
+            && let (Some(day), Some(run_day)) =
+                (bios_day, m.taken_at.get(0..10).and_then(parse_day))
+        {
+            let years = (run_day - day).whole_days() as f64 / 365.25;
+            if years > th.firmware_old_years {
+                push(
+                    Severity::Info,
+                    FlagKind::Machine,
+                    "firmware_old",
+                    format!("Firmware {years:.1} years old when measured"),
+                    format!(
+                        "BIOS {bios_version}, dated {day}, was {years:.1} years old when this \
+                         machine was measured on {run_day}. Firmware updates carry security and \
+                         stability fixes, and sometimes power or thermal changes that move \
+                         benchmark results. No machine of the same model here is far enough ahead \
+                         to compare against, so check the vendor's support site for a later \
+                         release."
+                    ),
+                );
+            }
         }
 
         // --- The measurement ------------------------------------------------
@@ -1365,6 +1809,10 @@ pub struct SubtestRow {
 pub struct Detail {
     pub history: Vec<HistoryPoint>,
     pub subtests: Vec<SubtestRow>,
+    /// Every drive of the latest run, in the order the document listed them.
+    /// Empty for a run from before loadbearer 1.6.0 or without admin / root,
+    /// and for one indexed before this build until `scan --reindex`.
+    pub drives: Vec<DriveView>,
 }
 
 /// The per-machine detail the drilldown needs, which the fleet snapshot
@@ -1421,7 +1869,18 @@ pub fn detail(conn: &Connection, machine_key: &str, latest_run: i64) -> Result<D
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    Ok(Detail { history, subtests })
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {DRIVE_COLUMNS} FROM drive d WHERE d.run_id = ?1 ORDER BY d.position"
+    ))?;
+    let drives = stmt
+        .query_map([latest_run], |r| DriveView::from_row(r, 0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(Detail {
+        history,
+        subtests,
+        drives,
+    })
 }
 
 #[cfg(test)]
@@ -2465,6 +2924,516 @@ mod tests {
             .snap()
             .filtered(&Filter::default(), &Thresholds::default());
         assert_eq!(view.summary.machines, 2);
+    }
+
+    /// The codes the drive, disk and firmware rules raise.
+    const HEALTH_CODES: [&str; 6] = [
+        "drive_failing",
+        "drive_media_errors",
+        "drive_worn",
+        "disk_nearly_full",
+        "firmware_behind_peers",
+        "firmware_old",
+    ];
+
+    /// A healthy NVMe drive as loadbearer 1.6.0 records one — including a
+    /// laptop's ordinary pile of unsafe shutdowns, which must not be a finding.
+    fn nvme(model: &str) -> Value {
+        json!({
+            "device": "nvme0", "interface": "nvme", "model": model,
+            "power_on_hours": 5120, "power_cycles": 910, "unsafe_shutdowns": 240,
+            "percentage_used": 10, "available_spare_pct": 100, "data_written_tb": 20.5,
+            "media_errors": 0, "critical_warning": 0
+        })
+    }
+
+    fn nvme_with(model: &str, field: &str, value: Value) -> Value {
+        let mut d = nvme(model);
+        d[field] = value;
+        d
+    }
+
+    fn with_drives(drives: Vec<Value>) -> impl FnOnce(&mut Value) {
+        move |d: &mut Value| {
+            d["machine"]["drives"] = Value::Array(drives);
+        }
+    }
+
+    fn flag_on<'a>(s: &'a Snapshot, code: &str, host: &str) -> Option<&'a Flag> {
+        s.flags
+            .iter()
+            .find(|f| f.code == code && f.hostname.as_deref() == Some(host))
+    }
+
+    #[test]
+    fn a_drive_raising_its_own_critical_warning_is_critical() {
+        let mut e = Estate::new();
+        e.add_with(
+            "PC-OK",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_drives(vec![nvme("Boot SSD"), nvme("Data SSD")]),
+        );
+        // The second drive is the bad one: a rule that read only the first,
+        // as the age line does, would miss it.
+        e.add_with(
+            "PC-SECOND",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_drives(vec![
+                nvme("Boot SSD"),
+                nvme_with("Data SSD", "critical_warning", json!(4)),
+            ]),
+        );
+        // Two failing drives: one flag, naming the one raising more.
+        e.add_with(
+            "PC-BOTH",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_drives(vec![
+                nvme_with("Hot SSD", "critical_warning", json!(2)),
+                nvme_with("Dying SSD", "critical_warning", json!(0x0c)),
+            ]),
+        );
+
+        let s = e.snap();
+        assert_eq!(flags_for(&s, "drive_failing").len(), 2, "{:?}", codes(&s));
+        assert!(flag_on(&s, "drive_failing", "PC-OK").is_none());
+
+        let f = flag_on(&s, "drive_failing", "PC-SECOND").expect("the second drive");
+        assert_eq!(f.severity, Severity::Critical);
+        assert_eq!(f.kind, FlagKind::Machine);
+        assert!(f.headline.contains("Data SSD"), "{}", f.headline);
+        assert!(f.detail.contains("reliability degraded"), "{}", f.detail);
+        assert!(f.detail.contains("replace"), "{}", f.detail);
+
+        let f = flag_on(&s, "drive_failing", "PC-BOTH").expect("one flag for two drives");
+        assert!(f.headline.contains("Dying SSD"), "{}", f.headline);
+        assert!(f.detail.contains("read-only"), "{}", f.detail);
+        assert!(f.detail.contains("One other drive"), "{}", f.detail);
+
+        // Hundreds of unsafe shutdowns on every drive, and not one finding
+        // about them.
+        assert!(
+            s.flags
+                .iter()
+                .all(|f| !f.detail.to_lowercase().contains("unsafe")),
+            "{:?}",
+            codes(&s)
+        );
+    }
+
+    #[test]
+    fn critical_warning_bits_are_decoded_and_unknown_ones_reported_by_number() {
+        assert_eq!(
+            critical_warning_words(0x01),
+            ["spare capacity below the drive's own threshold"]
+        );
+        assert_eq!(critical_warning_words(0x0c).len(), 2);
+        assert_eq!(critical_warning_words(0x40), ["bit 6"]);
+    }
+
+    #[test]
+    fn a_media_error_is_a_warning_from_the_first_one() {
+        let mut e = Estate::new();
+        e.add_with(
+            "PC-ZERO",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_drives(vec![nvme("SSD")]),
+        );
+        e.add_with(
+            "PC-ONE",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_drives(vec![
+                nvme("Boot SSD"),
+                nvme_with("Data SSD", "media_errors", json!(1)),
+            ]),
+        );
+        // SATA reports no media-error count at all; absent is not zero and
+        // is not a flag either.
+        e.add_with(
+            "PC-SATA",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_drives(vec![
+                json!({"device": "sda", "interface": "sata", "power_on_hours": 40000}),
+            ]),
+        );
+
+        let s = e.snap();
+        let f = flags_for(&s, "drive_media_errors");
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].hostname.as_deref(), Some("PC-ONE"));
+        assert_eq!(f[0].severity, Severity::Warning);
+        assert!(f[0].headline.contains("Data SSD"), "{}", f[0].headline);
+    }
+
+    #[test]
+    fn wear_and_spare_are_judged_at_their_boundaries() {
+        let mut e = Estate::new();
+        let cases: [(&str, &str, Value); 7] = [
+            ("WEAR-79", "percentage_used", json!(79)),
+            ("WEAR-80", "percentage_used", json!(80)),
+            ("WEAR-99", "percentage_used", json!(99)),
+            ("WEAR-100", "percentage_used", json!(100)),
+            // It can pass 100, and the reader must not choke on it.
+            ("WEAR-163", "percentage_used", json!(163)),
+            ("SPARE-20", "available_spare_pct", json!(20)),
+            ("SPARE-19", "available_spare_pct", json!(19)),
+        ];
+        for (host, field, value) in cases {
+            e.add_with(
+                host,
+                1000.0,
+                "2026-09-01T10:00:00Z",
+                with_drives(vec![nvme_with("SSD", field, value)]),
+            );
+        }
+        // A hard disk has no wear figure: nothing to say, nothing guessed.
+        e.add_with(
+            "HDD",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_drives(vec![json!({
+                "device": "sdb", "interface": "sata", "model": "Spinning Rust",
+                "power_on_hours": 61000, "power_cycles": 3100
+            })]),
+        );
+
+        let s = e.snap();
+        let sev = |host: &str| flag_on(&s, "drive_worn", host).map(|f| f.severity);
+        assert_eq!(sev("WEAR-79"), None);
+        assert_eq!(sev("WEAR-80"), Some(Severity::Warning));
+        assert_eq!(sev("WEAR-99"), Some(Severity::Warning));
+        assert_eq!(sev("WEAR-100"), Some(Severity::Critical));
+        assert_eq!(sev("WEAR-163"), Some(Severity::Critical));
+        assert_eq!(sev("SPARE-20"), None);
+        assert_eq!(sev("SPARE-19"), Some(Severity::Warning));
+        assert_eq!(sev("HDD"), None);
+
+        let f = flag_on(&s, "drive_worn", "WEAR-163").unwrap();
+        assert!(f.headline.contains("163%"), "{}", f.headline);
+        assert!(
+            f.detail.contains("not a prediction of failure"),
+            "{}",
+            f.detail
+        );
+        let f = flag_on(&s, "drive_worn", "SPARE-19").unwrap();
+        assert!(f.headline.contains("19% spare"), "{}", f.headline);
+    }
+
+    #[test]
+    fn of_several_worn_drives_the_worst_is_named() {
+        let mut e = Estate::new();
+        e.add_with(
+            "PC-1",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_drives(vec![
+                nvme_with("Tired SSD", "percentage_used", json!(85)),
+                nvme_with("Spent SSD", "percentage_used", json!(104)),
+                nvme("Fresh SSD"),
+            ]),
+        );
+        let s = e.snap();
+        let f = flags_for(&s, "drive_worn");
+        assert_eq!(f.len(), 1, "one flag per machine, however many drives");
+        assert_eq!(f[0].severity, Severity::Critical);
+        assert!(f[0].headline.contains("Spent SSD"), "{}", f[0].headline);
+        assert!(f[0].detail.contains("One other drive"), "{}", f[0].detail);
+    }
+
+    fn with_disks(disks: Value) -> impl FnOnce(&mut Value) {
+        move |d: &mut Value| {
+            d["machine"]["disks"] = disks;
+        }
+    }
+
+    /// A fixed volume of `total_gib`, `free_pct` free.
+    fn volume(mount: &str, total_gib: u64, free_pct: f64) -> Value {
+        let total = total_gib * 1024 * 1024 * 1024;
+        json!({
+            "name": mount, "mount_point": mount, "file_system": "NTFS", "kind": "SSD",
+            "total_bytes": total, "available_bytes": (total as f64 * free_pct / 100.0) as u64,
+            "removable": false
+        })
+    }
+
+    #[test]
+    fn a_nearly_full_disk_is_judged_on_its_fullest_fixed_volume() {
+        let mut e = Estate::new();
+        for (host, pct) in [
+            ("FREE-10", 10.0),
+            ("FREE-9.9", 9.9),
+            ("FREE-5", 5.0),
+            ("FREE-4.9", 4.9),
+        ] {
+            e.add_with(
+                host,
+                1000.0,
+                "2026-09-01T10:00:00Z",
+                with_disks(json!([volume("C:\\", 100, 40.0), volume("D:\\", 100, pct)])),
+            );
+        }
+        // Nearly full, but on volumes that run that way by design: a USB
+        // stick, an EFI partition and a recovery partition. The fixed volume
+        // that matters is fine. The last entry has no `removable` at all, as
+        // a document from a reader-tolerant future might not.
+        let mut stick = volume("E:\\", 64, 1.0);
+        stick["removable"] = json!(true);
+        let mut no_flag_field = volume("F:\\", 200, 60.0);
+        no_flag_field
+            .as_object_mut()
+            .expect("object")
+            .remove("removable");
+        e.add_with(
+            "SMALL-AND-REMOVABLE",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_disks(json!([
+                volume("/", 250, 30.0),
+                stick,
+                {
+                    "name": "efi", "mount_point": "/boot/efi", "file_system": "vfat",
+                    "kind": "SSD", "total_bytes": 536_870_912u64,
+                    "available_bytes": 1_048_576u64, "removable": false
+                },
+                volume("/recovery", 7, 0.5),
+                no_flag_field
+            ])),
+        );
+
+        let s = e.snap();
+        let sev = |host: &str| flag_on(&s, "disk_nearly_full", host).map(|f| f.severity);
+        assert_eq!(sev("FREE-10"), None);
+        assert_eq!(sev("FREE-9.9"), Some(Severity::Warning));
+        assert_eq!(sev("FREE-5"), Some(Severity::Warning));
+        assert_eq!(sev("FREE-4.9"), Some(Severity::Critical));
+        assert_eq!(sev("SMALL-AND-REMOVABLE"), None);
+
+        let f = flag_on(&s, "disk_nearly_full", "FREE-4.9").unwrap();
+        assert!(f.headline.contains("D:\\"), "{}", f.headline);
+        assert!(f.detail.contains("4.9 GiB free"), "{}", f.detail);
+
+        let m = machine(&s, "SMALL-AND-REMOVABLE");
+        assert_eq!(m.disk_low_mount.as_deref(), Some("/"));
+        assert!((m.disk_low_free_pct.unwrap() - 30.0).abs() < 0.01);
+    }
+
+    /// A Lenovo X1 Carbon, as loadbearer records its firmware.
+    fn firmware(bios_version: &str, bios_date: &str) -> impl FnOnce(&mut Value) {
+        let (v, d) = (bios_version.to_string(), bios_date.to_string());
+        move |doc: &mut Value| {
+            doc["machine"]["firmware"] = json!({
+                "system_vendor": "LENOVO", "system_model": "20XW004BUK",
+                "system_version": "ThinkPad X1 Carbon Gen 9",
+                "bios_version": v, "bios_date": d
+            });
+        }
+    }
+
+    #[test]
+    fn firmware_behind_its_peers_needs_two_dated_machines_and_the_day_gap() {
+        // One machine of the model: nothing to be behind.
+        let mut e = Estate::new();
+        e.add_with(
+            "ALONE",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            firmware("N32ET80W (1.56)", "2025-03-03"),
+        );
+        assert!(flags_for(&e.snap(), "firmware_behind_peers").is_empty());
+
+        // A second machine whose date can't be read doesn't make a group.
+        e.add_with(
+            "GARBLED",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            firmware("N32ET91W (1.67)", "06/01/2025"),
+        );
+        assert!(flags_for(&e.snap(), "firmware_behind_peers").is_empty());
+
+        // Now a dated peer exactly 90 days newer than ALONE, and a third
+        // machine one day short of that gap.
+        e.add_with(
+            "NEWEST",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            firmware("N32ET91W (1.67)", "2025-06-01"),
+        );
+        e.add_with(
+            "NEARLY",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            firmware("N32ET85W (1.61)", "2025-03-04"),
+        );
+        // The same dates on another model are not this model's peers.
+        e.add_with("OTHER-MODEL", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["machine"]["firmware"] = json!({
+                "system_vendor": "Dell Inc.", "system_model": "Latitude 7440",
+                "bios_version": "1.2.0", "bios_date": "2024-01-01"
+            });
+        });
+
+        let s = e.snap();
+        let behind: Vec<_> = flags_for(&s, "firmware_behind_peers")
+            .iter()
+            .filter_map(|f| f.hostname.as_deref())
+            .collect();
+        assert_eq!(behind, ["ALONE"], "{:?}", codes(&s));
+
+        let f = flag_on(&s, "firmware_behind_peers", "ALONE").unwrap();
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.kind, FlagKind::Machine);
+        for needle in [
+            "N32ET80W (1.56)",
+            "2025-03-03",
+            "N32ET91W (1.67)",
+            "2025-06-01",
+            "90 days",
+        ] {
+            assert!(f.detail.contains(needle), "{needle} missing: {}", f.detail);
+        }
+        assert_eq!(
+            machine(&s, "ALONE").bios_version.as_deref(),
+            Some("N32ET80W (1.56)")
+        );
+    }
+
+    #[test]
+    fn old_firmware_is_measured_against_the_run_and_gives_way_to_a_peer_comparison() {
+        let mut e = Estate::new();
+        // Exactly four years before the run is not *more* than four.
+        e.add_with("FOUR-YEARS", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["machine"]["firmware"] = json!({
+                "system_vendor": "HP", "system_model": "EliteBook 840 G9",
+                "bios_version": "U70 01.02.00", "bios_date": "2022-09-01"
+            });
+        });
+        e.add_with(
+            "FOUR-YEARS-AND-A-DAY",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            |d| {
+                d["machine"]["firmware"] = json!({
+                    "system_vendor": "HP", "system_model": "EliteBook 850 G9",
+                    "bios_version": "U70 01.01.00", "bios_date": "2022-08-31"
+                });
+            },
+        );
+        // Old *and* behind a peer: the peer comparison is the stronger
+        // statement, so it is the only one made.
+        e.add_with(
+            "BEHIND",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            firmware("N32ET40W (1.10)", "2020-01-15"),
+        );
+        e.add_with(
+            "CURRENT",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            firmware("N32ET91W (1.67)", "2026-06-01"),
+        );
+
+        let s = e.snap();
+        assert!(flag_on(&s, "firmware_old", "FOUR-YEARS").is_none());
+        let f = flag_on(&s, "firmware_old", "FOUR-YEARS-AND-A-DAY").expect("past four years");
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.detail.contains("security"), "{}", f.detail);
+
+        assert!(flag_on(&s, "firmware_behind_peers", "BEHIND").is_some());
+        assert!(
+            flag_on(&s, "firmware_old", "BEHIND").is_none(),
+            "{:?}",
+            codes(&s)
+        );
+
+        // Measured against the run, not the clock: years later, the same
+        // run says the same thing.
+        let later = e.snap_at(datetime!(2031-01-01 00:00:00 UTC));
+        assert!(flag_on(&later, "firmware_old", "FOUR-YEARS").is_none());
+    }
+
+    /// The newest firmware per model is a fleet-wide fact, like a cohort
+    /// median: narrowing the view to the machine that is behind doesn't make
+    /// it current.
+    #[test]
+    fn a_filter_does_not_move_the_newest_firmware_on_a_model() {
+        let mut e = Estate::new();
+        e.add_with("GLA-OLD", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            firmware("N32ET40W (1.10)", "2025-01-01")(d);
+            tagged("glasgow")(d);
+        });
+        e.add_with("EDI-NEW", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            firmware("N32ET91W (1.67)", "2026-06-01")(d);
+            tagged("edinburgh")(d);
+        });
+        let view = e.snap().filtered(
+            &Filter {
+                scopes: vec![BTreeMap::from([(
+                    "site".to_string(),
+                    "glasgow".to_string(),
+                )])],
+                ..Default::default()
+            },
+            &Thresholds::default(),
+        );
+        assert_eq!(view.summary.machines, 1);
+        assert!(flag_on(&view, "firmware_behind_peers", "GLA-OLD").is_some());
+    }
+
+    /// A document from before any of this — no drives, no firmware — raises
+    /// none of it and fails nothing. Its one disk is a quarter free.
+    #[test]
+    fn the_legacy_document_raises_none_of_the_health_findings() {
+        let mut e = Estate::new();
+        e.ingest("legacy-1.2.4.json");
+        e.ingest("linux-throttled.json");
+        e.ingest("low-end.json");
+        e.add("PC-1", 1000.0, "2026-09-01T10:00:00Z");
+        let s = e.snap();
+        for code in HEALTH_CODES {
+            assert!(flags_for(&s, code).is_empty(), "{code}: {:?}", codes(&s));
+        }
+        let legacy = s
+            .machines
+            .iter()
+            .find(|m| m.tool_version == "1.2.4")
+            .expect("legacy machine");
+        assert!(legacy.drives.is_empty());
+        assert_eq!(legacy.bios_date, None);
+        // Disks are in every version, so this is filled even here.
+        assert_eq!(legacy.disk_low_mount.as_deref(), Some("C:\\"));
+        let d = detail(e.idx.conn(), &legacy.key, legacy.run_id).unwrap();
+        assert!(d.drives.is_empty());
+    }
+
+    #[test]
+    fn the_drilldown_carries_every_drive_in_document_order() {
+        let mut e = Estate::new();
+        e.add_with(
+            "PC-1",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_drives(vec![
+                nvme("Boot SSD"),
+                json!({"device": "sda", "interface": "sata", "power_on_hours": 40000}),
+            ]),
+        );
+        let s = e.snap();
+        let m = machine(&s, "PC-1");
+        let d = detail(e.idx.conn(), &m.key, m.run_id).unwrap();
+        assert_eq!(d.drives.len(), 2);
+        assert_eq!(d.drives[0].model.as_deref(), Some("Boot SSD"));
+        assert_eq!(d.drives[0].unsafe_shutdowns, Some(240));
+        assert_eq!(d.drives[1].name(), "sda", "no model, so the device");
+        assert_eq!(d.drives[1].percentage_used, None);
+        // Kept out of the snapshot, which ships every machine.
+        let json = serde_json::to_value(m).unwrap();
+        assert!(json.get("drives").is_none());
     }
 
     /// The drilldown's own query: every run of one machine, and the subtests of
