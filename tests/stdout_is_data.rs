@@ -68,6 +68,60 @@ fn report_json_writes_only_the_snapshot_to_stdout() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `report --by` prints a table, and with `--json` the same document
+/// `/api/groups` sends — pipeable like the snapshot. An unknown dimension is
+/// refused, on stderr, rather than answered with an empty table.
+#[test]
+fn report_by_writes_the_groups_to_stdout() {
+    let dir = scratch("report-by");
+    let index = dir.join("i.db");
+    let index = index.to_str().expect("path");
+    stdout_of(&["--index", index, "scan", fixtures().to_str().expect("path")]);
+
+    let json = stdout_of(&["--index", index, "report", "--by", "tag:site", "--json"]);
+    let g: serde_json::Value = serde_json::from_str(&json).unwrap_or_else(|e| {
+        panic!(
+            "stdout did not parse as JSON ({e}). The first 200 bytes were:\n{}",
+            &json[..json.len().min(200)]
+        )
+    });
+    assert_eq!(g["by"], "tag:site");
+    let groups = g["groups"].as_array().expect("groups");
+    let total: u64 = groups
+        .iter()
+        .map(|grp| grp["machines"].as_u64().expect("count"))
+        .sum();
+    assert_eq!(Some(total), g["machines"].as_u64(), "the groups add up");
+    assert!(!json.contains('\u{1b}'), "stdout carried ANSI escape codes");
+
+    let text = stdout_of(&["--index", index, "report", "--by", "tag:site"]);
+    assert!(
+        text.starts_with("Grouped by tag:site:"),
+        "stdout should open with the table's own heading, got:\n{}",
+        &text[..text.len().min(200)]
+    );
+    assert!(text.contains("glasgow"), "{text}");
+    assert!(
+        text.contains("(untagged)"),
+        "the untagged fixture is a group: {text}"
+    );
+    assert!(!text.contains('\u{1b}'), "stdout carried ANSI escape codes");
+
+    let refused = Command::new(EXE)
+        .args(["--index", index, "report", "--by", "hostname"])
+        .output()
+        .expect("run the binary");
+    assert!(!refused.status.success(), "an unknown dimension must fail");
+    assert!(refused.stdout.is_empty(), "and print nothing to stdout");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("tag:<key>"),
+        "the refusal says what is accepted: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The same property with a log file configured, which the test above cannot
 /// see: without one there is nothing to announce.
 ///

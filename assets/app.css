@@ -222,6 +222,18 @@ a { color: inherit; }
 }
 
 .tag-filters { display: flex; gap: 12px; flex-wrap: wrap; }
+
+/* A model or CPU string is long and has to fit a phone's half-width column,
+   so the value truncates inside its button rather than widening the row; the
+   title and the aria-label carry the whole of it. */
+.filter-exact { min-width: 0; max-width: 280px; }
+.filter-exact .btn { display: inline-flex; align-items: center; max-width: 100%; min-width: 0; }
+.filter-exact-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* The Groups view's selector, inside a card rather than in the filter row:
+   it arranges the machines in view rather than choosing them. As wide as a
+   filter, not as wide as the card. */
+.filter-by { max-width: 280px; }
 .filter-count { color: var(--text-muted); font-size: 12px; margin-left: auto; }
 
 /* ---------- layout ---------- */
@@ -537,6 +549,11 @@ table.data td.wrap { white-space: normal; }
      chip buy about 30px of margin instead of 0. */
   .topbar { padding: 10px 12px; }
   .topbar-actions { gap: 6px; }
+  /* Six tabs: as they were, the strip overflowed a 390px phone by 19px and
+     Compare sat behind a swipe nobody would know to make. Tighter padding
+     and the action row's 13px type buy it back; on 320px it still scrolls,
+     as it did with five. */
+  .tab { font-size: 13px; padding-left: 6px; padding-right: 6px; }
   .topbar-actions .btn { font-size: 12px; padding-left: 8px; padding-right: 8px; }
   .chip { max-width: 35vw; }
 }

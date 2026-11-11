@@ -348,6 +348,29 @@ function host(w = 700) {
   auditChart('stackedChart', h);
 }
 
+// The same chart as shares of a fixed whole, as the Groups view draws it: a
+// row at 100%, a row at nothing, and figures carrying their own unit.
+{
+  const h = host(360);
+  mod.stackedChart(h, {
+    rows: [
+      { label: 'Dell Inc. Latitude 7440 2-in-1', values: { critical: 100, warning: 0 } },
+      { label: 'glasgow', values: { critical: 12.5, warning: 37.5 } },
+      { label: '(untagged)', values: { critical: 0, warning: 0 } },
+    ],
+    series: [
+      { key: 'critical', label: 'Critical', colour: '#d03b3b' },
+      { key: 'warning', label: 'Warning', colour: '#fab219' },
+    ],
+    max: 100,
+    format: (v) => `${Math.round(v)}%`,
+  });
+  auditChart('stackedChart/shares', h);
+  const text = textOf(h);
+  check('stackedChart/shares', text.includes('100%') && text.includes('50%'),
+    `the totals are not shown as shares: ${text}`);
+}
+
 // History: mixed comparability, a missing score, and two runs at the same
 // instant (t1 === t0), which is the divide-by-zero case on the time axis.
 {
@@ -455,6 +478,33 @@ function realCompare(names) {
   }
 }
 
+/** `report --by <dimension> --json`: the same document `/api/groups` sends. */
+function realGrouping(by) {
+  const target = process.env.CARGO_TARGET_DIR || 'target';
+  const exe = join(
+    target,
+    'debug',
+    process.platform === 'win32' ? 'loadbearer-fleet.exe' : 'loadbearer-fleet',
+  );
+  const db = join(tmpdir(), `lbf-check-grp-${process.pid}.db`);
+  const run = (args) => {
+    const r = spawnSync(exe, ['--index', db, '--log-level', 'warn', ...args], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      console.error(`\n${exe} ${args.join(' ')} failed:\n${r.stderr || r.stdout}`);
+      process.exit(1);
+    }
+    return r.stdout;
+  };
+  try {
+    run(['scan', 'tests/fixtures']);
+    return JSON.parse(run(['report', '--by', by, '--json']));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try { rmSync(db + suffix); } catch { /* already gone */ }
+    }
+  }
+}
+
 const snapshot = realSnapshot();
 check('snapshot', snapshot.machines.length > 0, 'the fixtures produced no machines');
 notes.push(`snapshot: ${snapshot.machines.length} machine(s), ${snapshot.flags.length} finding(s), `
@@ -528,6 +578,98 @@ renderView('machines', (h) => mod.renderMachines(h));
   mod.state.snap = { ...snapshot, machines: members, cohorts: [cohort], flags: [] };
   renderView('cohorts/with-peers', (h) => mod.renderCohorts(h));
   mod.state.snap = snapshot;
+}
+
+/*
+ * The Groups view fetches its own grouping. Answered first with one the binary
+ * produced from the fixtures — the real shape, where four distinct CPUs mean
+ * nobody has a peer group — and then with a synthetic estate big enough to
+ * draw every chart: more groups than the cap, thin ones, one with no peers at
+ * all, and the group of machines with no value.
+ */
+async function renderGroupsWith(name, grouping) {
+  globalThis.fetch = (url) => Promise.resolve(String(url).startsWith('/api/groups')
+    ? { ok: true, json: () => Promise.resolve(grouping), text: () => Promise.resolve('') }
+    : { ok: false, text: () => Promise.resolve('unexpected request') });
+  const h = host(1200);
+  try {
+    await mod.renderGroups(h);
+  } catch (err) {
+    failures.push(`${name}: threw ${err.message}`);
+    return null;
+  }
+  const text = textOf(h);
+  check(name, text.length > 40, 'rendered almost no text');
+  check(name, !text.includes('undefined'), 'the word "undefined" reached the page');
+  check(name, !text.includes('NaN'), 'the word "NaN" reached the page');
+  notes.push(`${name}: ${auditTree(name, h)} chart(s), ${text.length} chars of text`);
+  return h;
+}
+
+{
+  const real = realGrouping('tag:site');
+  check('groups', real.groups.reduce((a, g) => a + g.machines, 0) === real.machines,
+    'the groups the binary produced do not add up to the machines in view');
+  const h = await renderGroupsWith('groups', real);
+  if (h) {
+    const text = textOf(h);
+    check('groups', text.includes('(untagged)'), 'the untagged group is missing');
+    check('groups', text.includes('no machine with a peer group'),
+      'groups with nothing to compare were not explained');
+  }
+
+  const template = real.groups[0];
+  const synthetic = [];
+  for (let i = 0; i < 14; i += 1) {
+    const machines = [40, 9, 6, 5, 4, 4, 3, 2, 2, 1, 1, 1, 1, 1][i];
+    const withCohort = i === 6 ? 0 : Math.min(machines, i % 5 === 4 ? 2 : machines);
+    synthetic.push({
+      ...template,
+      value: i === 13 ? null : `SITE-${String.fromCharCode(65 + i)}${i === 0 ? '-WITH-A-LONG-NAME' : ''}`,
+      machines,
+      grades: [['S', 0], ['A', 1], ['B', machines - 1], ['C', 0], ['D', 0], ['F', 0]],
+      median_cohort_delta_pct: withCohort ? [-23.4, -8.1, 0, 3.2, -1.5][i % 5] : null,
+      with_cohort: withCohort,
+      thin: withCohort < real.thresholds.min_cohort,
+      flagged: Math.ceil(machines / (i + 1)),
+      machines_critical: i % 3 === 0 ? 1 : 0,
+      top_flags: [{ code: 'thermal_limited', machines: 1 }],
+    });
+  }
+  const big = await renderGroupsWith('groups/synthetic', { ...real, by: 'model', groups: synthetic, machines: 80 });
+  if (big) {
+    const text = textOf(big);
+    check('groups/synthetic', text.includes(`first 12 of ${synthetic.length}`),
+      'the charts did not say they were capped');
+    check('groups/synthetic', text.includes('(not recorded)'), 'the group with no model is missing');
+    check('groups/synthetic', text.includes('left out because fewer than'),
+      'thin groups were left out of the chart without saying so');
+    // The full table has a row for every group, capped charts or not.
+    let tables = 0;
+    let lastRows = 0;
+    walk(big, (n) => {
+      if (n.tagName !== 'table') return;
+      tables += 1;
+      const body = n.children.find((c) => c.tagName === 'tbody');
+      lastRows = body ? body.children.length : 0;
+    });
+    check('groups/synthetic', tables > 0 && lastRows === synthetic.length,
+      `the table has ${lastRows} row(s) for ${synthetic.length} group(s)`);
+  }
+
+  // A stale or hand-edited link naming a dimension that does not exist: the
+  // server's reason, and the way back.
+  globalThis.fetch = () => Promise.resolve({
+    ok: false, text: () => Promise.resolve('"hostname" is not something machines can be grouped by.'),
+  });
+  const refused = host(1200);
+  try {
+    await mod.renderGroups(refused);
+    check('groups/refused', textOf(refused).includes('not something machines can be grouped by'),
+      "the server's reason was not shown");
+  } catch (err) {
+    failures.push(`groups/refused: threw ${err.message}`);
+  }
 }
 
 // The drilldown fetches its own detail, so the fetch is answered with a payload

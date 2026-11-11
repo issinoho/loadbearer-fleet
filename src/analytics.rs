@@ -46,6 +46,14 @@
 //! actually binds, and it is set so the effective trigger lands around a 15%
 //! shortfall — comfortably above loadbearer's own few-percent run-to-run
 //! spread.
+//!
+//! ## Grouping by anything else
+//!
+//! A cohort is the only grouping the statistics are drawn from. Sites, models
+//! and operating systems are groupings of the *machines in view* (`groups`),
+//! and what they compare is each member's standing in its own cohort, never the
+//! raw score — otherwise "which site is in the worst shape" is answered by
+//! "whichever had its refresh longest ago".
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -1510,17 +1518,12 @@ fn evaluate(
     flags
 }
 
-/// Everything in the summary is derived from the machines in view, never from a
-/// separate query, so a filtered view's headline always agrees with the rows
-/// underneath it.
-fn summarise(
-    machines: &[MachineView],
-    cohorts: &[Cohort],
-    flags: &[Flag],
-    th: &Thresholds,
-) -> Summary {
-    let scores = sorted_of(machines.iter().filter_map(|m| m.score));
-
+/// Grade histogram, best first, with any grade this build doesn't recognise
+/// last. Shared by the summary and by each group, so a group's histogram is
+/// the summary's restricted to its members and the two always add up.
+fn grade_histogram<'a>(
+    machines: impl IntoIterator<Item = &'a MachineView>,
+) -> Vec<(String, usize)> {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     let mut unrecognised = 0usize;
     for m in machines {
@@ -1536,6 +1539,40 @@ fn summarise(
     if unrecognised > 0 {
         grades.push(("unrecognised".to_string(), unrecognised));
     }
+    grades
+}
+
+/// The machines that need attention: those carrying at least one critical or
+/// warning flag.
+///
+/// Info flags don't make a machine "flagged" — every machine in a small estate
+/// carries one, and a headline that says all of them need attention is a
+/// headline nobody reads twice. The one definition, so the overview's headline
+/// and a group's count cannot come to disagree about what "flagged" means.
+fn flagged_keys<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> HashSet<&'a str> {
+    flags
+        .into_iter()
+        .filter(|f| f.severity != Severity::Info)
+        .map(|f| f.machine_key.as_str())
+        .collect()
+}
+
+/// Whether a machine's latest result is history rather than inventory.
+fn is_stale(m: &MachineView, th: &Thresholds) -> bool {
+    m.age_days.is_some_and(|a| a > th.stale_days)
+}
+
+/// Everything in the summary is derived from the machines in view, never from a
+/// separate query, so a filtered view's headline always agrees with the rows
+/// underneath it.
+fn summarise(
+    machines: &[MachineView],
+    cohorts: &[Cohort],
+    flags: &[Flag],
+    th: &Thresholds,
+) -> Summary {
+    let scores = sorted_of(machines.iter().filter_map(|m| m.score));
+    let grades = grade_histogram(machines);
 
     let mut configs: BTreeMap<String, usize> = BTreeMap::new();
     for m in machines {
@@ -1544,14 +1581,7 @@ fn summarise(
     let mut configurations: Vec<(String, usize)> = configs.into_iter().collect();
     configurations.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    // Info flags don't make a machine "flagged" — every machine in a small
-    // estate carries one, and a headline that says all of them need attention
-    // is a headline nobody reads twice.
-    let flagged: HashSet<&str> = flags
-        .iter()
-        .filter(|f| f.severity != Severity::Info)
-        .map(|f| f.machine_key.as_str())
-        .collect();
+    let flagged = flagged_keys(flags);
 
     Summary {
         machines: machines.len(),
@@ -1573,10 +1603,7 @@ fn summarise(
             .filter(|f| f.severity == Severity::Info)
             .count(),
         machines_flagged: flagged.len(),
-        stale: machines
-            .iter()
-            .filter(|m| m.age_days.is_some_and(|a| a > th.stale_days))
-            .count(),
+        stale: machines.iter().filter(|m| is_stale(m, th)).count(),
         partial: machines.iter().filter(|m| m.partial).count(),
         thermally_limited: machines
             .iter()
@@ -1624,6 +1651,13 @@ pub struct Filter {
     /// Only machines measured within this many days.
     pub max_age_days: Option<f64>,
     pub cohort: Option<String>,
+    /// Exact system model, CPU model and OS — what a group on the Groups view
+    /// drills into. Exact rather than a search, because "Latitude 7440"
+    /// must not also find the "Latitude 7440 2-in-1" next to it, and a group's
+    /// members are exactly the machines whose value equals the group's.
+    pub system_model: Option<String>,
+    pub cpu_model: Option<String>,
+    pub os: Option<String>,
     /// Case-insensitive substring of hostname, key, serial, asset tag, system
     /// model, CPU, power plan, power mode or any tag value.
     pub search: Option<String>,
@@ -1671,6 +1705,21 @@ impl Filter {
             return false;
         }
         if self.flag.is_some() && !flagged.contains(m.key.as_str()) {
+            return false;
+        }
+        if let Some(v) = &self.system_model
+            && m.system_model.as_ref() != Some(v)
+        {
+            return false;
+        }
+        if let Some(v) = &self.cpu_model
+            && &m.cpu_model != v
+        {
+            return false;
+        }
+        if let Some(v) = &self.os
+            && m.os.as_ref() != Some(v)
+        {
             return false;
         }
         for (k, v) in &self.tags {
@@ -1770,6 +1819,317 @@ impl Snapshot {
             cohorts,
             flags,
         }
+    }
+}
+
+/// What to group the machines in view by, for the Groups view and
+/// `report --by`.
+///
+/// Spelled the same everywhere it is accepted — `model`, `cpu`, `os` or
+/// `tag:<key>` — so a URL, a command line and the JSON that echoes it back all
+/// say the same thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupBy {
+    /// The value of one tag: a site, a department, a ring.
+    Tag(String),
+    /// The system model from the firmware — "Dell Inc. Latitude 7440".
+    Model,
+    Cpu,
+    Os,
+}
+
+impl std::str::FromStr for GroupBy {
+    type Err = String;
+
+    /// An unknown dimension is refused rather than answered with an empty
+    /// result: "no groups" would read as an answer about the fleet when it is
+    /// really a typo.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "model" => Ok(Self::Model),
+            "cpu" => Ok(Self::Cpu),
+            "os" => Ok(Self::Os),
+            other => match other.strip_prefix("tag:").map(str::trim) {
+                Some(key) if !key.is_empty() => Ok(Self::Tag(key.to_string())),
+                Some(_) => Err("tag: needs a key, as in tag:site".to_string()),
+                None => Err(format!(
+                    "{other:?} is not something machines can be grouped by. Use model, cpu, os, \
+                     or tag:<key> for one of the tags the deployment tool passed (tag:site)"
+                )),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for GroupBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tag(key) => write!(f, "tag:{key}"),
+            Self::Model => f.write_str("model"),
+            Self::Cpu => f.write_str("cpu"),
+            Self::Os => f.write_str("os"),
+        }
+    }
+}
+
+impl GroupBy {
+    /// The group a machine falls in, or `None` when it has no value for this
+    /// dimension. A blank value is no value: it would otherwise be a group
+    /// whose label is nothing at all.
+    fn value_of<'a>(&self, m: &'a MachineView) -> Option<&'a str> {
+        let v = match self {
+            Self::Tag(key) => m.tags.get(key).map(String::as_str),
+            Self::Model => m.system_model.as_deref(),
+            Self::Cpu => Some(m.cpu_model.as_str()),
+            Self::Os => m.os.as_deref(),
+        };
+        v.filter(|s| !s.trim().is_empty())
+    }
+
+    /// What to group by when nobody has said: the system model if anything in
+    /// view recorded one, since "which laptop model" is the usual first
+    /// question; otherwise the first tag, which is whatever the estate labels
+    /// itself by; otherwise the CPU, which every result carries.
+    pub fn default_for(snap: &Snapshot) -> Self {
+        if snap
+            .machines
+            .iter()
+            .any(|m| Self::Model.value_of(m).is_some())
+        {
+            return Self::Model;
+        }
+        match tag_keys(snap).into_iter().next() {
+            Some(key) => Self::Tag(key.to_string()),
+            None => Self::Cpu,
+        }
+    }
+}
+
+fn tag_keys(snap: &Snapshot) -> std::collections::BTreeSet<&str> {
+    snap.machines
+        .iter()
+        .flat_map(|m| m.tags.keys().map(String::as_str))
+        .collect()
+}
+
+/// Every dimension the machines in view can be grouped by: the three every
+/// result can carry, and one per tag key present. Worked out from the same
+/// projection the groups are, so a scoped viewer is never offered a tag key
+/// that only exists on machines they cannot see.
+pub fn dimensions(snap: &Snapshot) -> Vec<String> {
+    [GroupBy::Model, GroupBy::Cpu, GroupBy::Os]
+        .iter()
+        .map(GroupBy::to_string)
+        .chain(tag_keys(snap).into_iter().map(|k| format!("tag:{k}")))
+        .collect()
+}
+
+/// Findings per queue.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct QueueCounts {
+    pub machine: usize,
+    pub measurement: usize,
+    pub coverage: usize,
+}
+
+/// One finding's code and how many machines carry it.
+#[derive(Debug, Clone, Serialize)]
+pub struct FlagCount {
+    pub code: &'static str,
+    pub machines: usize,
+}
+
+/// The machines in view that share one value of a dimension.
+#[derive(Debug, Clone, Serialize)]
+pub struct Group {
+    /// `None` for the machines with no value at all — untagged, or no system
+    /// model recorded. Kept as a group rather than dropped, so the groups
+    /// always add up to the machines in view.
+    pub value: Option<String>,
+    pub machines: usize,
+    /// Same shape and order as `Summary::grades`.
+    pub grades: Vec<(String, usize)>,
+    pub median_score: Option<f64>,
+    pub p10_score: Option<f64>,
+    pub p90_score: Option<f64>,
+    /// The median, over members that have one, of each machine's difference
+    /// from its own cohort median — the group's headline. See `groups`.
+    pub median_cohort_delta_pct: Option<f64>,
+    /// How many members that median is drawn from.
+    pub with_cohort: usize,
+    /// True when `with_cohort` is below `min_cohort`: the same reason a cohort
+    /// that small is not compared against — with two machines, one bad one is
+    /// half the median.
+    pub thin: bool,
+    pub median_trend_pct: Option<f64>,
+    pub with_trend: usize,
+    /// Members with at least one critical or warning finding, by the same rule
+    /// as `Summary::machines_flagged`.
+    pub flagged: usize,
+    /// Members with at least one critical finding.
+    pub machines_critical: usize,
+    /// Findings, not machines.
+    pub critical: usize,
+    pub warnings: usize,
+    pub info: usize,
+    pub queues: QueueCounts,
+    /// The commonest critical and warning findings among the members, most
+    /// machines first and then by code, at most three.
+    pub top_flags: Vec<FlagCount>,
+    pub stale: usize,
+    /// Median of the members' upper-bound age today (`max_age_months_now`),
+    /// over the members whose CPU the launch table knows.
+    pub median_max_age_months: Option<f64>,
+    pub with_age: usize,
+}
+
+/// Group the machines in a snapshot by one dimension.
+///
+/// **The headline is the median cohort delta, not the median score.** Raw
+/// score by site mostly measures how old each site's hardware is: the site
+/// that got its refresh last year comes out on top whatever state its machines
+/// are in. Each machine's `cohort_delta_pct` already holds the hardware and the
+/// measurement configuration constant, so the median of those across a group
+/// asks the question that is left — whether machines *here* run slower than
+/// identical machines elsewhere. That points at something about the place:
+/// power policy, the image, dust, a bad batch. The score and the grade mix are
+/// reported beside it as description, because they are what people ask for
+/// first, and they are not the comparison.
+///
+/// Takes an already-projected snapshot, so it sees exactly what the caller's
+/// filter and authorization scope let through and needs no scope handling of
+/// its own. Cohort deltas come with the machines and were worked out against
+/// the whole index, so grouping a filtered view does not move them.
+pub fn groups(snap: &Snapshot, by: &GroupBy) -> Vec<Group> {
+    let th = &snap.thresholds;
+    let mut members: BTreeMap<Option<&str>, Vec<&MachineView>> = BTreeMap::new();
+    for m in &snap.machines {
+        members.entry(by.value_of(m)).or_default().push(m);
+    }
+    let mut flags_of: HashMap<&str, Vec<&Flag>> = HashMap::new();
+    for f in &snap.flags {
+        flags_of.entry(f.machine_key.as_str()).or_default().push(f);
+    }
+
+    let mut out: Vec<Group> = members
+        .into_iter()
+        .map(|(value, ms)| {
+            let flags: Vec<&Flag> = ms
+                .iter()
+                .flat_map(|m| flags_of.get(m.key.as_str()).into_iter().flatten().copied())
+                .collect();
+            let count = |sev: Severity| flags.iter().filter(|f| f.severity == sev).count();
+            let mut queues = QueueCounts::default();
+            for f in &flags {
+                *match f.kind {
+                    FlagKind::Machine => &mut queues.machine,
+                    FlagKind::Measurement => &mut queues.measurement,
+                    FlagKind::Coverage => &mut queues.coverage,
+                } += 1;
+            }
+
+            // Machines rather than findings, so one machine raising the same
+            // rule on three drives doesn't outvote three machines raising it
+            // once each.
+            let mut by_code: BTreeMap<&'static str, HashSet<&str>> = BTreeMap::new();
+            for f in flags.iter().filter(|f| f.severity != Severity::Info) {
+                by_code
+                    .entry(f.code)
+                    .or_default()
+                    .insert(f.machine_key.as_str());
+            }
+            let mut top_flags: Vec<FlagCount> = by_code
+                .into_iter()
+                .map(|(code, ms)| FlagCount {
+                    code,
+                    machines: ms.len(),
+                })
+                .collect();
+            top_flags.sort_by(|a, b| b.machines.cmp(&a.machines).then(a.code.cmp(b.code)));
+            top_flags.truncate(3);
+
+            let scores = sorted_of(ms.iter().filter_map(|m| m.score));
+            let deltas = sorted_of(ms.iter().filter_map(|m| m.cohort_delta_pct));
+            let trends = sorted_of(ms.iter().filter_map(|m| m.trend_pct));
+            let ages = sorted_of(
+                ms.iter()
+                    .filter_map(|m| m.max_age_months_now)
+                    .map(|a| a as f64),
+            );
+            let med = |v: &[f64]| (!v.is_empty()).then(|| median(v));
+
+            Group {
+                value: value.map(str::to_string),
+                machines: ms.len(),
+                grades: grade_histogram(ms.iter().copied()),
+                median_score: med(&scores),
+                p10_score: (!scores.is_empty()).then(|| quantile(&scores, 0.10)),
+                p90_score: (!scores.is_empty()).then(|| quantile(&scores, 0.90)),
+                median_cohort_delta_pct: med(&deltas),
+                with_cohort: deltas.len(),
+                thin: deltas.len() < th.min_cohort,
+                median_trend_pct: med(&trends),
+                with_trend: trends.len(),
+                flagged: flagged_keys(flags.iter().copied()).len(),
+                machines_critical: flags
+                    .iter()
+                    .filter(|f| f.severity == Severity::Critical)
+                    .map(|f| f.machine_key.as_str())
+                    .collect::<HashSet<_>>()
+                    .len(),
+                critical: count(Severity::Critical),
+                warnings: count(Severity::Warning),
+                info: count(Severity::Info),
+                queues,
+                top_flags,
+                stale: ms.iter().filter(|m| is_stale(m, th)).count(),
+                median_max_age_months: med(&ages),
+                with_age: ages.len(),
+            }
+        })
+        .collect();
+
+    // Worst first by the share flagged rather than the count, so a big group
+    // doesn't top the list for being big; compared as a cross-product so the
+    // order is exact rather than at the mercy of float rounding. The group of
+    // machines with no value goes last whatever its share: it is not a place,
+    // a model or an image, and putting it first would make "not recorded" the
+    // headline.
+    out.sort_by(|a, b| {
+        a.value
+            .is_none()
+            .cmp(&b.value.is_none())
+            .then_with(|| (b.flagged * a.machines).cmp(&(a.flagged * b.machines)))
+            .then_with(|| b.machines.cmp(&a.machines))
+            .then_with(|| a.value.cmp(&b.value))
+    });
+    out
+}
+
+/// The whole answer to "group by this", as `/api/groups` and
+/// `report --by --json` both send it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Grouping {
+    /// The dimension used — echoed back, and chosen by `GroupBy::default_for`
+    /// when the caller didn't name one.
+    pub by: String,
+    /// Everything the machines in view could have been grouped by, so a UI
+    /// can build its selector from the same projection as the groups.
+    pub dimensions: Vec<String>,
+    /// Machines in view. The groups' `machines` always add up to this.
+    pub machines: usize,
+    pub thresholds: Thresholds,
+    pub groups: Vec<Group>,
+}
+
+pub fn grouping(snap: &Snapshot, by: Option<GroupBy>) -> Grouping {
+    let by = by.unwrap_or_else(|| GroupBy::default_for(snap));
+    Grouping {
+        by: by.to_string(),
+        dimensions: dimensions(snap),
+        machines: snap.machines.len(),
+        thresholds: snap.thresholds.clone(),
+        groups: groups(snap, &by),
     }
 }
 
@@ -3469,5 +3829,547 @@ mod tests {
             d.subtests.iter().any(|t| !t.scored),
             "ungraded subtests are measurements too"
         );
+    }
+
+    /// The group labelled `value`, or a panic naming what there was instead.
+    fn group<'a>(gs: &'a [Group], value: Option<&str>) -> &'a Group {
+        gs.iter()
+            .find(|g| g.value.as_deref() == value)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no group {value:?} in {:?}",
+                    gs.iter().map(|g| &g.value).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    fn site_tag() -> GroupBy {
+        GroupBy::Tag("site".into())
+    }
+
+    /// A machine at a site, or untagged when `site` is `None`.
+    fn at(site: Option<&str>) -> impl FnOnce(&mut Value) + use<'_> {
+        move |d: &mut Value| {
+            d["tags"] = match site {
+                Some(s) => json!({ "site": s }),
+                None => json!({}),
+            };
+        }
+    }
+
+    /// Clocks fell during the run: a warning, and so a flagged machine.
+    fn hot(d: &mut Value) {
+        d["telemetry"] = json!({"source": "test", "sample_count": 9, "thermal_limited": true});
+    }
+
+    /// A Dell of the given model, as loadbearer 1.6.0 records its firmware.
+    fn dell(model: &str) -> impl FnOnce(&mut Value) + use<'_> {
+        move |d: &mut Value| {
+            d["machine"]["firmware"] = json!({
+                "system_vendor": "Dell Inc.", "system_model": model,
+                "bios_version": "1.2.0", "bios_date": "2025-01-01"
+            });
+        }
+    }
+
+    /// Every machine lands in exactly one group, the ones with no value
+    /// included — so the groups add up to the fleet in view and nothing goes
+    /// missing between the headline and the table.
+    #[test]
+    fn groups_add_up_to_the_machines_in_view_including_the_untagged() {
+        let mut e = Estate::new();
+        for i in 0..3 {
+            e.add_with(
+                &format!("GLA-{i}"),
+                1000.0,
+                "2026-09-01T10:00:00Z",
+                at(Some("glasgow")),
+            );
+        }
+        for i in 0..2 {
+            e.add_with(
+                &format!("EDI-{i}"),
+                1000.0,
+                "2026-09-01T10:00:00Z",
+                at(Some("edinburgh")),
+            );
+        }
+        e.add_with("LOOSE", 1000.0, "2026-09-01T10:00:00Z", at(None));
+
+        let s = e.snap();
+        let gs = groups(&s, &site_tag());
+        assert_eq!(gs.len(), 3);
+        assert_eq!(
+            gs.iter().map(|g| g.machines).sum::<usize>(),
+            s.summary.machines
+        );
+        assert_eq!(group(&gs, Some("glasgow")).machines, 3);
+        assert_eq!(group(&gs, Some("edinburgh")).machines, 2);
+        assert_eq!(
+            group(&gs, None).machines,
+            1,
+            "an untagged machine is a group of its own, not dropped"
+        );
+        for g in &gs {
+            assert_eq!(
+                g.grades.iter().map(|(_, n)| n).sum::<usize>(),
+                g.machines,
+                "a group's grade histogram covers every member"
+            );
+        }
+
+        // A key nobody carries is one honest group of everything, not an
+        // empty answer.
+        let nobody = groups(&s, &GroupBy::Tag("department".into()));
+        assert_eq!(nobody.len(), 1);
+        assert_eq!(nobody[0].value, None);
+        assert_eq!(nobody[0].machines, s.summary.machines);
+    }
+
+    #[test]
+    fn each_dimension_groups_by_its_own_field() {
+        let mut e = Estate::new();
+        e.add_with("A", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            dell("Latitude 7440")(d);
+            d["machine"]["os"] = json!("Windows 11 Enterprise");
+            d["tags"] = json!({ "site": "glasgow" });
+        });
+        e.add_with("B", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            dell("Latitude 7440")(d);
+            d["machine"]["os"] = json!("Windows 10 Pro");
+            d["machine"]["cpu_model"] = json!("Some Other CPU");
+            d["tags"] = json!({ "site": "edinburgh" });
+        });
+        e.add_with("C", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["machine"]["os"] = json!("Windows 11 Enterprise");
+            d["tags"] = json!({ "site": "glasgow" });
+        });
+        let s = e.snap();
+        let base_cpu = machine(&s, "A").cpu_model.clone();
+
+        let by_model = groups(&s, &GroupBy::Model);
+        assert_eq!(
+            group(&by_model, Some("Dell Inc. Latitude 7440")).machines,
+            2
+        );
+        assert_eq!(
+            group(&by_model, None).machines,
+            1,
+            "no firmware recorded is a group of its own"
+        );
+
+        let by_cpu = groups(&s, &GroupBy::Cpu);
+        assert_eq!(group(&by_cpu, Some(&base_cpu)).machines, 2);
+        assert_eq!(group(&by_cpu, Some("Some Other CPU")).machines, 1);
+
+        let by_os = groups(&s, &GroupBy::Os);
+        assert_eq!(group(&by_os, Some("Windows 11 Enterprise")).machines, 2);
+        assert_eq!(group(&by_os, Some("Windows 10 Pro")).machines, 1);
+
+        let by_site = groups(&s, &site_tag());
+        assert_eq!(group(&by_site, Some("glasgow")).machines, 2);
+        assert_eq!(group(&by_site, Some("edinburgh")).machines, 1);
+
+        assert_eq!(
+            dimensions(&s),
+            ["model", "cpu", "os", "tag:site"],
+            "the three every result can carry, then one per tag key in view"
+        );
+    }
+
+    /// The headline compares each member with identical machines, so a member
+    /// with no peer group has nothing to contribute to it — and the group says
+    /// how many members the median actually came from.
+    #[test]
+    fn the_headline_is_the_median_against_identical_machines_and_says_how_many() {
+        let mut e = Estate::new();
+        for i in 0..3 {
+            e.add_with(
+                &format!("EDI-{i}"),
+                1000.0,
+                "2026-09-01T10:00:00Z",
+                at(Some("edinburgh")),
+            );
+        }
+        e.add_with("GLA-0", 900.0, "2026-09-01T10:00:00Z", at(Some("glasgow")));
+        e.add_with("GLA-1", 950.0, "2026-09-01T10:00:00Z", at(Some("glasgow")));
+        // Alone on its hardware, so it has no cohort delta. Slow on purpose: if
+        // it leaked into the headline it would drag it down visibly.
+        e.add_with("GLA-ODD", 500.0, "2026-09-01T10:00:00Z", |d| {
+            d["machine"]["cpu_model"] = json!("Some Other CPU");
+            d["tags"] = json!({ "site": "glasgow" });
+        });
+
+        let s = e.snap();
+        assert!(machine(&s, "GLA-ODD").cohort_delta_pct.is_none());
+        let gs = groups(&s, &site_tag());
+        let gla = group(&gs, Some("glasgow"));
+        assert_eq!(gla.machines, 3);
+        assert_eq!(
+            gla.with_cohort, 2,
+            "GLA-ODD has no peers to be compared with"
+        );
+        let delta = gla.median_cohort_delta_pct.expect("two members have peers");
+        assert!(
+            (delta - -7.5).abs() < 1e-9,
+            "median of -10% and -5%, got {delta}"
+        );
+        // The score, by contrast, is every member's: description, not the
+        // comparison.
+        assert_eq!(gla.median_score, Some(900.0));
+
+        let edi = group(&gs, Some("edinburgh"));
+        assert_eq!(edi.with_cohort, 3);
+        assert_eq!(edi.median_cohort_delta_pct, Some(0.0));
+
+        // Nobody with peers at all: no median, rather than a NaN.
+        let mut e = Estate::new();
+        e.add("LONE", 1000.0, "2026-09-01T10:00:00Z");
+        let gs = groups(&e.snap(), &GroupBy::Cpu);
+        assert_eq!(gs[0].with_cohort, 0);
+        assert_eq!(gs[0].median_cohort_delta_pct, None);
+        assert!(gs[0].thin);
+    }
+
+    /// Thin for the same reason a cohort that small is not compared against:
+    /// with three machines, one bad one is a third of the median.
+    #[test]
+    fn a_group_is_thin_below_min_cohort_members_with_peers() {
+        let n = Thresholds::default().min_cohort;
+        let mut e = Estate::new();
+        for i in 0..n {
+            e.add_with(
+                &format!("A-{i}"),
+                1000.0,
+                "2026-09-01T10:00:00Z",
+                at(Some("alpha")),
+            );
+        }
+        for i in 0..n - 1 {
+            e.add_with(
+                &format!("B-{i}"),
+                1000.0,
+                "2026-09-01T10:00:00Z",
+                at(Some("bravo")),
+            );
+        }
+        let gs = groups(&e.snap(), &site_tag());
+        let alpha = group(&gs, Some("alpha"));
+        assert_eq!(alpha.with_cohort, n);
+        assert!(!alpha.thin, "exactly min_cohort is enough");
+        let bravo = group(&gs, Some("bravo"));
+        assert_eq!(bravo.with_cohort, n - 1);
+        assert!(bravo.thin, "one fewer is not");
+        assert!(
+            bravo.median_cohort_delta_pct.is_some(),
+            "thin is a caveat on the figure, not a reason to withhold it"
+        );
+    }
+
+    /// The same rule as the overview's headline, so the groups' flagged counts
+    /// add up to it exactly.
+    #[test]
+    fn flagged_groups_add_up_to_the_headline() {
+        let mut e = Estate::new();
+        e.add_with(
+            "GLA-OK",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            at(Some("glasgow")),
+        );
+        e.add_with("GLA-HOT", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            at(Some("glasgow"))(d);
+            hot(d);
+        });
+        // Several findings on one machine still make one flagged machine.
+        e.add_with("EDI-SICK", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            at(Some("edinburgh"))(d);
+            hot(d);
+            d["gates"] = json!({"on_ac": false});
+        });
+        e.add_with("LOOSE-HOT", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            at(None)(d);
+            hot(d);
+        });
+
+        let s = e.snap();
+        assert_eq!(s.summary.machines_flagged, 3);
+        let gs = groups(&s, &site_tag());
+        assert_eq!(
+            gs.iter().map(|g| g.flagged).sum::<usize>(),
+            s.summary.machines_flagged
+        );
+        let edi = group(&gs, Some("edinburgh"));
+        assert_eq!(edi.flagged, 1, "one machine, two findings");
+        assert!(edi.warnings >= 2, "findings are counted as findings");
+        assert_eq!(
+            edi.queues.measurement, edi.warnings,
+            "both are about the measurement"
+        );
+        assert_eq!(
+            gs.iter().map(|g| g.critical).sum::<usize>(),
+            s.summary.critical
+        );
+        assert_eq!(
+            gs.iter().map(|g| g.warnings).sum::<usize>(),
+            s.summary.warnings
+        );
+    }
+
+    #[test]
+    fn top_findings_are_the_commonest_by_machines_then_by_code() {
+        let mut e = Estate::new();
+        // Three of the four are stale, an informational finding. If those
+        // counted, `stale` would lead the list; they don't, so it isn't there.
+        e.add_with("M1", 1000.0, "2026-01-01T10:00:00Z", |d| {
+            hot(d);
+            d["gates"] = json!({"on_ac": false});
+        });
+        e.add_with("M2", 1000.0, "2026-01-01T10:00:00Z", hot);
+        e.add_with("M3", 1000.0, "2026-01-01T10:00:00Z", |d| {
+            d["machine"]["battery"] = json!({
+                "charge_pct": 90.0, "state": "charging", "health_pct": 61.0, "cycle_count": 812
+            });
+        });
+        e.add_with("M4", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["machine"]["power"] = json!({
+                "source": "mains", "plan": "Balanced",
+                "plugged_in": {"power_mode": "best power efficiency"},
+                "held_back": ["Best power efficiency mode"]
+            });
+        });
+
+        let s = e.snap();
+        assert_eq!(flags_for(&s, "stale").len(), 3, "{:?}", codes(&s));
+        let gs = groups(&s, &GroupBy::Cpu);
+        assert_eq!(gs.len(), 1);
+        let top: Vec<(&str, usize)> = gs[0]
+            .top_flags
+            .iter()
+            .map(|f| (f.code, f.machines))
+            .collect();
+        // Two machines first; then three tied at one, by code, and the third
+        // of those (`power_limited`) past the cut.
+        assert_eq!(
+            top,
+            [
+                ("thermal_limited", 2),
+                ("battery_worn", 1),
+                ("on_battery", 1)
+            ],
+            "{:?}",
+            codes(&s)
+        );
+    }
+
+    #[test]
+    fn groups_are_ordered_by_share_flagged_with_no_value_last() {
+        let mut e = Estate::new();
+        let mut add = |host: &str, site: Option<&'static str>, flagged: bool| {
+            e.add_with(host, 1000.0, "2026-09-01T10:00:00Z", move |d| {
+                at(site)(d);
+                if flagged {
+                    hot(d);
+                }
+            });
+        };
+        add("A-1", Some("alpha"), true);
+        add("A-2", Some("alpha"), false);
+        add("B-1", Some("bravo"), true);
+        for i in 0..3 {
+            add(&format!("C-{i}"), Some("charlie"), false);
+        }
+        add("E-1", Some("echo"), false);
+        add("D-1", Some("delta"), false);
+        // Every one of these flagged, and still last: "not recorded" is not
+        // the headline.
+        add("LOOSE", None, true);
+
+        let gs = groups(&e.snap(), &site_tag());
+        let order: Vec<Option<&str>> = gs.iter().map(|g| g.value.as_deref()).collect();
+        assert_eq!(
+            order,
+            [
+                Some("bravo"),   // 1 of 1
+                Some("alpha"),   // 1 of 2
+                Some("charlie"), // 0 of 3: more machines first at the same share
+                Some("delta"),   // 0 of 1, and then by name
+                Some("echo"),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_dimension_is_refused_and_a_known_one_round_trips() {
+        for good in ["model", "cpu", "os", "tag:site", "tag:cost centre"] {
+            let by: GroupBy = good.parse().expect(good);
+            assert_eq!(by.to_string(), good);
+        }
+        assert_eq!(" os ".parse::<GroupBy>(), Ok(GroupBy::Os));
+        for bad in ["", "site", "Model", "tag:", "tag:  ", "hostname"] {
+            let err = bad.parse::<GroupBy>().expect_err(bad);
+            assert!(
+                err.contains("tag:"),
+                "{bad:?} should say what is accepted: {err}"
+            );
+        }
+    }
+
+    /// Grouping is over the projection it is handed, so the viewer's filter
+    /// and scope narrow the groups exactly as they narrow everything else —
+    /// while each machine's standing against its peers is the fleet-wide one.
+    #[test]
+    fn grouping_a_filtered_view_sees_only_the_filtered_machines() {
+        let mut e = Estate::new();
+        for i in 0..3 {
+            e.add_with(&format!("GLA-{i}"), 950.0, "2026-09-01T10:00:00Z", |d| {
+                at(Some("glasgow"))(d);
+                dell("Latitude 7440")(d);
+            });
+        }
+        for i in 0..3 {
+            e.add_with(&format!("EDI-{i}"), 1000.0, "2026-09-01T10:00:00Z", |d| {
+                at(Some("edinburgh"))(d);
+                dell("Latitude 5440")(d);
+            });
+        }
+        let all = e.snap();
+        let fleet = groups(&all, &GroupBy::Model);
+        let th = Thresholds::default();
+        let glasgow = BTreeMap::from([("site".to_string(), "glasgow".to_string())]);
+
+        for (why, filter) in [
+            (
+                "a filter",
+                Filter {
+                    tags: glasgow.clone(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "a scope",
+                Filter {
+                    scopes: vec![glasgow.clone()],
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let view = all.filtered(&filter, &th);
+            let gs = groups(&view, &GroupBy::Model);
+            assert_eq!(gs.len(), 1, "{why}: only Glasgow's model is in view");
+            assert_eq!(gs[0].value.as_deref(), Some("Dell Inc. Latitude 7440"));
+            assert_eq!(gs[0].machines, view.summary.machines);
+            assert_eq!(
+                gs[0].median_cohort_delta_pct,
+                group(&fleet, Some("Dell Inc. Latitude 7440")).median_cohort_delta_pct,
+                "{why}: the same machines stand where they did against their peers"
+            );
+            assert_eq!(
+                dimensions(&view),
+                ["model", "cpu", "os", "tag:site"],
+                "{why}"
+            );
+        }
+    }
+
+    /// What a group drills into: exact, so one model does not also find the
+    /// model whose name starts the same way, and ANDed like everything else.
+    #[test]
+    fn a_filter_can_select_an_exact_model_cpu_and_os() {
+        let mut e = Estate::new();
+        e.add_with("PLAIN", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            dell("Latitude 7440")(d);
+            d["machine"]["os"] = json!("Windows 11 Enterprise");
+        });
+        e.add_with("CONVERTIBLE", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            dell("Latitude 7440 2-in-1")(d);
+            d["machine"]["os"] = json!("Windows 11 Pro");
+            d["machine"]["cpu_model"] = json!("Some Other CPU");
+        });
+        let all = e.snap();
+        let th = Thresholds::default();
+        let hosts = |f: Filter| -> Vec<String> {
+            all.filtered(&f, &th)
+                .machines
+                .iter()
+                .filter_map(|m| m.hostname.clone())
+                .collect()
+        };
+
+        assert_eq!(
+            hosts(Filter {
+                search: Some("Latitude 7440".into()),
+                ..Default::default()
+            })
+            .len(),
+            2,
+            "search is a substring, which is why it is the wrong tool here"
+        );
+        assert_eq!(
+            hosts(Filter {
+                system_model: Some("Dell Inc. Latitude 7440".into()),
+                ..Default::default()
+            }),
+            ["PLAIN"]
+        );
+        assert_eq!(
+            hosts(Filter {
+                cpu_model: Some("Some Other CPU".into()),
+                ..Default::default()
+            }),
+            ["CONVERTIBLE"]
+        );
+        assert_eq!(
+            hosts(Filter {
+                os: Some("Windows 11 Enterprise".into()),
+                ..Default::default()
+            }),
+            ["PLAIN"]
+        );
+        assert!(
+            hosts(Filter {
+                system_model: Some("Dell Inc. Latitude 7440".into()),
+                os: Some("Windows 11 Pro".into()),
+                ..Default::default()
+            })
+            .is_empty(),
+            "two fields are both required"
+        );
+        assert!(
+            hosts(Filter {
+                os: Some("windows 11 enterprise".into()),
+                ..Default::default()
+            })
+            .is_empty(),
+            "exact means exact"
+        );
+    }
+
+    #[test]
+    fn the_default_dimension_is_the_model_then_the_first_tag_then_the_cpu() {
+        let mut e = Estate::new();
+        e.add_with("UNTAGGED", 1000.0, "2026-09-01T10:00:00Z", at(None));
+        assert_eq!(GroupBy::default_for(&e.snap()), GroupBy::Cpu);
+
+        e.add_with("TAGGED", 1000.0, "2026-09-01T10:00:00Z", |d| {
+            d["tags"] = json!({ "site": "glasgow", "ring": "canary" });
+        });
+        assert_eq!(
+            GroupBy::default_for(&e.snap()),
+            GroupBy::Tag("ring".into()),
+            "the first key, so the choice is stable"
+        );
+
+        e.add_with(
+            "MODELLED",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            dell("Latitude 7440"),
+        );
+        let s = e.snap();
+        assert_eq!(GroupBy::default_for(&s), GroupBy::Model);
+        assert_eq!(grouping(&s, None).by, "model");
+        assert_eq!(grouping(&s, Some(GroupBy::Os)).by, "os");
     }
 }

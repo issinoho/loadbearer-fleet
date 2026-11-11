@@ -29,6 +29,7 @@
   <nav class="tabs" id="tabs" aria-label="Views">
     <button type="button" class="tab" data-view="overview" aria-current="page">Overview</button>
     <button type="button" class="tab" data-view="cohorts">Cohorts</button>
+    <button type="button" class="tab" data-view="groups">Groups</button>
     <button type="button" class="tab" data-view="machines">Machines</button>
     <button type="button" class="tab" data-view="compare">Compare</button>
   </nav>
@@ -77,6 +78,9 @@
   </label>
 
   <span id="f-tags" class="tag-filters"></span>
+  <!-- A model, CPU or OS drilled into from the Groups view. Exact values with
+       no list to pick from, so each is shown as itself with a way out. -->
+  <span id="f-exact" class="tag-filters"></span>
 
   <label class="field">
     <span class="field-label">Finding</span>

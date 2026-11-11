@@ -328,6 +328,11 @@ struct FilterParams {
     cohort: Option<String>,
     q: Option<String>,
     flag: Option<String>,
+    /// Exact system model, CPU model and OS — a group drilled into from the
+    /// Groups view.
+    model: Option<String>,
+    cpu: Option<String>,
+    os: Option<String>,
 }
 
 impl FilterParams {
@@ -347,6 +352,9 @@ impl FilterParams {
             tags,
             max_age_days: self.since_days,
             cohort: self.cohort.filter(|s| !s.is_empty()),
+            system_model: self.model.filter(|s| !s.is_empty()),
+            cpu_model: self.cpu.filter(|s| !s.is_empty()),
+            os: self.os.filter(|s| !s.is_empty()),
             search: self.q.filter(|s| !s.trim().is_empty()),
             flag: self.flag.filter(|s| !s.is_empty()),
             scopes: Vec::new(),
@@ -367,6 +375,40 @@ async fn get_snapshot(
     Query(params): Query<FilterParams>,
 ) -> Json<Snapshot> {
     Json(visible(&state, &caller, params))
+}
+
+/// The one parameter `/api/groups` takes beyond the filter.
+#[derive(Debug, Deserialize, Default)]
+struct GroupParams {
+    /// `model`, `cpu`, `os` or `tag:<key>`; absent for the default.
+    by: Option<String>,
+}
+
+/// The machines in view, grouped.
+///
+/// Projected through `visible` like every other read, so the caller's filter
+/// and scope have already been applied to the snapshot before anything is
+/// grouped: a scoped viewer's groups are made of their machines only, and the
+/// list of dimensions offered is built from those machines too. Two `Query`
+/// extractors rather than one flattened struct, because serde's `flatten`
+/// hands a query string's values over as strings and `since_days` would then
+/// refuse to be a number.
+async fn get_groups(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Query(group): Query<GroupParams>,
+    Query(params): Query<FilterParams>,
+) -> Result<Json<analytics::Grouping>, AppError> {
+    // Judged before the fleet is looked at: the answer depends only on the
+    // request, so refusing it gives nothing away.
+    let by = group
+        .by
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.parse::<analytics::GroupBy>())
+        .transpose()
+        .map_err(AppError::bad_request)?;
+    let snap = visible(&state, &caller, params);
+    Ok(Json(analytics::grouping(&snap, by)))
 }
 
 /// Everything the drilldown needs for one machine, in one round trip.
@@ -749,6 +791,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/signed-out", get(auth::signed_out))
         .route("/api/me", get(auth::me))
         .route("/api/snapshot", get(get_snapshot))
+        .route("/api/groups", get(get_groups))
         .route("/api/machine/{key}", get(get_machine))
         .route("/api/compare", get(get_compare))
         .route("/api/rescan", post(post_rescan))
@@ -2180,6 +2223,103 @@ mod tests {
         assert_eq!(
             snap["cohorts"].as_array().expect("array").len(),
             unscoped["cohorts"].as_array().expect("array").len()
+        );
+    }
+
+    /// Groups are made from the caller's own view, so a scoped viewer's groups
+    /// are made of their machines only — including the list of what else they
+    /// could group by, which must not name a tag key that only exists outside
+    /// their scope.
+    #[tokio::test]
+    async fn a_scoped_viewer_groups_only_their_own_machines() {
+        let state = state_for(&oidc_config());
+        let admin = session(&state, Role::Admin, &[]);
+        let glasgow = session(&state, Role::Viewer, &[&[("site", "glasgow")]]);
+
+        let all = get(&state, "/api/groups?by=tag:site", Some(&admin)).await;
+        assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+        let all = all.json();
+        assert_eq!(all["by"], "tag:site");
+        assert_eq!(all["machines"], 4);
+        let sites: Vec<&serde_json::Value> = all["groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .map(|g| &g["value"])
+            .collect();
+        assert!(
+            sites.contains(&&serde_json::json!("edinburgh")),
+            "{sites:?}"
+        );
+
+        let mine = get(&state, "/api/groups?by=tag:site", Some(&glasgow))
+            .await
+            .json();
+        assert_eq!(mine["machines"], 1);
+        let groups = mine["groups"].as_array().expect("groups");
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0]["value"], "glasgow");
+        assert_eq!(groups[0]["machines"], 1);
+        // Only keys a Glasgow machine carries, derived from the same view.
+        let snap = get(&state, "/api/snapshot", Some(&glasgow)).await.json();
+        for d in mine["dimensions"].as_array().expect("dimensions") {
+            let d = d.as_str().expect("string");
+            if let Some(key) = d.strip_prefix("tag:") {
+                assert!(
+                    snap["machines"][0]["tags"].get(key).is_some(),
+                    "{d} is offered but no machine in view carries it"
+                );
+            }
+        }
+
+        // The filter applies as it does everywhere, and cannot widen the scope.
+        let elsewhere = get(
+            &state,
+            "/api/groups?by=tag:site&tags=site%3Dedinburgh",
+            Some(&glasgow),
+        )
+        .await
+        .json();
+        assert_eq!(elsewhere["machines"], 0);
+        assert_eq!(elsewhere["groups"].as_array().expect("groups").len(), 0);
+
+        // And the admin's filter narrows theirs, numbers included — the
+        // filter and `by` arrive on one query string and both must parse.
+        let narrowed = get(
+            &state,
+            "/api/groups?by=os&tags=site%3Dedinburgh&since_days=36500",
+            Some(&admin),
+        )
+        .await;
+        assert_eq!(narrowed.status, StatusCode::OK, "{}", narrowed.body);
+        assert_eq!(narrowed.json()["machines"], 2);
+    }
+
+    /// A dimension that cannot mean anything is the caller's mistake, and an
+    /// empty list of groups would read as an answer about the fleet.
+    #[tokio::test]
+    async fn an_unknown_grouping_is_a_bad_request_and_none_is_the_default() {
+        let state = state_for(&oidc_config());
+        let cookie = session(&state, Role::Viewer, &[]);
+        for uri in ["/api/groups?by=hostname", "/api/groups?by=tag:"] {
+            let r = get(&state, uri, Some(&cookie)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.body);
+            assert!(r.body.contains("tag:"), "{uri} said: {}", r.body);
+        }
+        let default = get(&state, "/api/groups", Some(&cookie)).await;
+        assert_eq!(default.status, StatusCode::OK);
+        let default = default.json();
+        assert!(
+            default["dimensions"]
+                .as_array()
+                .expect("dimensions")
+                .contains(&default["by"]),
+            "the default is one of the dimensions offered: {default}"
+        );
+        assert_eq!(
+            get(&state, "/api/groups", None).await.status,
+            StatusCode::UNAUTHORIZED,
+            "and it needs a session like every other read"
         );
     }
 

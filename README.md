@@ -181,10 +181,10 @@ empty dashboard, and results appear as they land.
 
 Whatever your deployment tool passes as `--tag key=value` is indexed, and the
 dashboard works it out from the data rather than from configuration: each key
-becomes a **filter** in the row above the views and a **sortable column** in the
-machine table, and any tag *value* is matched by the Search box. So
-`--tag site=glasgow --tag ring=canary` needs nothing here to become two filters
-and two columns. Tags are deliberately **not** part of a machine's peer group —
+becomes a **filter** in the row above the views, a **sortable column** in the
+machine table and a choice on the **Groups** tab, and any tag *value* is matched
+by the Search box. So `--tag site=glasgow --tag ring=canary` needs nothing here
+to become two filters, two columns and two ways to group the estate. Tags are deliberately **not** part of a machine's peer group —
 relabelling an estate never changes a cohort.
 
 **Owners are the tempting case, and worth a thought first.** `--tag
@@ -423,6 +423,7 @@ loadbearer-fleet status                            # what's in the index
 loadbearer-fleet report                            # summary, cohorts and red flags
 loadbearer-fleet report --all                      # include informational flags
 loadbearer-fleet report --json                     # the whole snapshot, as the UI sees it
+loadbearer-fleet report --by tag:site              # per site: worst share needing attention first
 loadbearer-fleet serve \\fileserver\loadbearer     # the dashboard, on http://127.0.0.1:8787
 loadbearer-fleet init-config > fleet.toml          # a starter config, placeholders included
 loadbearer-fleet serve --config fleet.toml         # with single sign-on
@@ -472,7 +473,7 @@ resets when they're reimaged" is something an estate owner should know.
 - [x] Drive health, nearly full disks and out-of-date firmware, from what
       loadbearer 1.6.0 already records — see [Drives, free space and
       firmware](#drives-free-space-and-firmware)
-- [x] Web UI: executive summary, cohort explorer, machine table, machine drilldown
+- [x] Web UI: executive summary, cohort explorer, groups, machine table, machine drilldown
       with history — see [The dashboard](#the-dashboard)
 - [x] Entra ID / OIDC SSO with PKCE, roles from group claims, tag-scoped
       authorization — see [Sign-in](#sign-in)
@@ -647,17 +648,43 @@ documents.
 loadbearer-fleet serve \\fileserver\loadbearer
 ```
 
-Scans the folder, then serves four views on `127.0.0.1:8787`: an executive
+Scans the folder, then serves five views on `127.0.0.1:8787`: an executive
 **overview** (how many machines need attention, grade distribution, findings by
 queue, score spread, and the ranked list of what to look at), a **cohort
-explorer** (each machine against the median of the machines like it), a sortable
-**machine table**, and a **drilldown** per machine with its score history, its
+explorer** (each machine against the median of the machines like it), **groups**
+(the estate by site, system model, CPU, OS or any tag), a sortable **machine
+table**, and a **drilldown** per machine with its score history, its
 components, its findings in full, its drives, and every subtest of its latest
 run.
 
+### Which site is in the worst shape
+
+The tempting answer is the median score per site, and it mostly measures how
+old each site's hardware is: the site refreshed last year wins whatever state
+its machines are in. So the **Groups** tab compares groups by the median of
+their members' standing *against identical machines* — each machine against the
+cohort median of the same CPU measured the same way, worked out across the
+whole index. A site whose machines run 12% below the same hardware elsewhere is
+pointing at something about the site — power policy, the image, dust, a bad
+batch — rather than at its purchase dates. Score and grade mix are shown beside
+it, as description.
+
+A group drawn from fewer than four machines with a peer group is marked
+**thin** and left out of that chart, with a note saying how many and why — the
+same reason a cohort that small is not compared against. The other charts show
+the *share* of each group needing attention and its grade mix, so a big group
+does not look worst for being big. Machines with no value — untagged, or no
+system model recorded — are a group of their own, so the groups always add up
+to the machines in view, and the filter row applies as it does everywhere
+else. Clicking a group opens the machine table filtered to it.
+
+`report --by <dimension>` prints the same thing at a prompt — `model`, `cpu`,
+`os`, or `tag:<key>` — and `--json` gives the document the dashboard draws.
+
 `POST /api/rescan` — the Rescan button — re-reads the folder. `GET /api/snapshot`
 returns exactly what the dashboard draws, so any view can be scripted or
-diffed; `GET /api/machine/{key}` is the drilldown payload. Every endpoint, the
+diffed; `GET /api/groups?by=<dimension>` is the Groups tab, taking the same
+filter parameters, and `GET /api/machine/{key}` is the drilldown payload. Every endpoint, the
 filter parameters they share with the dashboard, and how authorization is
 applied are in
 [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API).
