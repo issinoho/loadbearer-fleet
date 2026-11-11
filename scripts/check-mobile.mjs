@@ -27,7 +27,9 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import {
+  copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -54,7 +56,11 @@ const SIZES = [
 // `drilled` is the machine table as a group on the Groups view leaves it:
 // filtered to one exact CPU, which puts that whole CPU string in the filter
 // row — the longest thing that row ever has to hold.
-const VIEWS = ['overview', 'cohorts', 'groups', 'machines', 'drilled', 'machine', 'compare'];
+//
+// `overview-quarter` is the overview comparing with thirteen weeks back, which
+// for the fixtures is before anything was measured — the "no baseline" state
+// of "What changed", where the plain overview has its lists.
+const VIEWS = ['overview', 'overview-quarter', 'cohorts', 'groups', 'machines', 'drilled', 'machine', 'compare'];
 
 // A control smaller than this is a control you miss. 40px is the floor here
 // rather than Apple's 44 because the theme toggle is square and 44 looks
@@ -205,10 +211,34 @@ if (!chrome) bail('no Chrome or Edge found (set CHROME=/path/to/chrome). Skippin
 
 const work = mkdtempSync(join(tmpdir(), 'lbf-mobile-'));
 const port = 8790 + (process.pid % 40);
-// The fixtures directory is the collection folder: ingest only ever reads it,
-// and the index it derives goes to a temporary file.
+
+// The collection folder is the fixtures, copied, plus two results dated the
+// last couple of days: a later run of one fixture machine, now throttling, and
+// a machine new to the fleet with a hostname long enough to test a phone. The
+// fixtures alone were measured within a day of each other, so "What changed"
+// would only ever say nothing did — and the lists are the layout to check.
+const collection = join(work, 'collection');
+mkdirSync(collection);
+for (const f of readdirSync(join(root, 'tests/fixtures'))) {
+  copyFileSync(join(root, 'tests/fixtures', f), join(collection, f));
+}
+{
+  const recent = (days) => new Date(Date.now() - days * 86400000).toISOString();
+  const doc = JSON.parse(readFileSync(join(root, 'tests/fixtures/win-modern.json'), 'utf8'));
+  doc.timestamp = recent(2);
+  doc.telemetry = { source: 'check', sample_count: 9, thermal_limited: true };
+  writeFileSync(join(collection, 'later-run.json'), JSON.stringify(doc));
+  const arrived = JSON.parse(readFileSync(join(root, 'tests/fixtures/low-end.json'), 'utf8'));
+  arrived.timestamp = recent(1);
+  arrived.machine.hostname = 'WORKSTATION-WITH-A-VERY-LONG-HOSTNAME-07';
+  arrived.machine.identity = { serial: 'SN-CHECK-ARRIVED', smbios_uuid: 'u-check-arrived', machine_id: 'm-check-arrived' };
+  writeFileSync(join(collection, 'arrived.json'), JSON.stringify(arrived));
+}
+
+// Ingest only ever reads the collection folder, and the index it derives goes
+// to a temporary file.
 const server = spawn(binary, [
-  'serve', join(root, 'tests/fixtures'),
+  'serve', collection,
   '--index', join(work, 'index.db'),
   '--bind', `127.0.0.1:${port}`,
 ], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -276,6 +306,7 @@ try {
       // layout worth checking — the table is.
       if (view === 'compare') hash = `compare/${compareRuns.join(',')}`;
       if (view === 'drilled') hash = `machines?cpu=${encodeURIComponent(longestCpu)}`;
+      if (view === 'overview-quarter') hash = 'overview?changes=13';
       const where = `${size.name}/${view}`;
       // A fresh navigation rather than a hash change, so each measurement is of
       // a page that laid itself out at this size from the start.
@@ -353,6 +384,32 @@ try {
 
       notes.push(`${where}: ${m.documentWidth}px wide, topbar ${m.topbarHeight}px, `
         + `${m.controls.length} control(s), ${m.selfScrolls.length} scroller(s)`);
+
+      // The overview's history cards fill in after the rest, from their own
+      // requests: that they arrived, and arrived as content rather than as a
+      // placeholder or an error, is part of the view rendering.
+      if (view.startsWith('overview')) {
+        const probe = await cdp.send('Runtime.evaluate', {
+          expression: `(() => {
+            const text = (sel) => document.querySelector(sel)?.innerText || '';
+            const t = document.querySelector('[data-card="over-time"]');
+            return JSON.stringify({
+              changes: text('[data-card="changes"]'), overTime: text('[data-card="over-time"]'),
+              charts: t ? t.querySelectorAll('svg').length : 0,
+            });
+          })()`,
+          returnByValue: true,
+        });
+        const cards = JSON.parse(probe.result.value);
+        check(where, cards.changes.includes('What changed') && !cards.changes.includes('Loading'),
+          `"What changed" did not render: ${JSON.stringify(cards.changes.slice(0, 120))}`);
+        if (view === 'overview') {
+          check(where, cards.changes.includes('Machines added') && cards.changes.includes('New findings'),
+            'the week\'s changes — a machine added, a new finding — are not listed');
+        }
+        check(where, cards.overTime.includes('Over time') && cards.charts === 3,
+          `the over-time section has ${cards.charts} chart(s), not 3`);
+      }
     }
   }
 } finally {

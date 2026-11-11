@@ -122,6 +122,54 @@ fn report_by_writes_the_groups_to_stdout() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `report --changes` prints a summary, and with `--json` the same document
+/// `/api/changes` sends. A window that is not one of the three is refused, on
+/// stderr, rather than answered with a comparison against a date nobody asked
+/// for.
+#[test]
+fn report_changes_writes_the_changes_to_stdout() {
+    let dir = scratch("report-changes");
+    let index = dir.join("i.db");
+    let index = index.to_str().expect("path");
+    stdout_of(&["--index", index, "scan", fixtures().to_str().expect("path")]);
+
+    let json = stdout_of(&["--index", index, "report", "--changes", "4", "--json"]);
+    let c: serde_json::Value = serde_json::from_str(&json).unwrap_or_else(|e| {
+        panic!(
+            "stdout did not parse as JSON ({e}). The first 200 bytes were:\n{}",
+            &json[..json.len().min(200)]
+        )
+    });
+    assert_eq!(c["window_weeks"], 4);
+    assert!(c["counts"].is_object(), "parsed, but these are not changes");
+    assert!(c["new_findings"].is_array());
+    assert!(!json.contains('\u{1b}'), "stdout carried ANSI escape codes");
+
+    // No number means a week.
+    let text = stdout_of(&["--index", index, "report", "--changes"]);
+    assert!(
+        text.starts_with("Changes over 1 week:"),
+        "stdout should open with the summary's own heading, got:\n{}",
+        &text[..text.len().min(200)]
+    );
+    assert!(text.contains("judged by today's rules"), "{text}");
+    assert!(!text.contains('\u{1b}'), "stdout carried ANSI escape codes");
+
+    let refused = Command::new(EXE)
+        .args(["--index", index, "report", "--changes", "2"])
+        .output()
+        .expect("run the binary");
+    assert!(!refused.status.success(), "an unknown window must fail");
+    assert!(refused.stdout.is_empty(), "and print nothing to stdout");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("1, 4 or 13"),
+        "the refusal says what is accepted: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The same property with a log file configured, which the test above cannot
 /// see: without one there is nothing to announce.
 ///

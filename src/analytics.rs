@@ -54,6 +54,20 @@
 //! and what they compare is each member's standing in its own cohort, never the
 //! raw score — otherwise "which site is in the worst shape" is answered by
 //! "whichever had its refresh longest ago".
+//!
+//! ## Over time
+//!
+//! Everything above describes the fleet *now*. `timeline` reconstructs it as it
+//! was at earlier dates from the runs the index already holds, through the same
+//! rules — see its module notes for why it is reconstructed rather than
+//! recorded, and what that costs.
+
+mod timeline;
+
+pub use timeline::{
+    BySeverity, CHANGE_WINDOWS, Changes, FindingChange, TIMELINE_WEEKS, Timeline, TimelineView,
+    parse_weeks, parse_window,
+};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -533,6 +547,10 @@ struct RunRow {
     id: i64,
     machine_key: String,
     taken_at: String,
+    /// `taken_at` as an instant, for placing the run in time. `None` when it
+    /// does not parse — and then it can't be shown to precede anything, so a
+    /// reconstruction of the past leaves it out. See the module notes.
+    at: Option<OffsetDateTime>,
     score: Option<f64>,
     cmp: Comparability,
 }
@@ -583,8 +601,21 @@ fn mad(sorted: &[f64], med: f64) -> f64 {
     median(&devs)
 }
 
+/// A run's timestamp as an instant: the one parser for "when was this
+/// measured", so staleness and the reconstruction of the past can never
+/// disagree about whether a timestamp is readable.
+///
+/// Parsed rather than compared as text. loadbearer writes UTC with a `Z` and
+/// as many fractional digits as the clock gave — none, seven, nine — and
+/// `"…:25Z"` sorts *after* `"…:25.5Z"` as a string, because `.` is below `Z`.
+/// A document that arrived another way may carry an offset, and
+/// `"…T10:00:00+05:00"` sorts five hours away from where it belongs.
+fn instant(taken_at: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(taken_at, &Rfc3339).ok()
+}
+
 fn age_days(taken_at: &str, now: OffsetDateTime) -> Option<f64> {
-    let then = OffsetDateTime::parse(taken_at, &Rfc3339).ok()?;
+    let then = instant(taken_at)?;
     Some((now - then).as_seconds_f64() / 86_400.0)
 }
 
@@ -653,11 +684,103 @@ fn cohort_id(cpu_model: &str, cmp: &Comparability) -> String {
 /// Compute the whole fleet view from the index.
 ///
 /// `now` is a parameter rather than read from the clock so the staleness rules
-/// are testable without waiting, and so a report can be regenerated as of a
-/// past date.
+/// are testable without waiting.
+///
+/// Every run the index holds is in scope, however it is dated — including one
+/// stamped in the future by a machine whose clock is wrong. A reconstruction
+/// of the past (`reconstruct`) only admits runs at or before its cutoff; the
+/// view of *now* deliberately does not, because a machine that vanished from
+/// the dashboard for having a bad clock would be a worse answer than one shown
+/// with a date that looks odd.
 pub fn snapshot(conn: &Connection, th: &Thresholds, now: OffsetDateTime) -> Result<Snapshot> {
     let history = load_history(conn)?;
-    let mut machines = load_latest(conn, &history, now)?;
+    let own = by_machine(&history);
+    let mut machines = load_runs(conn, &Pick::Latest)?;
+    for m in &mut machines {
+        let runs: Vec<&RunRow> = own
+            .get(m.key.as_str())
+            .map(|rs| rs.iter().collect())
+            .unwrap_or_default();
+        place(m, &runs, now);
+    }
+    assess(machines, th, now)
+}
+
+/// The fleet as it was known at each of `cutoffs`, oldest first, handed to
+/// `each` one at a time so only one reconstruction is ever held at once.
+///
+/// For each machine, its latest run taken at or before the cutoff, judged with
+/// the cutoff as "now" and with only runs at or before it as its history — the
+/// same `place` and `assess` the live snapshot goes through, so the past is
+/// judged by exactly today's rules. A machine with no run by then is absent.
+///
+/// "Latest" here is chronological — the parsed instant, then the row id — not
+/// the stored text the live snapshot orders by; see `instant` for why the two
+/// can differ. On what loadbearer itself writes they agree.
+///
+/// The wide rows are loaded per cutoff but only for runs not already loaded
+/// for the previous one: from one week to the next most machines are standing
+/// on the same run, so the whole walk reads each run about once and holds at
+/// most two cutoffs' worth.
+fn reconstruct(
+    conn: &Connection,
+    th: &Thresholds,
+    cutoffs: &[OffsetDateTime],
+    mut each: impl FnMut(OffsetDateTime, Snapshot) -> Result<()>,
+) -> Result<()> {
+    let history = load_history(conn)?;
+    let own = by_machine(&history);
+    let mut loaded: HashMap<i64, MachineView> = HashMap::new();
+
+    for &cutoff in cutoffs {
+        // Per machine, the runs known by the cutoff and the one standing for
+        // it. Machines in key order, which is the order `load_runs` returns
+        // them in and the order everything downstream expects.
+        let known: Vec<(Vec<&RunRow>, i64)> = own
+            .values()
+            .filter_map(|runs| {
+                let by_then: Vec<&RunRow> = runs
+                    .iter()
+                    .filter(|r| r.at.is_some_and(|at| at <= cutoff))
+                    .collect();
+                let pick = by_then.iter().max_by_key(|r| (r.at, r.id))?.id;
+                Some((by_then, pick))
+            })
+            .collect();
+
+        let missing: Vec<i64> = known
+            .iter()
+            .map(|(_, id)| *id)
+            .filter(|id| !loaded.contains_key(id))
+            .collect();
+        if !missing.is_empty() {
+            for m in load_runs(conn, &Pick::Runs(&missing))? {
+                loaded.insert(m.run_id, m);
+            }
+        }
+
+        let mut machines = Vec::with_capacity(known.len());
+        for (runs, id) in &known {
+            let mut m = loaded.get(id).expect("loaded above").clone();
+            place(&mut m, runs, cutoff);
+            machines.push(m);
+        }
+        let standing: HashSet<i64> = known.iter().map(|(_, id)| *id).collect();
+        loaded.retain(|id, _| standing.contains(id));
+
+        each(cutoff, assess(machines, th, cutoff)?)?;
+    }
+    Ok(())
+}
+
+/// Cohorts, deltas, findings and the summary, over machines already placed in
+/// time. The half of a snapshot that is pure rules: everything here sees only
+/// what it is handed, which is what lets a reconstruction of the past share it.
+fn assess(
+    mut machines: Vec<MachineView>,
+    th: &Thresholds,
+    now: OffsetDateTime,
+) -> Result<Snapshot> {
     let cohorts = build_cohorts(&machines, th);
 
     let by_id: HashMap<&str, &Cohort> = cohorts.iter().map(|c| (c.id.as_str(), c)).collect();
@@ -686,17 +809,19 @@ pub fn snapshot(conn: &Connection, th: &Thresholds, now: OffsetDateTime) -> Resu
 }
 
 /// Every run, slim, for run counts and per-machine trend. The wide columns are
-/// only fetched for the latest run of each machine.
+/// only fetched for the run standing for each machine.
 fn load_history(conn: &Connection) -> Result<Vec<RunRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, machine_key, taken_at, overall_score, preset, profile, baseline, build_isa
            FROM run ORDER BY machine_key, taken_at, id",
     )?;
     let rows = stmt.query_map([], |r| {
+        let taken_at: String = r.get(2)?;
         Ok(RunRow {
             id: r.get(0)?,
             machine_key: r.get(1)?,
-            taken_at: r.get(2)?,
+            at: instant(&taken_at),
+            taken_at,
             score: r.get(3)?,
             cmp: Comparability {
                 preset: r.get(4)?,
@@ -709,25 +834,63 @@ fn load_history(conn: &Connection) -> Result<Vec<RunRow>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// The latest run per machine, with everything the views need.
-///
-/// "Latest" breaks ties on row id as well as timestamp, so two files written in
-/// the same instant resolve the same way every time rather than making the
-/// dashboard flicker between them.
-fn load_latest(
-    conn: &Connection,
-    history: &[RunRow],
-    now: OffsetDateTime,
-) -> Result<Vec<MachineView>> {
-    const LATEST: &str = "SELECT id FROM (SELECT id, ROW_NUMBER() OVER \
-         (PARTITION BY machine_key ORDER BY taken_at DESC, id DESC) rn FROM run) WHERE rn = 1";
+/// A machine's runs, in the order `load_history` returns them — `taken_at` as
+/// stored, then id. Keyed in machine-key order, which is the order `load_runs`
+/// returns machines in.
+fn by_machine(history: &[RunRow]) -> BTreeMap<&str, &[RunRow]> {
+    history
+        .chunk_by(|a, b| a.machine_key == b.machine_key)
+        .map(|runs| (runs[0].machine_key.as_str(), runs))
+        .collect()
+}
+
+/// Which run stands for each machine.
+enum Pick<'a> {
+    /// The newest per machine by `taken_at` as stored, ties broken on row id
+    /// so two files written in the same instant resolve the same way every
+    /// time rather than making the dashboard flicker between them. What the
+    /// live snapshot has always shown.
+    Latest,
+    /// Exactly these runs, chosen by the caller — a reconstruction of the past.
+    Runs(&'a [i64]),
+}
+
+impl Pick<'_> {
+    /// A subquery yielding the chosen run ids as `id`, and what it binds.
+    ///
+    /// The ids go in as one JSON array rather than as a placeholder each: a
+    /// fleet of thousands would pass SQLite's limit on bound parameters, and
+    /// `json_each` keeps the statement the same text whatever the count.
+    fn sql(&self) -> (&'static str, Vec<String>) {
+        const LATEST: &str = "SELECT id FROM (SELECT id, ROW_NUMBER() OVER \
+             (PARTITION BY machine_key ORDER BY taken_at DESC, id DESC) rn FROM run) WHERE rn = 1";
+        match self {
+            Pick::Latest => (LATEST, Vec::new()),
+            Pick::Runs(ids) => (
+                "SELECT value AS id FROM json_each(?1)",
+                vec![format!(
+                    "[{}]",
+                    ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+                )],
+            ),
+        }
+    }
+}
+
+/// The chosen run per machine, with everything the views need that belongs to
+/// the run itself. What depends on *when* it is being looked at from — age,
+/// run count, trend — is left for `place`, so one loaded run can stand for its
+/// machine at several points in time.
+fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
+    let (chosen, args) = pick.sql();
+    let bind = || rusqlite::params_from_iter(args.iter());
 
     let mut tags: HashMap<i64, BTreeMap<String, String>> = HashMap::new();
     {
         let mut stmt = conn.prepare(&format!(
-            "SELECT t.run_id, t.key, t.value FROM tag t JOIN ({LATEST}) l ON l.id = t.run_id"
+            "SELECT t.run_id, t.key, t.value FROM tag t JOIN ({chosen}) l ON l.id = t.run_id"
         ))?;
-        for row in stmt.query_map([], |r| {
+        for row in stmt.query_map(bind(), |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -743,9 +906,9 @@ fn load_latest(
     {
         let mut stmt = conn.prepare(&format!(
             "SELECT c.run_id, c.id, c.score, c.grade, c.graded FROM component c \
-             JOIN ({LATEST}) l ON l.id = c.run_id ORDER BY c.id"
+             JOIN ({chosen}) l ON l.id = c.run_id ORDER BY c.id"
         ))?;
-        for row in stmt.query_map([], |r| {
+        for row in stmt.query_map(bind(), |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 ComponentView {
@@ -765,9 +928,9 @@ fn load_latest(
     {
         let mut stmt = conn.prepare(&format!(
             "SELECT d.run_id, {DRIVE_COLUMNS} FROM drive d \
-             JOIN ({LATEST}) l ON l.id = d.run_id ORDER BY d.run_id, d.position"
+             JOIN ({chosen}) l ON l.id = d.run_id ORDER BY d.run_id, d.position"
         ))?;
-        for row in stmt.query_map([], |r| {
+        for row in stmt.query_map(bind(), |r| {
             Ok((r.get::<_, i64>(0)?, DriveView::from_row(r, 1)?))
         })? {
             let (id, d) = row?;
@@ -782,22 +945,13 @@ fn load_latest(
     let mut low_conf: HashMap<i64, i64> = HashMap::new();
     {
         let mut stmt = conn.prepare(&format!(
-            "SELECT s.run_id, COUNT(*) FROM subtest s JOIN ({LATEST}) l ON l.id = s.run_id \
+            "SELECT s.run_id, COUNT(*) FROM subtest s JOIN ({chosen}) l ON l.id = s.run_id \
              WHERE s.confidence = 'low' AND s.component = 'cpu' GROUP BY s.run_id"
         ))?;
-        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+        for row in stmt.query_map(bind(), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
             let (id, n) = row?;
             low_conf.insert(id, n);
         }
-    }
-
-    // Run count and first sighting per machine, from the slim history.
-    let mut counts: HashMap<&str, (usize, &str)> = HashMap::new();
-    for r in history {
-        counts
-            .entry(r.machine_key.as_str())
-            .and_modify(|e| e.0 += 1)
-            .or_insert((1, r.taken_at.as_str()));
     }
 
     let mut stmt = conn.prepare(&format!(
@@ -810,11 +964,11 @@ fn load_latest(
                 drive_hours_undercounted, power_plan, power_mode, power_held_back,
                 bios_version, bios_date, disk_low_mount, disk_low_free_pct,
                 disk_low_free_bytes
-           FROM run WHERE id IN ({LATEST}) ORDER BY machine_key"
+           FROM run WHERE id IN ({chosen}) ORDER BY machine_key"
     ))?;
 
     let mut out = Vec::new();
-    for row in stmt.query_map([], |r| {
+    for row in stmt.query_map(bind(), |r| {
         let run_id: i64 = r.get(0)?;
         let key: String = r.get(1)?;
         let taken_at: String = r.get(4)?;
@@ -825,7 +979,6 @@ fn load_latest(
             build_isa: r.get(9)?,
         };
         let caveats: String = r.get(24)?;
-        let seen = counts.get(key.as_str()).copied();
         let cpu_model: String = r.get(12)?;
         let (cpu_launched, cpu_family, age_source) =
             resolve_launch(r.get(28)?, r.get(27)?, &cpu_model);
@@ -834,18 +987,19 @@ fn load_latest(
         let max_age_months: Option<i64> = match age_source {
             Some(AgeSource::Derived) => cpu_launched
                 .as_deref()
-                .and_then(|l| months_since(l, OffsetDateTime::parse(&taken_at, &Rfc3339).ok()?)),
+                .and_then(|l| months_since(l, instant(&taken_at)?)),
             _ => r.get(29)?,
         };
         Ok(MachineView {
-            max_age_months_now: cpu_launched.as_deref().and_then(|l| months_since(l, now)),
+            // Set by `place`, against whichever "now" this run is seen from.
+            max_age_months_now: None,
+            age_days: None,
+            runs: 1,
+            first_seen: taken_at.clone(),
             max_age_months,
             age_source,
             cpu_family,
             cohort: cohort_id(&r.get::<_, String>(12)?, &cmp),
-            age_days: age_days(&taken_at, now),
-            runs: seen.map_or(1, |s| s.0),
-            first_seen: seen.map_or_else(|| taken_at.clone(), |s| s.1.to_string()),
             key,
             key_kind: r.get(2)?,
             hostname: r.get(3)?,
@@ -904,11 +1058,22 @@ fn load_latest(
     })? {
         out.push(row?);
     }
-
-    for m in &mut out {
-        m.trend_pct = trend(history, m);
-    }
     Ok(out)
+}
+
+/// Put a loaded run in time: its age as of `now`, and its run count, first
+/// sighting and trend from `runs` — the machine's runs known by then, in
+/// `load_history`'s order. The live snapshot passes every run the machine has;
+/// a reconstruction passes only those at or before its cutoff, which is what
+/// keeps a later run from leaking into the past as part of a trend.
+fn place(m: &mut MachineView, runs: &[&RunRow], now: OffsetDateTime) {
+    m.age_days = age_days(&m.taken_at, now);
+    m.max_age_months_now = m.cpu_launched.as_deref().and_then(|l| months_since(l, now));
+    if let Some(first) = runs.first() {
+        m.runs = runs.len();
+        m.first_seen = first.taken_at.clone();
+    }
+    m.trend_pct = trend(runs, m);
 }
 
 /// A machine against its own past.
@@ -917,11 +1082,10 @@ fn load_latest(
 /// preset has not regressed, it has been measured differently. The reference is
 /// the median of the priors rather than the best of them, because one unusually
 /// good run would otherwise make every later run look like a regression.
-fn trend(history: &[RunRow], m: &MachineView) -> Option<f64> {
+fn trend(runs: &[&RunRow], m: &MachineView) -> Option<f64> {
     let score = m.score?;
     let priors = sorted_of(
-        history
-            .iter()
+        runs.iter()
             .filter(|r| r.machine_key == m.key && r.id != m.run_id && r.cmp == m.comparability)
             .filter_map(|r| r.score),
     );
@@ -1521,14 +1685,12 @@ fn evaluate(
 /// Grade histogram, best first, with any grade this build doesn't recognise
 /// last. Shared by the summary and by each group, so a group's histogram is
 /// the summary's restricted to its members and the two always add up.
-fn grade_histogram<'a>(
-    machines: impl IntoIterator<Item = &'a MachineView>,
-) -> Vec<(String, usize)> {
+fn grade_histogram<'a>(grades: impl IntoIterator<Item = &'a str>) -> Vec<(String, usize)> {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     let mut unrecognised = 0usize;
-    for m in machines {
-        match grade_rank(&m.grade) {
-            Some(_) => *counts.entry(m.grade.as_str()).or_default() += 1,
+    for g in grades {
+        match grade_rank(g) {
+            Some(_) => *counts.entry(g).or_default() += 1,
             None => unrecognised += 1,
         }
     }
@@ -1552,9 +1714,16 @@ fn grade_histogram<'a>(
 fn flagged_keys<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> HashSet<&'a str> {
     flags
         .into_iter()
-        .filter(|f| f.severity != Severity::Info)
+        .filter(|f| needs_attention(f.severity))
         .map(|f| f.machine_key.as_str())
         .collect()
+}
+
+/// Whether a finding of this severity makes its machine one that needs
+/// attention. The rule behind `flagged_keys`, on its own so the timeline —
+/// which keeps findings without the `Flag` around them — applies the same one.
+fn needs_attention(s: Severity) -> bool {
+    s != Severity::Info
 }
 
 /// Whether a machine's latest result is history rather than inventory.
@@ -1572,7 +1741,7 @@ fn summarise(
     th: &Thresholds,
 ) -> Summary {
     let scores = sorted_of(machines.iter().filter_map(|m| m.score));
-    let grades = grade_histogram(machines);
+    let grades = grade_histogram(machines.iter().map(|m| m.grade.as_str()));
 
     let mut configs: BTreeMap<String, usize> = BTreeMap::new();
     for m in machines {
@@ -1932,6 +2101,16 @@ pub struct QueueCounts {
     pub coverage: usize,
 }
 
+impl QueueCounts {
+    fn add(&mut self, kind: FlagKind) {
+        *match kind {
+            FlagKind::Machine => &mut self.machine,
+            FlagKind::Measurement => &mut self.measurement,
+            FlagKind::Coverage => &mut self.coverage,
+        } += 1;
+    }
+}
+
 /// One finding's code and how many machines carry it.
 #[derive(Debug, Clone, Serialize)]
 pub struct FlagCount {
@@ -2021,18 +2200,14 @@ pub fn groups(snap: &Snapshot, by: &GroupBy) -> Vec<Group> {
             let count = |sev: Severity| flags.iter().filter(|f| f.severity == sev).count();
             let mut queues = QueueCounts::default();
             for f in &flags {
-                *match f.kind {
-                    FlagKind::Machine => &mut queues.machine,
-                    FlagKind::Measurement => &mut queues.measurement,
-                    FlagKind::Coverage => &mut queues.coverage,
-                } += 1;
+                queues.add(f.kind);
             }
 
             // Machines rather than findings, so one machine raising the same
             // rule on three drives doesn't outvote three machines raising it
             // once each.
             let mut by_code: BTreeMap<&'static str, HashSet<&str>> = BTreeMap::new();
-            for f in flags.iter().filter(|f| f.severity != Severity::Info) {
+            for f in flags.iter().filter(|f| needs_attention(f.severity)) {
                 by_code
                     .entry(f.code)
                     .or_default()
@@ -2061,7 +2236,7 @@ pub fn groups(snap: &Snapshot, by: &GroupBy) -> Vec<Group> {
             Group {
                 value: value.map(str::to_string),
                 machines: ms.len(),
-                grades: grade_histogram(ms.iter().copied()),
+                grades: grade_histogram(ms.iter().map(|m| m.grade.as_str())),
                 median_score: med(&scores),
                 p10_score: (!scores.is_empty()).then(|| quantile(&scores, 0.10)),
                 p90_score: (!scores.is_empty()).then(|| quantile(&scores, 0.90)),
@@ -2334,6 +2509,26 @@ mod tests {
 
         fn snap_at(&self, at: OffsetDateTime) -> Snapshot {
             snapshot(self.idx.conn(), &Thresholds::default(), at).unwrap()
+        }
+
+        /// The fleet as it was known at `at`: only runs taken by then, judged
+        /// with `at` as now. What the timeline holds for each of its weeks.
+        fn snap_as_of(&self, at: OffsetDateTime) -> Snapshot {
+            let mut out = None;
+            reconstruct(self.idx.conn(), &Thresholds::default(), &[at], |_, s| {
+                out = Some(s);
+                Ok(())
+            })
+            .unwrap();
+            out.expect("one cutoff, one snapshot")
+        }
+
+        /// The timeline as the server builds it, `weeks` back from `now()`.
+        fn timeline(&self, weeks: usize) -> (Snapshot, Timeline) {
+            let th = Thresholds::default();
+            let snap = snapshot(self.idx.conn(), &th, now()).unwrap();
+            let t = Timeline::build(self.idx.conn(), &th, &snap, now(), weeks).unwrap();
+            (snap, t)
         }
     }
 
@@ -4371,5 +4566,650 @@ mod tests {
         assert_eq!(GroupBy::default_for(&s), GroupBy::Model);
         assert_eq!(grouping(&s, None).by, "model");
         assert_eq!(grouping(&s, Some(GroupBy::Os)).by, "os");
+    }
+
+    // --- The fleet over time ---------------------------------------------
+
+    /// The heart of the reconstruction: as of a date between two runs, the
+    /// machine stands on the earlier one, and its trend is drawn only from the
+    /// runs before *that* — the later run must not leak into the past.
+    #[test]
+    fn as_of_a_date_a_machine_stands_on_the_run_it_had_by_then() {
+        let mut e = Estate::new();
+        e.add("PC-1", 1000.0, "2026-06-01T10:00:00Z");
+        e.add("PC-1", 900.0, "2026-07-01T10:00:00Z");
+        e.add("PC-1", 600.0, "2026-08-01T10:00:00Z");
+
+        let then = e.snap_as_of(datetime!(2026-07-15 00:00:00 UTC));
+        let m = machine(&then, "PC-1");
+        assert_eq!(m.taken_at, "2026-07-01T10:00:00Z");
+        assert_eq!(m.runs, 2, "the third run had not been taken");
+        assert_eq!(then.summary.runs, 2);
+        assert_eq!(m.first_seen, "2026-06-01T10:00:00Z");
+        assert!(
+            (m.trend_pct.unwrap() + 10.0).abs() < 1e-9,
+            "900 against the one earlier run, 1000: {:?}",
+            m.trend_pct
+        );
+        assert_eq!(then.generated_at, "2026-07-15T00:00:00Z");
+        assert!(
+            flags_for(&then, "regressed").is_empty(),
+            "-10% is within the regression threshold, and the -33% to come has not happened"
+        );
+
+        // Today, the same machine is the third run, trended against both.
+        let now = e.snap();
+        let m = machine(&now, "PC-1");
+        assert_eq!(m.taken_at, "2026-08-01T10:00:00Z");
+        assert!((m.trend_pct.unwrap() - (600.0 / 950.0 - 1.0) * 100.0).abs() < 1e-9);
+        assert_eq!(flags_for(&now, "regressed").len(), 1);
+    }
+
+    #[test]
+    fn a_machine_first_measured_after_the_date_is_absent_from_it() {
+        let mut e = Estate::new();
+        e.add("OLD", 1000.0, "2026-06-01T10:00:00Z");
+        e.add("NEW", 1000.0, "2026-08-01T10:00:00Z");
+
+        let then = e.snap_as_of(datetime!(2026-07-01 00:00:00 UTC));
+        assert_eq!(then.summary.machines, 1);
+        assert_eq!(then.machines[0].hostname.as_deref(), Some("OLD"));
+        assert!(
+            then.flags
+                .iter()
+                .all(|f| f.hostname.as_deref() == Some("OLD"))
+        );
+
+        let before_anything = e.snap_as_of(datetime!(2026-01-01 00:00:00 UTC));
+        assert_eq!(before_anything.summary.machines, 0);
+        assert!(before_anything.flags.is_empty());
+    }
+
+    /// Stale means "not measured for a while" *as of the date being looked
+    /// at*. Judged against today instead, every past week of the timeline would
+    /// be as stale as the machine is now.
+    #[test]
+    fn staleness_in_the_past_is_judged_against_that_date() {
+        let mut e = Estate::new();
+        e.add("PC-1", 1000.0, "2026-01-01T10:00:00Z");
+
+        let fresh = e.snap_as_of(datetime!(2026-02-01 10:00:00 UTC));
+        assert!(flags_for(&fresh, "stale").is_empty());
+        assert!((machine(&fresh, "PC-1").age_days.unwrap() - 31.0).abs() < 1e-9);
+
+        let later = e.snap_as_of(datetime!(2026-06-01 10:00:00 UTC));
+        let stale = flags_for(&later, "stale");
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].headline, "Last measured 151 days ago");
+        assert_eq!(later.summary.stale, 1);
+    }
+
+    /// The live view admits every run however it is dated, as it always has —
+    /// a machine with a clock set in the future stays on the dashboard. Only a
+    /// reconstruction applies a cutoff, and at "now" that leaves the
+    /// future-dated run out.
+    #[test]
+    fn the_live_snapshot_keeps_a_run_dated_in_the_future() {
+        let mut e = Estate::new();
+        e.add("PC-1", 1000.0, "2026-09-01T10:00:00Z");
+        e.add("SKEWED", 1000.0, "2027-03-01T10:00:00Z");
+
+        let live = e.snap();
+        assert_eq!(live.summary.machines, 2);
+        let reconstructed = e.snap_as_of(now());
+        assert_eq!(reconstructed.summary.machines, 1);
+    }
+
+    /// What loadbearer writes, what the fixtures carry, and what RFC 3339
+    /// otherwise permits, all through the one parser.
+    #[test]
+    fn run_timestamps_parse_in_every_form_the_index_holds() {
+        let at = |s: &str| instant(s).map(|t| t.unix_timestamp_nanos());
+        let whole = at("2026-09-09T13:50:25Z").unwrap();
+        assert_eq!(
+            at("2026-09-09T13:50:25.7775272Z"),
+            Some(whole + 777_527_200)
+        );
+        assert_eq!(
+            at("2026-09-09T16:59:48.365852386Z").map(|n| n % 1_000_000_000),
+            Some(365_852_386)
+        );
+        assert_eq!(at("2026-09-09T13:50:25.0000000Z"), Some(whole));
+        assert_eq!(at("2026-09-09T13:50:25+00:00"), Some(whole));
+        assert_eq!(at("2026-09-09T14:50:25+01:00"), Some(whole));
+        assert_eq!(
+            at("2026-09-09t13:50:25z"),
+            Some(whole),
+            "RFC 3339 allows lower case"
+        );
+        assert_eq!(at("2026-09-09"), None);
+        assert_eq!(at("yesterday"), None);
+    }
+
+    /// The reason the cutoff compares instants rather than text. As strings,
+    /// `"…:00Z"` sorts after `"…:00.5Z"` — `.` is below `Z` — and an offset
+    /// sorts by its local time, hours from where it belongs.
+    #[test]
+    fn the_cutoff_compares_instants_not_text() {
+        let mut e = Estate::new();
+        // Half a second apart; as text the later one sorts first.
+        e.add("SUBSEC", 1000.0, "2026-09-01T10:00:00Z");
+        e.add("SUBSEC", 900.0, "2026-09-01T10:00:00.5Z");
+        let a = e.snap_as_of(datetime!(2026-09-01 10:00:00.25 UTC));
+        assert_eq!(machine(&a, "SUBSEC").taken_at, "2026-09-01T10:00:00Z");
+        assert_eq!(machine(&a, "SUBSEC").runs, 1);
+        let b = e.snap_as_of(datetime!(2026-09-01 10:00:01 UTC));
+        assert_eq!(
+            machine(&b, "SUBSEC").taken_at,
+            "2026-09-01T10:00:00.5Z",
+            "the chronologically later run, though it sorts first as text"
+        );
+
+        // 12:00 at +05:00 is 07:00 UTC, so it was measured by 08:00 UTC
+        // although "…T12" sorts after "…T08".
+        e.add("OFFSET", 1000.0, "2026-09-01T12:00:00+05:00");
+        let c = e.snap_as_of(datetime!(2026-09-01 08:00:00 UTC));
+        assert!(
+            c.machines
+                .iter()
+                .any(|m| m.hostname.as_deref() == Some("OFFSET"))
+        );
+        let d = e.snap_as_of(datetime!(2026-09-01 06:00:00 UTC));
+        assert!(
+            d.machines
+                .iter()
+                .all(|m| m.hostname.as_deref() != Some("OFFSET"))
+        );
+    }
+
+    /// A timestamp nobody can read can't be shown to precede anything, so the
+    /// past leaves it out — while the live view keeps the machine, as it
+    /// always has, with its age unreadable.
+    #[test]
+    fn a_run_with_an_unreadable_timestamp_is_only_ever_current() {
+        let mut e = Estate::new();
+        e.add("READABLE", 1000.0, "2026-09-01T10:00:00Z");
+        e.add("GARBLED", 1000.0, "last tuesday");
+
+        let live = e.snap();
+        assert_eq!(live.summary.machines, 2);
+        assert!(machine(&live, "GARBLED").age_days.is_none());
+
+        let past = e.snap_as_of(datetime!(2026-09-05 00:00:00 UTC));
+        assert_eq!(past.summary.machines, 1);
+        let (_, t) = e.timeline(4);
+        let view = t.view(&live, 4);
+        let last = view.points.last().unwrap();
+        assert_eq!(last.machines, 2, "now is the live snapshot");
+        assert_eq!(view.points[view.points.len() - 2].machines, 1);
+    }
+
+    #[test]
+    fn timeline_points_are_a_week_apart_and_start_with_the_first_run() {
+        let mut e = Estate::new();
+        // First seen 20 days before now(): three weeks back holds nothing.
+        e.add("PC-1", 1000.0, "2026-08-20T10:00:00Z");
+        e.add("PC-2", 1000.0, "2026-09-05T10:00:00Z");
+
+        let (snap, t) = e.timeline(TIMELINE_WEEKS);
+        let dates = t.dates();
+        assert_eq!(dates.len(), TIMELINE_WEEKS + 1, "every week is held");
+        assert_eq!(*dates.last().unwrap(), now());
+        assert!(
+            dates
+                .windows(2)
+                .all(|w| w[1] - w[0] == time::Duration::weeks(1))
+        );
+
+        let view = t.view(&snap, TIMELINE_WEEKS);
+        let at: Vec<&str> = view.points.iter().map(|p| p.at.as_str()).collect();
+        assert_eq!(
+            at,
+            ["2026-08-26", "2026-09-02", "2026-09-09"],
+            "the weeks before anything was measured are not sent as zeros"
+        );
+        let machines: Vec<usize> = view.points.iter().map(|p| p.machines).collect();
+        assert_eq!(machines, [1, 1, 2]);
+
+        // Fewer weeks asked for, fewer sent.
+        assert_eq!(t.view(&snap, 1).points.len(), 2);
+    }
+
+    /// The newest point is the live snapshot, so it must say exactly what the
+    /// overview's headline says — through the same definitions.
+    #[test]
+    fn the_newest_point_agrees_with_the_summary() {
+        let mut e = Estate::new();
+        for i in 0..5 {
+            e.add(&format!("PC-{i}"), 1000.0, "2026-09-01T10:00:00Z");
+        }
+        e.add("SLOW", 650.0, "2026-09-01T10:00:00Z");
+        e.add_with("HOT", 1000.0, "2026-09-01T10:00:00Z", hot);
+        e.add("OLD", 450.0, "2026-03-01T10:00:00Z");
+        e.add_with(
+            "FULL",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            with_disks(json!([volume("C:\\", 100, 2.0)])),
+        );
+
+        let (snap, t) = e.timeline(4);
+        let p = t.view(&snap, 4).points.pop().unwrap();
+        let s = &snap.summary;
+        assert_eq!(p.at, "2026-09-09");
+        assert_eq!(p.machines, s.machines);
+        assert_eq!(p.grades, s.grades);
+        assert_eq!(p.median_score, s.median_score);
+        assert_eq!(p.machines_flagged, s.machines_flagged);
+        assert_eq!(
+            (p.critical, p.warnings, p.info),
+            (s.critical, s.warnings, s.info)
+        );
+        assert_eq!(p.stale, s.stale);
+        assert!(p.stale > 0 && p.critical > 0, "the estate exercises both");
+        let critical: HashSet<&str> = snap
+            .flags
+            .iter()
+            .filter(|f| f.severity == Severity::Critical)
+            .map(|f| f.machine_key.as_str())
+            .collect();
+        assert_eq!(p.machines_critical, critical.len());
+        let grouped = groups(&snap, &GroupBy::Cpu);
+        assert_eq!(grouped.len(), 1, "one CPU, one group");
+        assert_eq!(p.machines_critical, grouped[0].machines_critical);
+        assert_eq!(p.queues.machine, grouped[0].queues.machine);
+        assert_eq!(p.queues.coverage, grouped[0].queues.coverage);
+    }
+
+    /// Each past point is the reconstruction at its date, slimmed: the
+    /// figures the timeline sends must be the ones a full snapshot of that
+    /// date would have summarised to.
+    #[test]
+    fn a_past_point_agrees_with_a_reconstruction_of_its_date() {
+        let mut e = Estate::new();
+        for i in 0..5 {
+            e.add(&format!("PC-{i}"), 1000.0, "2026-08-01T10:00:00Z");
+            e.add(&format!("PC-{i}"), 1010.0, "2026-09-05T10:00:00Z");
+        }
+        e.add("SLOW", 690.0, "2026-08-25T10:00:00Z");
+        e.add_with("HOT", 1000.0, "2026-08-28T10:00:00Z", hot);
+        e.add("GONE-QUIET", 450.0, "2026-04-01T10:00:00Z");
+
+        let (snap, t) = e.timeline(4);
+        let points = t.view(&snap, 4).points;
+        assert_eq!(points.len(), 5);
+        for (k, p) in points.iter().rev().enumerate().skip(1) {
+            let past = e.snap_as_of(now() - time::Duration::weeks(k as i64));
+            let s = &past.summary;
+            assert_eq!(p.machines, s.machines, "{k} week(s) back");
+            assert_eq!(p.grades, s.grades, "{k}");
+            assert_eq!(p.median_score, s.median_score, "{k}");
+            assert_eq!(p.machines_flagged, s.machines_flagged, "{k}");
+            assert_eq!(
+                (p.critical, p.warnings, p.info),
+                (s.critical, s.warnings, s.info),
+                "{k}"
+            );
+            assert_eq!(p.stale, s.stale, "{k}");
+        }
+        // And they differ from week to week, or this proved nothing.
+        assert_ne!(points[0].machines, points[4].machines);
+        assert_ne!(points[0].machines_flagged, points[4].machines_flagged);
+    }
+
+    /// Projected onto the caller's view: a filtered or scoped viewer's past is
+    /// made of their machines, and a machine judged by its current tags brings
+    /// its history with it.
+    #[test]
+    fn the_timeline_is_projected_onto_the_view() {
+        let mut e = Estate::new();
+        e.add_with("GLA-1", 1000.0, "2026-08-01T10:00:00Z", at(Some("glasgow")));
+        e.add_with(
+            "EDI-1",
+            1000.0,
+            "2026-08-01T10:00:00Z",
+            at(Some("edinburgh")),
+        );
+        // Moved from Edinburgh to Glasgow last week.
+        e.add_with(
+            "MOVER",
+            1000.0,
+            "2026-08-01T10:00:00Z",
+            at(Some("edinburgh")),
+        );
+        e.add_with("MOVER", 1000.0, "2026-09-05T10:00:00Z", |d| {
+            at(Some("glasgow"))(d);
+            hot(d);
+        });
+        // In Glasgow, but only measured this week: before then the view had
+        // one machine, then two, never a third that wasn't measured yet.
+        e.add_with(
+            "GLA-NEW",
+            1000.0,
+            "2026-09-08T10:00:00Z",
+            at(Some("glasgow")),
+        );
+
+        let (snap, t) = e.timeline(4);
+        let glasgow = snap.filtered(
+            &Filter {
+                scopes: vec![BTreeMap::from([("site".into(), "glasgow".into())])],
+                ..Default::default()
+            },
+            &Thresholds::default(),
+        );
+        assert_eq!(glasgow.summary.machines, 3);
+        let points = t.view(&glasgow, 4).points;
+        let machines: Vec<usize> = points.iter().map(|p| p.machines).collect();
+        assert_eq!(
+            machines,
+            [2, 2, 2, 2, 3],
+            "GLA-1 and MOVER throughout, GLA-NEW now"
+        );
+        assert_eq!(
+            points.last().unwrap().machines_flagged,
+            glasgow.summary.machines_flagged
+        );
+
+        let edinburgh = snap.filtered(
+            &Filter {
+                tags: BTreeMap::from([("site".into(), "edinburgh".into())]),
+                ..Default::default()
+            },
+            &Thresholds::default(),
+        );
+        let machines: Vec<usize> = t
+            .view(&edinburgh, 4)
+            .points
+            .iter()
+            .map(|p| p.machines)
+            .collect();
+        assert_eq!(machines, [1, 1, 1, 1, 1], "the mover left with its history");
+
+        // Nobody in view: nothing sent, rather than a line of zeros.
+        let nobody = snap.filtered(
+            &Filter {
+                tags: BTreeMap::from([("site".into(), "dundee".into())]),
+                ..Default::default()
+            },
+            &Thresholds::default(),
+        );
+        assert!(t.view(&nobody, 4).points.is_empty());
+        assert!(t.changes(&nobody, 1).baseline_empty);
+    }
+
+    /// Every category, on one estate measured a week ago and again now.
+    #[test]
+    fn changes_name_what_appeared_went_away_and_moved() {
+        let mut e = Estate::new();
+        let then = "2026-08-30T10:00:00Z";
+        let now_ = "2026-09-06T10:00:00Z";
+        let disk = |pct: f64| with_disks(json!([volume("C:\\", 100, pct)]));
+        // Cooled down: its thermal finding is resolved.
+        e.add_with("COOLED", 1000.0, then, hot);
+        e.add("COOLED", 1000.0, now_);
+        // Started throttling: a new finding.
+        e.add("WARMED", 1000.0, then);
+        e.add_with("WARMED", 1000.0, now_, hot);
+        // Filling up: warning, then critical.
+        e.add_with("FILLING", 1000.0, then, disk(8.0));
+        e.add_with("FILLING", 1000.0, now_, disk(3.0));
+        // Cleared some space: critical, then warning.
+        e.add_with("CLEARED", 1000.0, then, disk(3.0));
+        e.add_with("CLEARED", 1000.0, now_, disk(8.0));
+        // Dropped a grade, C to D, which is also a new grade_low.
+        e.add("SLIPPED", 700.0, then);
+        e.add("SLIPPED", 500.0, now_);
+        // Up a grade, B to A.
+        e.add("ROSE", 1100.0, then);
+        e.add("ROSE", 1200.0, now_);
+        // New to the fleet, and throttling.
+        e.add_with("ARRIVED", 1000.0, now_, hot);
+
+        let (snap, t) = e.timeline(4);
+        let c = t.changes(&snap, 1);
+        assert!(!c.baseline_empty);
+        assert_eq!(
+            (c.from.as_str(), c.to.as_str()),
+            ("2026-09-02", "2026-09-09")
+        );
+
+        let new: Vec<(&str, &str)> = c
+            .new_findings
+            .iter()
+            .filter(|f| f.severity != Severity::Info)
+            .map(|f| (f.hostname.as_deref().unwrap(), f.code))
+            .collect();
+        assert_eq!(
+            new,
+            [
+                // 700 to 500 is also a 29% regression, which is critical and
+                // so comes first.
+                ("SLIPPED", "regressed"),
+                ("ARRIVED", "thermal_limited"),
+                ("SLIPPED", "grade_low"),
+                ("WARMED", "thermal_limited"),
+            ]
+        );
+        assert!(
+            c.new_findings
+                .iter()
+                .filter(|f| f.hostname.as_deref() == Some("ARRIVED"))
+                .all(|f| f.new_machine)
+        );
+        assert!(
+            c.new_findings
+                .iter()
+                .filter(|f| f.hostname.as_deref() != Some("ARRIVED"))
+                .all(|f| !f.new_machine)
+        );
+
+        let resolved: Vec<(&str, &str)> = c
+            .resolved
+            .iter()
+            .map(|f| (f.hostname.as_deref().unwrap(), f.code))
+            .collect();
+        assert_eq!(resolved, [("COOLED", "thermal_limited")]);
+
+        assert_eq!(c.worsened.len(), 1);
+        let w = &c.worsened[0];
+        assert_eq!(
+            (w.hostname.as_deref(), w.code),
+            (Some("FILLING"), "disk_nearly_full")
+        );
+        assert_eq!((w.from, w.to), (Severity::Warning, Severity::Critical));
+        assert!(
+            w.headline.contains("3.0%"),
+            "as it reads now: {}",
+            w.headline
+        );
+
+        assert_eq!(c.eased.len(), 1);
+        let ez = &c.eased[0];
+        assert_eq!(
+            (ez.hostname.as_deref(), ez.from, ez.to),
+            (Some("CLEARED"), Severity::Critical, Severity::Warning)
+        );
+
+        let added: Vec<&str> = c
+            .machines_added
+            .iter()
+            .map(|m| m.hostname.as_deref().unwrap())
+            .collect();
+        assert_eq!(added, ["ARRIVED"]);
+        assert!(c.machines_added[0].flagged);
+
+        let grades: Vec<(&str, &str, &str, timeline::GradeDirection)> = c
+            .grade_changes
+            .iter()
+            .map(|g| {
+                (
+                    g.hostname.as_deref().unwrap(),
+                    g.from.as_str(),
+                    g.to.as_str(),
+                    g.direction,
+                )
+            })
+            .collect();
+        assert_eq!(
+            grades,
+            [
+                ("SLIPPED", "C", "D", timeline::GradeDirection::Down),
+                ("ROSE", "B", "A", timeline::GradeDirection::Up),
+            ],
+            "down before up"
+        );
+
+        let n = &c.counts;
+        assert_eq!((n.new_findings.critical, n.new_findings.warning), (1, 2));
+        assert_eq!(n.new_machine_findings.warning, 1);
+        assert_eq!((n.resolved.critical, n.resolved.warning), (0, 1));
+        assert_eq!((n.worsened, n.eased), (1, 1));
+        assert_eq!((n.machines_added, n.machines_added_flagged), (1, 1));
+        assert_eq!((n.grades_down, n.grades_up), (1, 1));
+    }
+
+    /// Critical, then warning, then informational — so a `stale` appearing on
+    /// a dozen machines lands under the one drive that failed, not over it —
+    /// and by machine within each.
+    #[test]
+    fn changes_are_ordered_most_severe_first_then_by_machine() {
+        let mut e = Estate::new();
+        let then = "2026-08-30T10:00:00Z";
+        let now_ = "2026-09-06T10:00:00Z";
+        for host in ["ZED", "ALPHA", "MIKE"] {
+            e.add(host, 1000.0, then);
+        }
+        e.add_with(
+            "ZED",
+            1000.0,
+            now_,
+            with_disks(json!([volume("C:\\", 100, 2.0)])),
+        );
+        e.add_with("ALPHA", 1000.0, now_, hot);
+        e.add_with("MIKE", 1000.0, now_, |d| {
+            hot(d);
+            make_cpu_noisy(d);
+        });
+
+        let (snap, t) = e.timeline(4);
+        let c = t.changes(&snap, 1);
+        let order: Vec<(Severity, &str)> = c
+            .new_findings
+            .iter()
+            .map(|f| (f.severity, f.hostname.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (Severity::Critical, "ZED"),
+                (Severity::Warning, "ALPHA"),
+                (Severity::Warning, "MIKE"),
+                (Severity::Info, "MIKE"),
+            ]
+        );
+        assert_eq!(c.counts.new_findings.info, 1);
+    }
+
+    /// With no data that far back, there is no baseline — which is said as
+    /// that, rather than as every machine and every finding being new.
+    #[test]
+    fn a_window_reaching_before_the_data_has_no_baseline() {
+        let mut e = Estate::new();
+        e.add_with("PC-1", 1000.0, "2026-08-20T10:00:00Z", hot);
+        let (snap, t) = e.timeline(TIMELINE_WEEKS);
+
+        let quarter = t.changes(&snap, 13);
+        assert!(quarter.baseline_empty);
+        assert!(quarter.is_empty());
+        assert_eq!(quarter.counts.machines_added, 0);
+        assert_eq!(quarter.from, "2026-06-10");
+
+        let week = t.changes(&snap, 1);
+        assert!(!week.baseline_empty);
+        assert!(week.is_empty(), "the same run a week ago and now: {week:?}");
+    }
+
+    #[test]
+    fn only_the_three_windows_and_a_sane_number_of_weeks_are_accepted() {
+        for ok in ["1", "4", "13", " 4 "] {
+            assert!(parse_window(ok).is_ok(), "{ok}");
+        }
+        for bad in ["0", "2", "26", "-1", "week", ""] {
+            let err = parse_window(bad).unwrap_err();
+            assert!(err.contains("1, 4 or 13"), "{bad}: {err}");
+        }
+        assert_eq!(parse_weeks("4"), Ok(4));
+        assert_eq!(parse_weeks(&TIMELINE_WEEKS.to_string()), Ok(TIMELINE_WEEKS));
+        for bad in ["3", "0", "105", "many"] {
+            assert!(parse_weeks(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// What a refresh costs at a realistic size, and what the result holds.
+    /// Ignored by default — it ingests sixteen thousand documents. Run it in a
+    /// release build:
+    ///
+    ///     cargo test --release timeline_build_cost -- --ignored --nocapture
+    ///
+    /// `LBF_BENCH_RUNS` and `LBF_BENCH_WEEKS` change the runs per machine (8)
+    /// and the weeks built (`TIMELINE_WEEKS`), to try a longer history.
+    #[test]
+    #[ignore]
+    fn timeline_build_cost() {
+        let env = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let mut e = Estate::new();
+        let machines = 2000;
+        let runs = env("LBF_BENCH_RUNS", 8);
+        let weeks = env("LBF_BENCH_WEEKS", TIMELINE_WEEKS);
+        let started = std::time::Instant::now();
+        for i in 0..machines {
+            for r in 0..runs {
+                // One run every three weeks, staggered across machines, so the
+                // half-year holds most of each machine's history.
+                let taken = now() - time::Duration::days((r * 21 + i % 21) as i64);
+                let score = 900.0 + ((i * 37 + r * 11) % 300) as f64;
+                e.add_with(
+                    &format!("PC-{i:05}"),
+                    score,
+                    &taken.format(&Rfc3339).unwrap(),
+                    |d| {
+                        d["machine"]["cpu_model"] = json!(format!("CPU model {}", i % 40));
+                        if i % 7 == 0 {
+                            hot(d);
+                        }
+                        d["tags"] = json!({ "site": format!("site-{}", i % 12) });
+                    },
+                );
+            }
+        }
+        eprintln!("ingest: {:?}", started.elapsed());
+
+        let th = Thresholds::default();
+        let started = std::time::Instant::now();
+        let snap = snapshot(e.idx.conn(), &th, now()).unwrap();
+        eprintln!("snapshot: {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        let t = Timeline::build(e.idx.conn(), &th, &snap, now(), weeks).unwrap();
+        eprintln!(
+            "timeline ({weeks} weeks, {machines} machines x {runs} runs): {:?}, about {} KiB held",
+            started.elapsed(),
+            t.heap_bytes() / 1024
+        );
+        let started = std::time::Instant::now();
+        let view = t.view(&snap, weeks);
+        let changes = t.changes(&snap, 13);
+        eprintln!(
+            "projection and changes: {:?} ({} points, {} new findings)",
+            started.elapsed(),
+            view.points.len(),
+            changes.new_findings.len()
+        );
+        assert_eq!(view.points.last().unwrap().machines, machines);
     }
 }

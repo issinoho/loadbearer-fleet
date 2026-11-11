@@ -408,6 +408,10 @@ table.data td.wrap { white-space: normal; }
 .finding-detail { color: var(--text-secondary); margin: 4px 0 0; }
 .finding-queue { color: var(--text-muted); font-size: 12px; }
 
+/* "What changed" lists one kind of change after another inside one card, so
+   each heading needs the room a card's own top edge would have given it. */
+.change-section { margin-top: 16px; }
+
 .link-button {
   font: inherit;
   font-weight: 600;
