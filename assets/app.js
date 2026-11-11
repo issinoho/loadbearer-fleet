@@ -414,21 +414,39 @@ export function divergingChart(host, { rows, onSelect }) {
   root.append(svg('line', {
     x1: zero, x2: zero, y1: m.top, y2: m.top + plotH, stroke: ink('--axis'), 'stroke-width': 1,
   }));
+  // The caption shares a line with the two tick labels, a quarter of the plot
+  // either side of it. On a phone, with a long label gutter, that quarter is
+  // narrower than the words and they ran into the ticks — so there the
+  // midpoint is labelled as what it is on the scale, and the card's own text
+  // is left to say what zero means.
+  const caption = 'cohort median';
+  const tick = Math.max(textWidth(signed(-span / 2, 0), 10), textWidth(signed(span / 2, 0), 10));
+  const fits = plotW / 4 >= textWidth(caption, 10) / 2 + tick / 2 + 6;
   root.append(svg('text', {
     x: zero, y: height - 8, 'text-anchor': 'middle', fill: ink('--text-muted'), 'font-size': 10,
-  }, [document.createTextNode('cohort median')]));
+  }, [document.createTextNode(fits ? caption : '0')]));
   host.append(root);
 }
 
-/** Horizontal stacked bars: a 2px surface gap does the separating, not a stroke. */
-export function stackedChart(host, { rows, series }) {
+/**
+ * Horizontal stacked bars: a 2px surface gap does the separating, not a stroke.
+ *
+ * Counts by default. For shares, pass `max: 100` so every row is drawn against
+ * the same whole rather than against the longest row, a `format` for the
+ * figures, and a `tip` that puts the count behind the share back into the
+ * tooltip — a share of two machines and a share of two hundred look the same.
+ */
+export function stackedChart(host, {
+  rows, series, max: fixedMax, unit = 'findings', format = (v) => nf0.format(v), tip,
+}) {
   const width = Math.max(320, host.clientWidth || 520);
   const gutter = Math.min(150, Math.max(80, ...rows.map((r) => textWidth(r.label, 12) + 12)));
   const m = { top: 6, right: 46, bottom: 6, left: gutter };
   const rowH = 34;
   const height = rowH * rows.length + m.top + m.bottom;
   const plotW = width - m.left - m.right;
-  const max = Math.max(1, ...rows.map((r) => series.reduce((a, s) => a + (r.values[s.key] || 0), 0)));
+  const max = fixedMax
+    || Math.max(1, ...rows.map((r) => series.reduce((a, s) => a + (r.values[s.key] || 0), 0)));
   const barH = Math.min(24, rowH - 12);
   const root = svg('svg', { class: 'chart', viewBox: `0 0 ${width} ${height}`, width, height });
 
@@ -458,24 +476,24 @@ export function stackedChart(host, { rows, series }) {
       // Yellow sits below 3:1 on the light surface, so the count is written on
       // the segment whenever it fits; where it doesn't, the tooltip and the
       // table view carry it.
-      if (w > textWidth(v, 11) + 14) {
+      if (w > textWidth(format(v), 11) + 14) {
         root.append(svg('text', {
           x: cursor + w / 2, y: cy + 4, 'text-anchor': 'middle',
           fill: '#0b0b0b', 'font-size': 11, 'font-weight': 600,
           'font-variant-numeric': 'tabular-nums',
-        }, [document.createTextNode(nf0.format(v))]));
+        }, [document.createTextNode(format(v))]));
       }
       root.append(hoverable(svg('rect', {
         x: cursor, y: cy - rowH / 2, width: Math.max(w, 8), height: rowH,
-        fill: 'transparent', role: 'img', 'aria-label': `${r.label}, ${s.label}: ${v}`,
-      }), () => tipBlock(`${r.label} · ${s.label}`, [['findings', nf0.format(v), s.colour]])));
+        fill: 'transparent', role: 'img', 'aria-label': `${r.label}, ${s.label}: ${format(v)}`,
+      }), () => tipBlock(`${r.label} · ${s.label}`, tip ? tip(r, s, v) : [[unit, format(v), s.colour]])));
       cursor += raw;
     });
 
     root.append(svg('text', {
       x: m.left + plotW + 10, y: cy + 4, fill: ink('--text-secondary'),
       'font-size': 11, 'font-variant-numeric': 'tabular-nums',
-    }, [document.createTextNode(nf0.format(total))]));
+    }, [document.createTextNode(format(total))]));
   });
   host.append(root);
 }
@@ -618,9 +636,12 @@ export function dataTable({ columns, rows, onRow, sortable, initialSort }) {
     let body = rows;
     if (state.key !== null) {
       const i = state.key;
+      // A row's own sort key wins even when it is null, so "no value" sorts
+      // last as the null check below intends. Falling back to the cell for a
+      // null key compared '—' or an element against numbers instead.
       body = rows.slice().sort((a, b) => {
-        const av = a.sort?.[i] ?? a.cells[i];
-        const bv = b.sort?.[i] ?? b.cells[i];
+        const av = a.sort ? a.sort[i] : a.cells[i];
+        const bv = b.sort ? b.sort[i] : b.cells[i];
         if (av === bv) return 0;
         if (av === null || av === undefined) return 1;
         if (bv === null || bv === undefined) return -1;
@@ -725,7 +746,13 @@ export const state = {
   /// The run ids being compared, in the order they were chosen: the first is
   /// the one everything else is measured against.
   runs: [],
+  /// What the Groups view groups by, or null for the server's default. Kept
+  /// across a trip to another tab, so coming back finds the same grouping.
+  by: null,
 };
+
+/** The filter fields the URL carries, all sent to the server as they are. */
+const FILTER_KEYS = ['since_days', 'tags', 'flag', 'q', 'cohort', 'model', 'cpu', 'os'];
 
 function parseHash() {
   const raw = location.hash.replace(/^#\/?/, '');
@@ -733,11 +760,11 @@ function parseHash() {
   const parts = (path || 'overview').split('/');
   const params = new URLSearchParams(query || '');
   const filter = {};
-  for (const k of ['since_days', 'tags', 'flag', 'q', 'cohort']) {
+  for (const k of FILTER_KEYS) {
     const v = params.get(k);
     if (v) filter[k] = v;
   }
-  const named = ['overview', 'cohorts', 'machines', 'compare'];
+  const named = ['overview', 'cohorts', 'groups', 'machines', 'compare'];
   const view = parts[0] === 'machine'
     ? 'machine'
     : (named.includes(parts[0]) ? parts[0] : 'overview');
@@ -750,14 +777,19 @@ function parseHash() {
     runs: view === 'compare'
       ? (parts[1] || '').split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0)
       : [],
+    // Beside the filter in the query but not part of it: it says how to
+    // arrange the machines in view, not which ones are in view.
+    by: params.get('by') || null,
     filter,
   };
 }
 
 function writeHash({
-  view = state.view, key = state.key, filter = state.filter, runs = state.runs,
+  view = state.view, key = state.key, filter = state.filter, runs = state.runs, by = state.by,
 } = {}) {
-  const q = new URLSearchParams(filter).toString();
+  const params = new URLSearchParams(filter);
+  if (view === 'groups' && by) params.set('by', by);
+  const q = params.toString();
   let path = view;
   if (view === 'machine') path = `machine/${encodeURIComponent(key)}`;
   if (view === 'compare') path = runs?.length ? `compare/${runs.join(',')}` : 'compare';
@@ -789,6 +821,15 @@ async function fetchJson(url, options) {
 async function fetchSnapshot() {
   const q = new URLSearchParams(state.filter).toString();
   return fetchJson(`/api/snapshot${q ? `?${q}` : ''}`);
+}
+
+/** The machines in view, grouped — through the same filter, so the same
+ *  machines the snapshot holds and nothing the caller's scope excludes. */
+async function fetchGroups() {
+  const params = new URLSearchParams(state.filter);
+  if (state.by) params.set('by', state.by);
+  const q = params.toString();
+  return fetchJson(`/api/groups${q ? `?${q}` : ''}`);
 }
 
 /*
@@ -930,7 +971,24 @@ function syncFilterControls() {
       el('span', { class: 'field-label', text: k }), sel,
     ]);
   }));
+
+  // A group drilled into from the Groups view. There is no list of values to
+  // offer, and a filter nobody can see is one nobody thinks to clear — so
+  // each is shown as itself, and pressing it lets go of it.
+  $('#f-exact').replaceChildren(...EXACT_FILTERS.filter(([k]) => state.filter[k]).map(([k, label]) => (
+    el('span', { class: 'field filter-exact' }, [
+      el('span', { class: 'field-label', text: label }),
+      el('button', {
+        type: 'button', class: 'btn', title: state.filter[k],
+        'aria-label': `${label} is ${state.filter[k]}. Stop filtering by it`,
+        onclick: () => applyFilter({ [k]: undefined }),
+      }, [el('span', { class: 'filter-exact-value', text: state.filter[k] }), el('span', { text: ' ✕', 'aria-hidden': 'true' })]),
+    ])
+  )));
 }
+
+/** The exact-match filters, by query parameter, with what to call each. */
+const EXACT_FILTERS = [['model', 'System model'], ['cpu', 'CPU'], ['os', 'OS']];
 
 function applyFilter(patch) {
   const filter = { ...state.filter, ...patch };
@@ -1243,6 +1301,295 @@ export function renderCohorts(main) {
       thinCard,
     ]),
   );
+}
+
+/** The most groups a chart draws. Past this the bars are too many to read and
+ *  the long tail is the table's job. */
+const GROUP_CHART_CAP = 12;
+
+/** "System model", "CPU", "OS", "Tag: site". */
+function dimensionLabel(by) {
+  if (by.startsWith('tag:')) return `Tag: ${by.slice(4)}`;
+  return { model: 'System model', cpu: 'CPU', os: 'OS' }[by] || by;
+}
+
+function groupLabel(g, by) {
+  if (g.value !== null) return g.value;
+  return by.startsWith('tag:') ? '(untagged)' : '(not recorded)';
+}
+
+/**
+ * The filter that selects one group's machines, or null for the group with no
+ * value — there is no "has no system model" filter to send. Exact fields for
+ * model, CPU and OS rather than the search box, which would also find the
+ * model whose name merely starts the same way.
+ */
+function groupFilter(g, by) {
+  if (g.value === null) return null;
+  if (by.startsWith('tag:')) {
+    const tags = new Map((state.filter.tags || '').split(',').filter(Boolean)
+      .map((p) => p.split('=')).filter((p) => p.length === 2));
+    tags.set(by.slice(4), g.value);
+    return { tags: [...tags.entries()].map(([k, v]) => `${k}=${v}`).join(',') };
+  }
+  return { [by]: g.value };
+}
+
+function drillInto(g, by) {
+  const patch = groupFilter(g, by);
+  if (!patch) return;
+  writeHash({ view: 'machines', key: null, filter: { ...state.filter, ...patch } });
+}
+
+/** "-7.5% · 6 machines, thin", the headline figure as the table states it. */
+function vsIdentical(g) {
+  if (g.median_cohort_delta_pct === null) return 'no peer group';
+  return `${signed(g.median_cohort_delta_pct, 1)} · ${g.with_cohort} with peers${g.thin ? ', thin' : ''}`;
+}
+
+/** Share of a group, 0–100, never NaN for an empty one. */
+function share(n, of) {
+  return of > 0 ? (n / of) * 100 : 0;
+}
+
+const pct = (v) => `${Math.round(v)}%`;
+
+export async function renderGroups(main) {
+  let data;
+  try {
+    data = await fetchGroups();
+  } catch (err) {
+    // An unknown dimension is the likeliest cause — a hand-edited or stale
+    // link — so the way back is offered with the server's reason.
+    main.append(el('div', { class: 'banner' }, [
+      el('span', { text: err.message }),
+      ' ',
+      el('button', {
+        type: 'button', class: 'link-button', text: 'Group by the default instead',
+        onclick: () => { state.by = null; writeHash({ view: 'groups', by: null }); },
+      }),
+    ]));
+    return;
+  }
+  const { by, groups, thresholds } = data;
+  const minCohort = thresholds.min_cohort;
+  const truncated = groups.length > GROUP_CHART_CAP
+    ? `The first ${GROUP_CHART_CAP} of ${groups.length} groups, worst share flagged first; the table has every one.`
+    : null;
+
+  // The selector offers what the server says the machines in view carry, plus
+  // whatever is selected now — a tag nobody in view carries is still a
+  // grouping, and its single "(untagged)" group is an honest answer.
+  const dims = data.dimensions.includes(by) ? data.dimensions : [...data.dimensions, by];
+  const picker = el('select', {
+    'aria-label': 'Group by',
+    onchange: (e) => { state.by = e.target.value; writeHash({ view: 'groups', by: e.target.value }); },
+  }, dims.map((d) => el('option', { value: d, text: dimensionLabel(d) })));
+  picker.value = by;
+
+  const intro = el('div', { class: 'card col-12' }, [
+    el('div', { class: 'card-head' }, [el('h3', { text: `${nf0.format(data.machines)} machine(s) in ${groups.length} group(s)` })]),
+    el('p', {
+      class: 'card-sub',
+      text: 'Raw score by site mostly measures how old each site’s hardware is. So groups are compared by '
+        + 'the median of their members against identical machines — the same CPU, measured the same way — '
+        + 'and a group well below zero points at something about the group: power policy, the image, dust, a '
+        + 'bad batch. Score and grade are shown too, as description; they are not the comparison.',
+    }),
+    el('label', { class: 'field filter-by' }, [el('span', { class: 'field-label', text: 'Group by' }), picker]),
+  ]);
+
+  // Thin groups and groups with nothing to compare are left out of the chart
+  // rather than drawn in a colour of their own: the palette has no role for
+  // "a median of two", and a bar of the same length as a solid one reads as
+  // just as solid whatever its colour. The note says how many, and why.
+  const comparable = groups.filter((g) => g.median_cohort_delta_pct !== null && !g.thin);
+  const thinCount = groups.filter((g) => g.with_cohort > 0 && g.thin).length;
+  const noneCount = groups.filter((g) => g.with_cohort === 0).length;
+  const plotted = comparable.slice(0, GROUP_CHART_CAP)
+    .sort((a, b) => a.median_cohort_delta_pct - b.median_cohort_delta_pct);
+  const leftOut = [
+    thinCount ? `${thinCount} group(s) left out because fewer than ${minCohort} of their machines have a peer `
+      + 'group — a median of so few describes those machines, not the group.' : null,
+    noneCount ? `${noneCount} group(s) have no machine with a peer group at all, so there is nothing to compare.` : null,
+    comparable.length > GROUP_CHART_CAP
+      ? `The first ${GROUP_CHART_CAP} of ${comparable.length} are drawn; the table has every one.` : null,
+  ].filter(Boolean).join(' ');
+
+  const identicalCard = chartCard({
+    title: 'Against identical machines',
+    subtitle: 'Each bar is the median of a group’s machines, each measured against the median of the machines '
+      + 'like it across the whole index. Below zero, this group’s machines run slower than the same hardware '
+      + 'elsewhere. Select a bar to see its machines.',
+    note: leftOut || null,
+    span: 'col-12',
+    draw: (host) => {
+      if (!plotted.length) {
+        host.append(el('div', {
+          class: 'empty',
+          text: `No group in view has ${minCohort} or more machines with a peer group to compare.`,
+        }));
+        return;
+      }
+      divergingChart(host, {
+        rows: plotted.map((g) => ({
+          label: groupLabel(g, by),
+          value: g.median_cohort_delta_pct,
+          score: g.median_score,
+          note: `median of ${g.with_cohort} machine(s) with peers`,
+          group: g,
+        })),
+        onSelect: (r) => drillInto(r.group, by),
+      });
+    },
+    table: () => dataTable({
+      columns: [{ label: 'Group' }, { label: 'Machines', num: true }, { label: 'With peers', num: true },
+        { label: 'vs identical', num: true }, { label: 'Thin' }],
+      rows: groups.map((g) => ({
+        cells: [groupLabel(g, by), g.machines, g.with_cohort, signed(g.median_cohort_delta_pct, 1),
+          g.with_cohort === 0 ? '—' : g.thin ? 'yes' : 'no'],
+        sort: [groupLabel(g, by), g.machines, g.with_cohort, g.median_cohort_delta_pct, g.thin],
+      })),
+      sortable: true,
+    }),
+  });
+
+  // Shares rather than counts: group sizes differ by orders of magnitude, and
+  // a count bar ranks the biggest group worst for being big. The count each
+  // share stands for is in the tooltip and the table.
+  const charted = groups.slice(0, GROUP_CHART_CAP);
+  const attention = charted.map((g) => ({
+    label: groupLabel(g, by),
+    group: g,
+    values: {
+      critical: share(g.machines_critical, g.machines),
+      warning: share(g.flagged - g.machines_critical, g.machines),
+    },
+  }));
+  const attentionSeries = [
+    { key: 'critical', label: 'Critical' },
+    { key: 'warning', label: 'Warning, nothing critical' },
+  ];
+  const attentionCard = chartCard({
+    title: 'Machines needing attention',
+    subtitle: 'The share of each group’s machines with a critical or warning finding, by the worst one each carries.',
+    note: truncated,
+    span: 'col-6',
+    draw: (host) => {
+      host.append(legend(attentionSeries.map((s) => ({ label: s.label, colour: ink(`--status-${s.key}`) }))));
+      stackedChart(host, {
+        rows: attention,
+        series: attentionSeries.map((s) => ({ ...s, colour: ink(`--status-${s.key}`) })),
+        max: 100,
+        format: pct,
+        tip: (r, s, v) => {
+          const n = s.key === 'critical' ? r.group.machines_critical : r.group.flagged - r.group.machines_critical;
+          return [[`of ${nf0.format(r.group.machines)} machine(s)`, `${nf0.format(n)} · ${pct(v)}`, s.colour]];
+        },
+      });
+    },
+    table: () => dataTable({
+      columns: [{ label: 'Group' }, { label: 'Machines', num: true }, { label: 'Flagged', num: true },
+        { label: 'Share', num: true }, { label: 'Critical', num: true }],
+      rows: groups.map((g) => ({
+        cells: [groupLabel(g, by), g.machines, g.flagged, pct(share(g.flagged, g.machines)), g.machines_critical],
+        sort: [groupLabel(g, by), g.machines, g.flagged, share(g.flagged, g.machines), g.machines_critical],
+      })),
+      sortable: true,
+    }),
+  });
+
+  // Grades share one hue across the dashboard — six steps cannot clear the
+  // ordinal lightness gate (see app.css) — so six segments in it would be six
+  // indistinguishable blocks. The chart splits the mix in two with roles that
+  // already exist, and the table carries every grade.
+  const gradeKeys = groups[0]?.grades.map(([g]) => g) || [];
+  const upper = ['S', 'A', 'B'];
+  const lower = ['C', 'D', 'F'];
+  const count = (g, keys) => g.grades.filter(([k]) => keys.includes(k)).reduce((a, [, n]) => a + n, 0);
+  const gradeRows = charted.map((g) => ({
+    label: groupLabel(g, by),
+    group: g,
+    values: { upper: share(count(g, upper), g.machines), lower: share(count(g, lower), g.machines) },
+  }));
+  // Resolved when drawn, not now: marks carry hex, and a theme change redraws.
+  const gradeSeries = () => [
+    { key: 'upper', label: 'S to B', colour: ink('--series-1'), keys: upper },
+    { key: 'lower', label: 'C to F', colour: ink('--deemph'), keys: lower },
+  ];
+  const gradesCard = chartCard({
+    title: 'Grades',
+    subtitle: 'Against the reference baseline, so this says how new a group’s hardware is as much as how it is '
+      + 'doing. Split at B here; the table has every grade.',
+    note: truncated,
+    span: 'col-6',
+    draw: (host) => {
+      const series = gradeSeries();
+      host.append(legend(series.map((s) => ({ label: s.label, colour: s.colour }))));
+      stackedChart(host, {
+        rows: gradeRows,
+        series,
+        max: 100,
+        format: pct,
+        tip: (r, s, v) => [[`of ${nf0.format(r.group.machines)} machine(s)`,
+          `${nf0.format(count(r.group, s.keys))} · ${pct(v)}`, s.colour]],
+      });
+    },
+    table: () => dataTable({
+      columns: [{ label: 'Group' }, { label: 'Machines', num: true },
+        ...gradeKeys.map((k) => ({ label: k, num: true }))],
+      rows: groups.map((g) => ({
+        cells: [groupLabel(g, by), g.machines, ...g.grades.map(([, n]) => n)],
+      })),
+      sortable: true,
+    }),
+  });
+
+  const tableCard = el('div', { class: 'card col-12' }, [
+    el('div', { class: 'card-head' }, [el('h3', { text: `Every group by ${dimensionLabel(by).toLowerCase()}` })]),
+    el('p', {
+      class: 'card-sub',
+      text: 'Flagged and Critical count machines, not findings. A median marked thin comes from fewer than '
+        + `${minCohort} machines with a peer group. Click a column to sort, or a group to see its machines.`,
+    }),
+    dataTable({
+      columns: [{ label: 'Group' }, { label: 'Machines', num: true }, { label: 'Flagged', num: true },
+        { label: 'Critical', num: true }, { label: 'Median score', num: true },
+        { label: 'vs identical', num: true }, { label: 'Trend', num: true }, { label: 'Stale', num: true },
+        { label: 'Median age', num: true }, { label: 'Top findings', wrap: true }],
+      rows: groups.map((g) => ({
+        group: g,
+        cells: [
+          groupFilter(g, by)
+            ? el('button', {
+              type: 'button', class: 'link-button', text: groupLabel(g, by),
+              onclick: (e) => { e.stopPropagation(); drillInto(g, by); },
+            })
+            : el('span', { class: 'meta', text: groupLabel(g, by) }),
+          g.machines,
+          `${g.flagged} (${pct(share(g.flagged, g.machines))})`,
+          g.machines_critical,
+          num(g.median_score, 0),
+          vsIdentical(g),
+          g.median_trend_pct === null ? '—' : `${signed(g.median_trend_pct, 1)} · ${g.with_trend}`,
+          g.stale,
+          g.median_max_age_months === null ? '—' : maxAge(Math.round(g.median_max_age_months)),
+          g.top_flags.length
+            ? g.top_flags.map((f) => `${f.code.replace(/_/g, ' ')} ${f.machines}`).join(', ')
+            : '—',
+        ],
+        sort: [groupLabel(g, by).toLowerCase(), g.machines, share(g.flagged, g.machines), g.machines_critical,
+          g.median_score, g.median_cohort_delta_pct, g.median_trend_pct, g.stale, g.median_max_age_months,
+          g.top_flags[0]?.machines ?? null],
+      })),
+      onRow: (r) => drillInto(r.group, by),
+      sortable: true,
+    }),
+  ]);
+
+  main.append(el('div', { class: 'grid' }, groups.length
+    ? [intro, identicalCard, attentionCard, gradesCard, tableCard]
+    : [intro, el('div', { class: 'card col-12' }, [el('div', { class: 'empty', text: 'No machines in view to group.' })])]));
 }
 
 export function renderMachines(main) {
@@ -1790,17 +2137,21 @@ function render() {
 
   if (state.view === 'machine') { renderMachine(main, state.key); return; }
   if (state.view === 'compare') { renderCompare(main, state.runs); return; }
+  if (state.view === 'groups') return renderGroups(main);
   if (state.view === 'cohorts') renderCohorts(main);
   else if (state.view === 'machines') renderMachines(main);
   else renderOverview(main);
 }
 
 async function route() {
-  const { view, key, filter, runs } = parseHash();
+  const { view, key, filter, runs, by } = parseHash();
   state.view = view;
   state.key = key;
   state.filter = filter;
   state.runs = runs;
+  // Only the Groups view's own URL names one; elsewhere the last choice is
+  // kept for the way back.
+  if (view === 'groups') state.by = by;
   const main = $('#main');
   main.classList.add('loading');
   try {
@@ -1819,7 +2170,9 @@ async function route() {
       $('#footer-build').textContent = `loadbearer-fleet ${state.snap.version}${build}`;
     }
     syncFilterControls();
-    render();
+    // Awaited so `loading` stays on until a view that fetches its own data
+    // has drawn it, rather than lifting over a half-built page.
+    await render();
   } catch (err) {
     main.replaceChildren(el('div', { class: 'banner' }, [el('span', { text: `Could not load the fleet: ${err.message}` })]));
   } finally {

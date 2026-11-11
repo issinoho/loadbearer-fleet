@@ -88,6 +88,15 @@ enum Command {
         /// findings under forty notices is how a dashboard stops being read.
         #[arg(long)]
         all: bool,
+        /// Group the machines instead: `model`, `cpu`, `os`, or `tag:<key>`
+        /// for one of the tags the deployment tool passed (`tag:site`).
+        ///
+        /// Each group is compared by the median of its members' standing
+        /// against identical machines, not by raw score — so a site with old
+        /// hardware is not mistaken for a site with a problem. With `--json`,
+        /// the same document `/api/groups` sends.
+        #[arg(long, value_name = "DIMENSION", value_parser = parse_group_by)]
+        by: Option<analytics::GroupBy>,
     },
     /// Serve the web dashboard.
     Serve {
@@ -592,10 +601,19 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Report { json, all } => {
+        Command::Report { json, all, by } => {
             let idx = index::Index::open_existing(&config.server.index)?;
             let th = Thresholds::default();
             let snap = analytics::snapshot(idx.conn(), &th, OffsetDateTime::now_utc())?;
+            if let Some(by) = by {
+                let grouping = analytics::grouping(&snap, Some(by.clone()));
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&grouping)?);
+                } else {
+                    print_groups(&grouping);
+                }
+                return Ok(());
+            }
             if *json {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
                 return Ok(());
@@ -864,6 +882,107 @@ fn print_report(snap: &analytics::Snapshot, show_info: bool) {
         println!(
             "\n{} informational flag(s) hidden — pass --all to see them.",
             s.info
+        );
+    }
+}
+
+/// `--by`'s parser, so a dimension that means nothing is refused by clap with
+/// the reason, before any index is opened.
+fn parse_group_by(s: &str) -> Result<analytics::GroupBy, String> {
+    s.parse()
+}
+
+/// `report --by`: one line per group, in the server's order — worst share
+/// flagged first, the group with no value last.
+fn print_groups(g: &analytics::Grouping) {
+    let none = if g.by.starts_with("tag:") {
+        "(untagged)"
+    } else {
+        "(not recorded)"
+    };
+    println!(
+        "Grouped by {}: {} machine(s) in {} group(s)",
+        g.by,
+        g.machines,
+        g.groups.len()
+    );
+    println!(
+        "  \"vs identical\" is the median of each member against machines with the same CPU\n  \
+         measured the same way, so it does not reward new hardware. Score describes the\n  \
+         hardware as much as its condition. A group drawn from fewer than {} machines\n  \
+         with peers is marked thin.",
+        g.thresholds.min_cohort
+    );
+    if g.groups.is_empty() {
+        println!("\nNo machines in the index.");
+        return;
+    }
+
+    // A column as wide as the longest value, within reason: a system model can
+    // be forty characters, and the figures are what this table is for.
+    let label = |v: &Option<String>| -> String {
+        let v = v.as_deref().unwrap_or(none);
+        if v.chars().count() > 28 {
+            format!("{}…", v.chars().take(27).collect::<String>())
+        } else {
+            v.to_string()
+        }
+    };
+    let width = g
+        .groups
+        .iter()
+        .map(|grp| label(&grp.value).chars().count())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+
+    println!();
+    println!(
+        "  {:<width$}  {:>8}  {:>10}  {:>8}  {:>6}  {:<22}  {:>7}  {:>5}  {:>8}  top findings",
+        "group",
+        "machines",
+        "flagged",
+        "critical",
+        "score",
+        "vs identical",
+        "trend",
+        "stale",
+        "age"
+    );
+    for grp in &g.groups {
+        let pct = |n: usize| n * 100 / grp.machines.max(1);
+        let vs = match grp.median_cohort_delta_pct {
+            Some(d) => format!(
+                "{d:+.1}% (n={}{})",
+                grp.with_cohort,
+                if grp.thin { ", thin" } else { "" }
+            ),
+            None => "no peer group".to_string(),
+        };
+        let top: Vec<String> = grp
+            .top_flags
+            .iter()
+            .map(|f| format!("{} {}", f.code, f.machines))
+            .collect();
+        println!(
+            "  {:<width$}  {:>8}  {:>10}  {:>8}  {:>6}  {:<22}  {:>7}  {:>5}  {:>8}  {}",
+            label(&grp.value),
+            grp.machines,
+            format!("{} ({}%)", grp.flagged, pct(grp.flagged)),
+            grp.machines_critical,
+            grp.median_score
+                .map_or_else(|| "—".to_string(), |s| format!("{s:.0}")),
+            vs,
+            grp.median_trend_pct
+                .map_or_else(|| "—".to_string(), |t| format!("{t:+.1}%")),
+            grp.stale,
+            grp.median_max_age_months
+                .map_or_else(|| "—".to_string(), |m| format!("≤{:.1} yr", m / 12.0)),
+            if top.is_empty() {
+                "—".to_string()
+            } else {
+                top.join(", ")
+            },
         );
     }
 }

@@ -50,7 +50,11 @@ const SIZES = [
 // Three of these hold the widest thing on the site: the machines table, a
 // drilldown with its history charts, and a comparison, which is a table whose
 // width is chosen by the reader — one column per run.
-const VIEWS = ['overview', 'cohorts', 'machines', 'machine', 'compare'];
+//
+// `drilled` is the machine table as a group on the Groups view leaves it:
+// filtered to one exact CPU, which puts that whole CPU string in the filter
+// row — the longest thing that row ever has to hold.
+const VIEWS = ['overview', 'cohorts', 'groups', 'machines', 'drilled', 'machine', 'compare'];
 
 // A control smaller than this is a control you miss. 40px is the floor here
 // rather than Apple's 44 because the theme toggle is square and 44 looks
@@ -229,6 +233,8 @@ const snapshot = await (await fetch(`${origin}/api/snapshot`)).json();
 const machineKey = snapshot.machines[0].key;
 // Three runs: the widest table a reader can ask for on a phone, short of four.
 const compareRuns = snapshot.machines.slice(0, 3).map((m) => m.run_id);
+const longestCpu = snapshot.machines.map((m) => m.cpu_model)
+  .reduce((a, b) => (b.length > a.length ? b : a), '');
 check('fixtures', snapshot.machines.length > 0, 'the fixtures produced no machines');
 
 /* ----------------------------------------------------------------- the runs */
@@ -269,6 +275,7 @@ try {
       // A comparison with nothing chosen is only the picker, which is not the
       // layout worth checking — the table is.
       if (view === 'compare') hash = `compare/${compareRuns.join(',')}`;
+      if (view === 'drilled') hash = `machines?cpu=${encodeURIComponent(longestCpu)}`;
       const where = `${size.name}/${view}`;
       // A fresh navigation rather than a hash change, so each measurement is of
       // a page that laid itself out at this size from the start.
