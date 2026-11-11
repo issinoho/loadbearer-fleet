@@ -131,8 +131,14 @@ function ageFacts(m) {
       + (m.age_source === 'derived' ? ' · from the CPU model' : '')
     : null;
   let firmware = null;
-  if (m.firmware_dated) {
-    firmware = `dated ${monthYear(m.firmware_dated)}`;
+  // The firmware's own version and day where the run recorded them (and the
+  // index has them — a run indexed before the index kept them needs
+  // `scan --reindex`), the age estimate's month otherwise.
+  if (m.firmware_dated || m.bios_date || m.bios_version) {
+    firmware = [
+      m.bios_version ? `BIOS ${m.bios_version}` : null,
+      m.bios_date ? `dated ${m.bios_date}` : m.firmware_dated ? `dated ${monthYear(m.firmware_dated)}` : null,
+    ].filter(Boolean).join(', ');
     if (m.firmware_likely_original === true) firmware += ' — probably as shipped, so the machine likely dates from about then';
     if (m.firmware_likely_original === false) firmware += ' — updated since it shipped';
   }
@@ -1301,14 +1307,26 @@ export async function renderMachine(main, key) {
     return;
   }
   const { machine: m, flags, cohort, history, subtests } = payload;
+  // Absent from a server older than the drive table, as well as empty for a
+  // run that recorded none.
+  const drives = payload.drives || [];
 
   const age = ageFacts(m);
+  // The fixed volume with the least free space — what `disk_nearly_full`
+  // judges. Free bytes to more than whole GiB, since on a nearly full disk
+  // the fraction is the point.
+  const fullest = m.disk_low_mount
+    ? `${m.disk_low_mount} — ${num(m.disk_low_free_pct, 1)}% free`
+      + (m.disk_low_free_bytes === null || m.disk_low_free_bytes === undefined
+        ? '' : ` (${num(m.disk_low_free_bytes / 1024 ** 3)} GiB)`)
+    : null;
   const facts = [
     ...(m.system_model ? [['System', m.system_model]] : []),
     ['CPU', m.cpu_model],
     ['Age', age.built || 'unknown — the CPU isn’t in the launch table'],
     ...(age.firmware ? [['Firmware', age.firmware]] : []),
     ...(age.drive ? [['Drive', age.drive]] : []),
+    ...(fullest ? [['Fullest volume', fullest]] : []),
     ...(powerFact(m) ? [['Power', powerFact(m)]] : []),
     ...(m.battery_cycles === null || m.battery_cycles === undefined ? [] : [['Battery',
       `${m.battery_cycles} cycles`
@@ -1436,6 +1454,35 @@ export async function renderMachine(main, key) {
       : el('div', { class: 'empty', text: 'Nothing flagged on this machine.' }),
   ]);
 
+  // Every drive the latest run could query, not just the boot drive the age
+  // line reads. Hidden rather than shown empty: no drives means a run without
+  // admin rights or from before loadbearer 1.6.0, which says nothing about
+  // the drives themselves. Blank cells are figures the drive doesn't report.
+  const opt = (v, suffix = '') => (v === null || v === undefined ? null : `${nf0.format(v)}${suffix}`);
+  const driveCard = drives.length
+    ? el('div', { class: 'card col-12' }, [
+      el('div', { class: 'card-head' }, [el('h3', { text: 'Drives' })]),
+      el('p', {
+        class: 'card-sub',
+        text: 'Health counters from each drive, as of the latest run. Wear is the vendor’s estimate of rated '
+          + 'endurance used — it can pass 100% — not a prediction of failure; a non-zero warning is the drive '
+          + 'itself reporting a problem.',
+      }),
+      dataTable({
+        columns: [{ label: 'Drive' }, { label: 'Interface' }, { label: 'Hours', num: true },
+          { label: 'Wear', num: true }, { label: 'Spare', num: true }, { label: 'Media errors', num: true },
+          { label: 'Warning' }],
+        rows: drives.map((d) => ({
+          cells: [d.model || d.device, d.interface, opt(d.power_on_hours), opt(d.percentage_used, '%'),
+            opt(d.available_spare_pct, '%'), opt(d.media_errors),
+            d.critical_warning === null || d.critical_warning === undefined
+              ? null
+              : d.critical_warning === 0 ? 'none' : `0x${d.critical_warning.toString(16).padStart(2, '0')}`],
+        })),
+      }),
+    ])
+    : null;
+
   const measurementCard = el('div', { class: 'card col-12' }, [
     el('div', { class: 'card-head' }, [el('h3', { text: 'Measurements' })]),
     el('p', {
@@ -1463,7 +1510,8 @@ export async function renderMachine(main, key) {
       type: 'button', class: 'link-button', text: '← All machines',
       onclick: () => writeHash({ view: 'machines', key: null }),
     })]),
-    el('div', { class: 'grid' }, [head, heroCard, historyCard, componentCard, flagCard, measurementCard]),
+    el('div', { class: 'grid' }, [head, heroCard, historyCard, componentCard, flagCard, driveCard, measurementCard]
+      .filter(Boolean)),
   );
 }
 

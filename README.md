@@ -469,6 +469,9 @@ resets when they're reimaged" is something an estate owner should know.
 - [x] Red flags: low grades, cohort outliers, regressions, weak components, thermal
       limits, forced runs, partial runs, RAM-backed disk targets, battery wear,
       stale results, weak identity
+- [x] Drive health, nearly full disks and out-of-date firmware, from what
+      loadbearer 1.6.0 already records — see [Drives, free space and
+      firmware](#drives-free-space-and-firmware)
 - [x] Web UI: executive summary, cohort explorer, machine table, machine drilldown
       with history — see [The dashboard](#the-dashboard)
 - [x] Entra ID / OIDC SSO with PKCE, roles from group claims, tag-scoped
@@ -520,13 +523,13 @@ means an estate owner reads a thermal caveat as a failing asset:
 
 | Queue | Means | Examples |
 | --- | --- | --- |
-| **machine** | a hardware decision — repair, replace, reassign | low grade, cohort outlier, regression, one weak component, worn battery |
+| **machine** | a hardware decision — repair, replace, reassign | low grade, cohort outlier, regression, one weak component, worn battery, failing or worn drive, media errors, nearly full disk, firmware behind its peers or simply old |
 | **measurement** | the number can't be trusted until collection is fixed | thermally limited, run on battery, held back by its power settings, partial run, RAM-backed disk target, unstable CPU timings |
 | **coverage** | about the data we hold, not about the machine | stale result, attributed by hostname only, no peer group |
 
 Every threshold lives in one struct with its reasoning attached, so tuning the
-engine is a config change rather than a code read. All fourteen rules, what
-fires each one and every threshold with its default are in
+engine is a config change rather than a code read. Every rule, what fires
+each one and every threshold with its default are in
 [Findings](https://github.com/issinoho/loadbearer-fleet/wiki/Findings).
 
 ### Head to head, when the estate view isn't the question
@@ -599,6 +602,45 @@ is flagged **held back by its power settings**; a drop in score on such a run
 is reported as a warning to re-measure rather than a critical regression.
 Older runs record none of it.
 
+### Drives, free space and firmware
+
+loadbearer 1.6.0 and later, run with admin or root, record health counters for
+every drive they can query, and the firmware's version and date. The machine
+page lists the drives — hours, wear, spare, media errors and the drive's own
+warning — and six findings in the **machine** queue read them:
+
+- **A drive reporting a critical warning** is critical: that is the drive
+  itself saying it is in trouble (spare exhausted, overheating, reliability
+  degraded, gone read-only), not an inference from a slow run. Back it up and
+  replace it.
+- **Media errors** — reads the drive could not correct — are a warning from
+  the first one.
+- **A worn drive** is a warning at 80% of its rated endurance used, or below
+  20% spare, and critical at 100%. The endurance figure is the vendor's
+  estimate, not a failure prediction, and can pass 100. A drive that reports
+  no wear figure — most hard disks, some SATA SSDs — is never guessed at.
+- **A nearly full disk** — the fixed volume with the least free space, as a
+  share of its size — is a warning under 10% free and critical under 5%.
+  Percentage rather than bytes on purpose: an SSD slows as it fills whatever
+  its size. Removable media and volumes under 8 GiB (EFI and recovery
+  partitions, loop mounts) are left out; this one reads `machine.disks`, so
+  it works on results from any version.
+- **Firmware behind its peers** is informational: among machines of the same
+  system model, one whose BIOS is at least 90 days older than the newest seen
+  on that model. It names both versions and dates, so it reads as "this
+  update exists and other machines here already have it". Like a cohort
+  median, the newest firmware is worked out across the whole estate rather
+  than the filtered view. Where there is no peer to compare against,
+  **old firmware** — more than four years older than the run — is named
+  instead.
+
+Every drive is judged, not just the boot drive, with one finding per rule per
+machine naming the worst. Unsafe-shutdown counts are recorded and shown but
+never flagged: a healthy laptop collects hundreds from lid closes and flat
+batteries. An index from an earlier version gains all of this on open, empty
+for the runs it already holds — `scan --reindex` fills them in from the
+documents.
+
 ## The dashboard
 
 ```
@@ -610,7 +652,8 @@ Scans the folder, then serves four views on `127.0.0.1:8787`: an executive
 queue, score spread, and the ranked list of what to look at), a **cohort
 explorer** (each machine against the median of the machines like it), a sortable
 **machine table**, and a **drilldown** per machine with its score history, its
-components, its findings in full, and every subtest of its latest run.
+components, its findings in full, its drives, and every subtest of its latest
+run.
 
 `POST /api/rescan` — the Rescan button — re-reads the folder. `GET /api/snapshot`
 returns exactly what the dashboard draws, so any view can be scripted or

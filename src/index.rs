@@ -181,6 +181,14 @@ fn content_hash(text: &str) -> String {
         .collect()
 }
 
+/// A document's `u64` as SQLite's signed integer. NVMe counters are 128-bit on
+/// the wire and truncated by loadbearer, so a corrupt or hostile one can be
+/// anything; pinning it at the top is still "a very large number" rather than
+/// a negative one or a failed ingest.
+fn saturating(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
 /// Columns added to an existing index in place.
 ///
 /// Deliberately *not* an `INDEX_VERSION` bump. A version change moves the old
@@ -194,7 +202,7 @@ fn content_hash(text: &str) -> String {
 /// Rows written before the column existed keep `NULL`, which is the honest
 /// answer — see `scan --reindex` for filling them in from the documents.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    const ADDED: [(&str, &str, &str); 17] = [
+    const ADDED: [(&str, &str, &str); 22] = [
         ("subtest", "label", "TEXT"),
         ("subtest", "direction", "TEXT"),
         // Component ids are short and lower-case — `cpu`, `memory` — so a
@@ -225,6 +233,18 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         ("run", "power_plan", "TEXT"),
         ("run", "power_mode", "TEXT"),
         ("run", "power_held_back", "TEXT"),
+        // The firmware's own version and date, from `machine.firmware`
+        // (1.6.0+), for comparing a machine with others of its model.
+        // `firmware_dated` above is the age estimate's month, not this.
+        ("run", "bios_version", "TEXT"),
+        ("run", "bios_date", "TEXT"),
+        // The fixed volume with the lowest free percentage — see
+        // `Machine::fullest_fixed_volume`. Unlike the columns above, every
+        // document version carries `machine.disks`, so a reindex fills these
+        // in for old runs too.
+        ("run", "disk_low_mount", "TEXT"),
+        ("run", "disk_low_free_pct", "REAL"),
+        ("run", "disk_low_free_bytes", "INTEGER"),
     ];
 
     for (table, column, decl) in ADDED {
@@ -605,7 +625,32 @@ impl Index {
                  value  TEXT NOT NULL,
                  PRIMARY KEY (run_id, key)
              );
-             CREATE INDEX IF NOT EXISTS tag_lookup ON tag(key, value);",
+             CREATE INDEX IF NOT EXISTS tag_lookup ON tag(key, value);
+
+             -- Every drive's health counters, from loadbearer 1.6.0's
+             -- `machine.drives`; the `run` table keeps only the first one's,
+             -- for the age line. Added after the fact, and `IF NOT EXISTS`
+             -- is what gives an existing index the table without a format
+             -- bump: its older runs simply have no rows here until
+             -- `scan --reindex`.
+             CREATE TABLE IF NOT EXISTS drive (
+                 run_id              INTEGER NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+                 -- Order in the document: on Windows the physical drive
+                 -- number, on Linux NVMe first. 0 is usually the boot drive.
+                 position            INTEGER NOT NULL,
+                 device              TEXT NOT NULL,
+                 interface           TEXT NOT NULL,
+                 model               TEXT,
+                 power_on_hours      INTEGER NOT NULL,
+                 power_cycles        INTEGER,
+                 unsafe_shutdowns    INTEGER,
+                 percentage_used     INTEGER,
+                 available_spare_pct INTEGER,
+                 data_written_tb     REAL,
+                 media_errors        INTEGER,
+                 critical_warning    INTEGER,
+                 PRIMARY KEY (run_id, position)
+             );",
         )?;
         add_missing_columns(&conn)?;
         conn.pragma_update(None, "user_version", INDEX_VERSION)?;
@@ -763,8 +808,8 @@ impl Index {
     pub fn reingest_file(&mut self, path: &Path) -> Result<bool> {
         let text = read_document(path)?;
         let hash = content_hash(&text);
-        // Children go with it: `run` is the parent of component, subtest and
-        // tag, all with ON DELETE CASCADE.
+        // Children go with it: `run` is the parent of component, subtest, tag
+        // and drive, all with ON DELETE CASCADE.
         self.conn
             .execute("DELETE FROM run WHERE content_hash = ?1", params![hash])?;
         self.ingest_text(&text, path)
@@ -843,6 +888,8 @@ impl Index {
         let age = doc.machine.age.clone().unwrap_or_default();
         let drive = doc.machine.drives.first();
         let power = doc.machine.power.clone().unwrap_or_default();
+        let firmware = doc.machine.firmware.clone().unwrap_or_default();
+        let fullest = doc.machine.fullest_fixed_volume();
         let tx = self.conn.transaction()?;
 
         tx.execute(
@@ -854,10 +901,11 @@ impl Index {
                  content_hash, system_model, cpu_family, cpu_launched, max_age_months,
                  firmware_dated, firmware_likely_original, drive_power_on_hours,
                  drive_wear_pct, drive_hours_undercounted, power_plan, power_mode,
-                 power_held_back, ingested_at
+                 power_held_back, bios_version, bios_date, disk_low_mount,
+                 disk_low_free_pct, disk_low_free_bytes, ingested_at
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
                        ?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,
-                       ?35,?36,?37,?38, datetime('now'))",
+                       ?35,?36,?37,?38,?39,?40,?41,?42,?43, datetime('now'))",
             params![
                 key.value,
                 key.kind.as_str(),
@@ -897,9 +945,39 @@ impl Index {
                 power.plan,
                 power.mode_in_force(),
                 Some(power.held_back.join(" | ")).filter(|h| !h.is_empty()),
+                firmware.bios_version,
+                firmware.bios_date,
+                fullest.map(|(d, _)| d.mount_point.as_str()),
+                fullest.map(|(_, pct)| pct),
+                fullest.map(|(d, _)| saturating(d.available_bytes)),
             ],
         )?;
         let run_id = tx.last_insert_rowid();
+
+        for (position, d) in doc.machine.drives.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO drive
+                   (run_id, position, device, interface, model, power_on_hours, power_cycles,
+                    unsafe_shutdowns, percentage_used, available_spare_pct, data_written_tb,
+                    media_errors, critical_warning)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    run_id,
+                    position as i64,
+                    d.device,
+                    d.interface,
+                    d.model.as_deref().map(str::trim).filter(|m| !m.is_empty()),
+                    saturating(d.power_on_hours),
+                    d.power_cycles.map(saturating),
+                    d.unsafe_shutdowns.map(saturating),
+                    d.percentage_used,
+                    d.available_spare_pct,
+                    d.data_written_tb,
+                    d.media_errors.map(saturating),
+                    d.critical_warning,
+                ],
+            )?;
+        }
 
         for c in &doc.components {
             tx.execute(
@@ -1047,7 +1125,7 @@ impl Index {
         }
 
         // The child tables declare ON DELETE CASCADE and `foreign_keys` is on,
-        // so components, subtests and tags go with their runs.
+        // so components, subtests, tags and drives go with their runs.
         let removed = self
             .conn
             .execute("DELETE FROM run WHERE machine_key = ?1", [key])?;
@@ -1463,6 +1541,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The real fixture with loadbearer 1.6.0's firmware and two drives added,
+    /// since none of the fixtures was taken with admin rights on 1.6.0.
+    fn with_drives() -> String {
+        let text = std::fs::read_to_string(fixture("win-modern.json")).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        doc["machine"]["firmware"] = serde_json::json!({
+            "system_vendor": "LENOVO", "system_model": "20XW004BUK",
+            "bios_version": "N32ET91W (1.67)", "bios_date": "2025-06-01"
+        });
+        doc["machine"]["drives"] = serde_json::json!([
+            {"device": "PhysicalDrive0", "interface": "nvme", "model": "  Boot SSD  ",
+             "power_on_hours": 12881, "unsafe_shutdowns": 195, "percentage_used": 19,
+             "available_spare_pct": 100, "media_errors": 0, "critical_warning": 0},
+            {"device": "PhysicalDrive1", "interface": "sata", "power_on_hours": 40000}
+        ]);
+        doc.to_string()
+    }
+
+    fn drive_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM drive", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn every_drive_and_the_firmware_are_indexed() {
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.ingest_text(&with_drives(), Path::new("x.json"))
+            .unwrap();
+        let rows: Vec<(i64, String, Option<String>, Option<i64>)> = idx
+            .conn
+            .prepare(
+                "SELECT position, device, model, unsafe_shutdowns FROM drive ORDER BY position",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (
+                    0,
+                    "PhysicalDrive0".to_string(),
+                    Some("Boot SSD".to_string()),
+                    Some(195)
+                ),
+                (1, "PhysicalDrive1".to_string(), None, None),
+            ]
+        );
+        let (version, date, mount): (Option<String>, Option<String>, Option<String>) = idx
+            .conn
+            .query_row(
+                "SELECT bios_version, bios_date, disk_low_mount FROM run",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(version.as_deref(), Some("N32ET91W (1.67)"));
+        assert_eq!(date.as_deref(), Some("2025-06-01"));
+        // The fixture's C:\ is 29% free and D:\ 80%.
+        assert_eq!(mount.as_deref(), Some("C:\\"));
+    }
+
+    /// The same additive migration as the columns above, for a whole table:
+    /// an index from before it gains the table and the columns on open, keeps
+    /// its runs, and has nothing in them until a reindex.
+    #[test]
+    fn an_older_index_gains_the_drive_table_and_firmware_columns() {
+        let dir = scratch("migrate-drives");
+        let db = dir.join("i.db");
+        let collection = dir.join("collection");
+        std::fs::create_dir_all(&collection).unwrap();
+        std::fs::write(collection.join("x1.json"), with_drives()).unwrap();
+
+        // What an index written by 0.9.0 looks like.
+        {
+            let mut idx = Index::open(&db).unwrap();
+            idx.scan(&collection).unwrap();
+            idx.conn
+                .execute_batch(
+                    "DROP TABLE drive;
+                     ALTER TABLE run DROP COLUMN bios_version;
+                     ALTER TABLE run DROP COLUMN bios_date;
+                     ALTER TABLE run DROP COLUMN disk_low_mount;
+                     ALTER TABLE run DROP COLUMN disk_low_free_pct;
+                     ALTER TABLE run DROP COLUMN disk_low_free_bytes;",
+                )
+                .unwrap();
+        }
+
+        let mut idx = Index::open(&db).unwrap();
+        assert_eq!(idx.run_count().unwrap(), 1, "the history is kept");
+        assert_eq!(drive_rows(&idx.conn), 0, "the table is back, and empty");
+        let date: Option<String> = idx
+            .conn
+            .query_row("SELECT bios_date FROM run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(date, None);
+
+        idx.scan(&collection).unwrap();
+        assert_eq!(drive_rows(&idx.conn), 0, "a plain rescan cannot fill it");
+
+        idx.rescan_all(&collection).unwrap();
+        assert_eq!(drive_rows(&idx.conn), 2);
+        let date: Option<String> = idx
+            .conn
+            .query_row("SELECT bios_date FROM run", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(date.as_deref(), Some("2025-06-01"));
+        assert_eq!(idx.run_count().unwrap(), 1, "and not duplicated");
+
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_a_machine_takes_its_drive_rows() {
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.ingest_text(&with_drives(), Path::new("x.json"))
+            .unwrap();
+        idx.ingest_file(&fixture("low-end.json")).unwrap();
+        assert_eq!(drive_rows(&idx.conn), 2);
+
+        let key = idx.machines_matching("FLEET-WIN-01").unwrap()[0]
+            .key
+            .clone();
+        idx.forget(&key).unwrap();
+        assert_eq!(drive_rows(&idx.conn), 0);
+        assert_eq!(idx.run_count().unwrap(), 1);
+    }
+
     /// A scan only ever adds, so removing a machine has to be asked for. This
     /// checks the whole of it goes: runs, and the rows that hang off them.
     #[test]
@@ -1488,7 +1698,7 @@ mod tests {
 
         // The cascade is the part worth asserting: components, subtests and
         // tags are separate tables and could easily be orphaned.
-        for table in ["component", "subtest", "tag"] {
+        for table in ["component", "subtest", "tag", "drive"] {
             let orphans: i64 = idx
                 .conn
                 .query_row(

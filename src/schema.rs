@@ -300,6 +300,35 @@ pub struct Disk {
     pub total_bytes: u64,
     #[serde(default)]
     pub available_bytes: u64,
+    /// A USB stick or card reader. Present in every version so far, but
+    /// defaulted rather than required — the reader tolerates its absence.
+    #[serde(default)]
+    pub removable: bool,
+}
+
+/// Smaller than this is not a volume anyone stores work on: an EFI system
+/// partition, a recovery partition, a snap's loop mount, a RAM-backed `/tmp`.
+/// Those run nearly full by design, so judging free space on them would flag
+/// every machine in the estate.
+pub const MIN_FIXED_VOLUME_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+impl Machine {
+    /// The fixed volume with the least free space as a share of its size —
+    /// the one a "disk nearly full" finding is about. Removable media and
+    /// anything under [`MIN_FIXED_VOLUME_BYTES`] are left out.
+    ///
+    /// Ties keep the first listed, so the answer doesn't depend on anything
+    /// but the document.
+    pub fn fullest_fixed_volume(&self) -> Option<(&Disk, f64)> {
+        self.disks
+            .iter()
+            .filter(|d| !d.removable && d.total_bytes >= MIN_FIXED_VOLUME_BYTES)
+            .map(|d| (d, d.available_bytes as f64 / d.total_bytes as f64 * 100.0))
+            .fold(None, |best: Option<(&Disk, f64)>, (d, pct)| match best {
+                Some((_, b)) if b <= pct => best,
+                _ => Some((d, pct)),
+            })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
