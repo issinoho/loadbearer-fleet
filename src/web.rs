@@ -368,6 +368,24 @@ struct FilterParams {
     model: Option<String>,
     cpu: Option<String>,
     os: Option<String>,
+    /// `replace`, `repair`, `investigate`, `watch` or `keep`.
+    #[serde(default, deserialize_with = "verdict_param")]
+    lifecycle: Option<analytics::Verdict>,
+}
+
+/// `lifecycle=` as a closed set: empty is no filter, as every other parameter
+/// here treats it, and anything else that is not a verdict fails the query's
+/// own deserialisation — a 400 naming the five, the same answer a
+/// `since_days=soon` gets. Unlike `flag`, whose codes are an open set that a
+/// fleet simply may not carry, a misspelt verdict can only be a mistake, and an
+/// empty fleet would read as an answer.
+fn verdict_param<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<analytics::Verdict>, D::Error> {
+    match Option::<String>::deserialize(d)?.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(v) => v.parse().map(Some).map_err(serde::de::Error::custom),
+    }
 }
 
 impl FilterParams {
@@ -392,6 +410,7 @@ impl FilterParams {
             os: self.os.filter(|s| !s.is_empty()),
             search: self.q.filter(|s| !s.trim().is_empty()),
             flag: self.flag.filter(|s| !s.is_empty()),
+            lifecycle: self.lifecycle,
             scopes: Vec::new(),
         }
     }
@@ -2522,6 +2541,117 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    /// `lifecycle=` narrows like every other filter parameter — in the
+    /// snapshot, the groups and the timeline alike — and like them it cannot
+    /// reach past the caller's scope. The fixtures' verdicts: three machines
+    /// to watch, two of them in Edinburgh, and Glasgow's one to keep.
+    #[tokio::test]
+    async fn the_lifecycle_filter_narrows_and_cannot_widen_a_scoped_view() {
+        let state = state_for(&oidc_config());
+        let admin = session(&state, Role::Admin, &[]);
+        let glasgow = session(&state, Role::Viewer, &[&[("site", "glasgow")]]);
+
+        let all = get(&state, "/api/snapshot", Some(&admin)).await.json();
+        let counts = &all["summary"]["lifecycle"];
+        assert_eq!(counts["watch"], 3, "{counts}");
+        assert_eq!(counts["keep"], 1, "{counts}");
+
+        let watch = get(&state, "/api/snapshot?lifecycle=watch", Some(&admin))
+            .await
+            .json();
+        assert_eq!(watch["summary"]["machines"], 3);
+        for m in watch["machines"].as_array().expect("machines") {
+            assert_eq!(m["lifecycle"]["verdict"], "watch", "{m}");
+        }
+        assert_eq!(watch["summary"]["lifecycle"]["keep"], 0);
+        let grouped = get(
+            &state,
+            "/api/groups?by=tag:site&lifecycle=watch",
+            Some(&admin),
+        )
+        .await;
+        assert_eq!(grouped.status, StatusCode::OK, "{}", grouped.body);
+        assert_eq!(grouped.json()["machines"], 3);
+
+        // Glasgow's only machine is one to keep, so asking for the machines
+        // to watch — of which there are three elsewhere — is an empty view,
+        // not those three.
+        let mine = get(&state, "/api/snapshot?lifecycle=watch", Some(&glasgow))
+            .await
+            .json();
+        assert_eq!(mine["summary"]["machines"], 0);
+        assert_eq!(mine["flags"].as_array().expect("flags").len(), 0);
+        let elsewhere = get(
+            &state,
+            "/api/snapshot?lifecycle=watch&tags=site%3Dedinburgh",
+            Some(&glasgow),
+        )
+        .await
+        .json();
+        assert_eq!(elsewhere["summary"]["machines"], 0);
+        let kept = get(&state, "/api/snapshot?lifecycle=keep", Some(&glasgow))
+            .await
+            .json();
+        assert_eq!(kept["summary"]["machines"], 1);
+        assert_eq!(kept["machines"][0]["tags"]["site"], "glasgow");
+        let over_time = get(&state, "/api/timeline?lifecycle=watch", Some(&glasgow)).await;
+        assert_eq!(over_time.status, StatusCode::OK, "{}", over_time.body);
+        assert!(
+            over_time.json()["points"]
+                .as_array()
+                .expect("points")
+                .iter()
+                .all(|p| p["machines"] == 0),
+            "nobody in view, at any point"
+        );
+
+        // The verdict rides on the drilldown too.
+        let key = kept["machines"][0]["key"]
+            .as_str()
+            .expect("key")
+            .to_string();
+        let one = get(&state, &format!("/api/machine/{key}"), Some(&glasgow))
+            .await
+            .json();
+        assert_eq!(one["machine"]["lifecycle"]["verdict"], "keep");
+    }
+
+    /// A verdict is a closed set, so a misspelt one is refused with the five
+    /// that exist — the same 400 a non-numeric `since_days` gets, and for the
+    /// same reason: an empty fleet in reply would read as an answer. Empty
+    /// means no filter, as it does for every other parameter.
+    #[tokio::test]
+    async fn an_unknown_lifecycle_verdict_is_a_bad_request() {
+        let state = state_for(&oidc_config());
+        let cookie = session(&state, Role::Viewer, &[]);
+        for uri in [
+            "/api/snapshot?lifecycle=retire",
+            "/api/snapshot?lifecycle=Replace",
+            "/api/groups?lifecycle=retire",
+            "/api/timeline?lifecycle=retire",
+            "/api/changes?lifecycle=retire",
+        ] {
+            let r = get(&state, uri, Some(&cookie)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.body);
+            assert!(
+                r.body
+                    .contains("replace, repair, investigate, watch or keep"),
+                "{uri} said: {}",
+                r.body
+            );
+        }
+        let bad_number = get(&state, "/api/snapshot?since_days=soon", Some(&cookie)).await;
+        assert_eq!(
+            bad_number.status,
+            StatusCode::BAD_REQUEST,
+            "the precedent: {}",
+            bad_number.body
+        );
+        let empty = get(&state, "/api/snapshot?lifecycle=", Some(&cookie)).await;
+        assert_eq!(empty.status, StatusCode::OK, "{}", empty.body);
+        assert_eq!(empty.json()["summary"]["machines"], 4);
     }
 
     /// A dimension that cannot mean anything is the caller's mistake, and an

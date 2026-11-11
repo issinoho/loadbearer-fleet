@@ -61,6 +61,40 @@
 //! was at earlier dates from the runs the index already holds, through the same
 //! rules — see its module notes for why it is reconstructed rather than
 //! recorded, and what that costs.
+//!
+//! ## What to do about it
+//!
+//! Findings say what is wrong; an estate owner's next question is which
+//! decision follows, and the decisions differ in kind and in cost. So every
+//! machine also gets a **lifecycle** verdict (`lifecycle`): *replace* it,
+//! *repair* a part, *investigate* why it is slower than its own hardware should
+//! be, *watch* it, or *keep* it. It is a short rule over evidence the snapshot
+//! already holds — the findings `evaluate` raised and the best estimate of the
+//! machine's age — never a score, and it carries the sentences that fired it.
+//! First match wins:
+//!
+//! 1. **replace** — graded F; or old *and* either graded D or F or with a part
+//!    problem.
+//! 2. **repair** — a part problem on a machine that is neither: a part, not a
+//!    platform.
+//! 3. **investigate** — slower than identical machines or than its own past. It
+//!    should be faster than it is, and finding out why is cheaper than buying.
+//! 4. **watch** — old, or graded D.
+//! 5. **keep** — none of those.
+//!
+//! Two consequences are deliberate. **Age alone is not a reason to buy**: an old
+//! machine that still performs and whose parts are sound is *watch*, not
+//! *replace*. And **an F is against the reference baseline**, so *replace* for
+//! a grade means "inadequate against that reference", which an estate with
+//! modest needs may reasonably disagree with — the reason says so in as many
+//! words, rather than dressing it up as a fault.
+//!
+//! A verdict that leans on a performance figure is marked uncertain when the
+//! same run carries a measurement caveat — throttled, on battery, held back,
+//! partial, RAM-backed — because the measurement condemning the machine may be
+//! the thing that is wrong. One resting only on age and on parts that report
+//! their own condition is not; a weak component is read off the benchmark, so
+//! it counts as a performance figure here.
 
 mod timeline;
 
@@ -141,6 +175,11 @@ pub struct Thresholds {
     /// Firmware older than this at the time of the run is named even when no
     /// peer of the same model shows a newer one.
     pub firmware_old_years: f64,
+    /// A machine at least this old, by the best estimate of its age today, is
+    /// *old* for the lifecycle verdict. Five years is the usual depreciation and
+    /// warranty horizon for a business PC — and old on its own only ever makes
+    /// a machine one to watch; see the module notes.
+    pub replace_age_years: f64,
 }
 
 impl Default for Thresholds {
@@ -160,6 +199,7 @@ impl Default for Thresholds {
             disk_free_critical_pct: 5.0,
             firmware_behind_days: 90.0,
             firmware_old_years: 4.0,
+            replace_age_years: 5.0,
         }
     }
 }
@@ -434,6 +474,9 @@ pub struct MachineView {
     /// to the snapshot. The field to rank or compare machines by — unlike
     /// `max_age_months` it doesn't depend on when each was last measured.
     pub max_age_months_now: Option<i64>,
+    /// The best estimate of the machine's age today, and what kind of
+    /// estimate it is — see `best_age`. `None` when nothing dates it.
+    pub age_estimate: Option<AgeEstimate>,
     /// The power plan's name (Windows), in the machine's language.
     pub power_plan: Option<String>,
     /// The power mode for the source the run was on (Windows), or the
@@ -457,6 +500,11 @@ pub struct MachineView {
     /// gets them from `detail` instead.
     #[serde(skip)]
     pub drives: Vec<DriveView>,
+    /// The highest `percentage_used` across every drive of the latest run, or
+    /// the boot drive's from the age evidence where no drive table was
+    /// recorded. The one drive figure the snapshot carries, since `drives`
+    /// itself stays out of it.
+    pub worst_drive_wear_pct: Option<i64>,
     pub low_confidence_cpu_subtests: i64,
     pub tags: BTreeMap<String, String>,
     pub components: Vec<ComponentView>,
@@ -466,8 +514,313 @@ pub struct MachineView {
     /// Percentage difference from the median of this machine's own earlier
     /// comparable runs. Negative is a regression.
     pub trend_pct: Option<f64>,
+    /// What to do about the machine. Set by `assess`, from its findings.
+    pub lifecycle: Lifecycle,
     pub run_id: i64,
     pub source_path: String,
+}
+
+/// What a machine's age estimate rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgeBasis {
+    /// The CPU's launch: the machine cannot be older, and may be years
+    /// younger — a CPU stays on sale long after it launches.
+    UpperBound,
+    /// Firmware loadbearer judged to be as shipped: the machine dates from
+    /// about then. Closer than the bound, and only ever inside it.
+    Firmware,
+}
+
+/// The best estimate of how old a machine is today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AgeEstimate {
+    pub months: i64,
+    pub basis: AgeBasis,
+}
+
+impl AgeEstimate {
+    pub fn years(&self) -> f64 {
+        self.months as f64 / 12.0
+    }
+
+    /// "At most 6.2 years old, by its CPU's launch date" — the wording says
+    /// which kind of figure it is, because a bound read as a dating makes a
+    /// three-year-old machine sound six.
+    pub fn sentence(&self) -> String {
+        match self.basis {
+            AgeBasis::UpperBound => format!(
+                "At most {:.1} years old, by its CPU's launch date",
+                self.years()
+            ),
+            AgeBasis::Firmware => format!(
+                "About {:.1} years old, by its original firmware's date",
+                self.years()
+            ),
+        }
+    }
+}
+
+/// The best estimate of a machine's age at `now` that the evidence supports.
+///
+/// Two sources, and they are different kinds of answer. The CPU's launch is an
+/// **upper bound**: the machine was built that month or later. Firmware that
+/// loadbearer judged likely to be as shipped is a **dating**: the machine is
+/// about that old. The dating wins when there is one — it is the closer of the
+/// two — but only inside the bound, since a machine cannot predate its own CPU
+/// and a firmware date that says otherwise is the firmware being wrong. With
+/// neither, there is no estimate at all; nothing here guesses.
+///
+/// The firmware's month comes from the age evidence where loadbearer recorded
+/// it, and from the BIOS date otherwise; "likely original" is only ever
+/// recorded alongside the first, so in practice that is what dates a machine.
+pub fn best_age(
+    cpu_launched: Option<&str>,
+    firmware_dated: Option<&str>,
+    firmware_likely_original: Option<bool>,
+    now: OffsetDateTime,
+) -> Option<AgeEstimate> {
+    let bound = cpu_launched.and_then(|l| months_since(l, now));
+    let dated = firmware_dated
+        .filter(|_| firmware_likely_original == Some(true))
+        .and_then(|d| months_since(d, now))
+        .filter(|d| bound.is_none_or(|b| *d <= b));
+    match (dated, bound) {
+        (Some(months), _) => Some(AgeEstimate {
+            months,
+            basis: AgeBasis::Firmware,
+        }),
+        (None, Some(months)) => Some(AgeEstimate {
+            months,
+            basis: AgeBasis::UpperBound,
+        }),
+        (None, None) => None,
+    }
+}
+
+/// The decision a machine calls for. Ordered most to least urgent, which is
+/// the order every list of them is shown in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    Replace,
+    Repair,
+    Investigate,
+    Watch,
+    #[default]
+    Keep,
+}
+
+impl Verdict {
+    pub const ALL: [Verdict; 5] = [
+        Verdict::Replace,
+        Verdict::Repair,
+        Verdict::Investigate,
+        Verdict::Watch,
+        Verdict::Keep,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Replace => "replace",
+            Verdict::Repair => "repair",
+            Verdict::Investigate => "investigate",
+            Verdict::Watch => "watch",
+            Verdict::Keep => "keep",
+        }
+    }
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Verdict {
+    type Err = String;
+
+    /// Refused rather than read as "no filter": a misspelt decision answered
+    /// with the whole fleet, or with nothing, would read as an answer.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Verdict::ALL
+            .into_iter()
+            .find(|v| v.as_str() == s.trim())
+            .ok_or_else(|| {
+                format!(
+                    "{s:?} is not a lifecycle decision. Use replace, repair, investigate, watch \
+                     or keep"
+                )
+            })
+    }
+}
+
+/// A machine's lifecycle verdict and why.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Lifecycle {
+    pub verdict: Verdict,
+    /// One short sentence per piece of evidence, the ones that decided the
+    /// verdict first. Empty for `keep`, which by construction has none.
+    pub reasons: Vec<String>,
+    /// The verdict leans on a performance figure from a run that carries a
+    /// measurement caveat: re-measure before acting on it.
+    pub uncertain: bool,
+    /// Those caveats, by headline. Empty unless `uncertain`.
+    pub caveats: Vec<String>,
+}
+
+/// Findings that name a part: something to fix or swap rather than a reason
+/// to retire the platform. Not a nearly full disk, which is housekeeping, and
+/// not firmware, which is an update.
+const PART_FINDINGS: [&str; 5] = [
+    "battery_worn",
+    "drive_failing",
+    "drive_media_errors",
+    "drive_worn",
+    "component_weak",
+];
+
+/// The one part finding that comes from a benchmark figure rather than from
+/// the part reporting on itself — see `Evidence::verdict`.
+const MEASURED_PART: &str = "component_weak";
+
+/// Findings that say the machine is slower than its own hardware should be.
+const UNDERPERFORMING: [&str; 2] = ["cohort_outlier", "regressed"];
+
+/// What a lifecycle verdict is drawn from. The findings rather than the
+/// figures behind them, so each threshold lives in one place — `evaluate` —
+/// and a verdict can never disagree with the finding it quotes.
+struct Evidence<'a> {
+    /// `grade_low` at critical: an F.
+    failing: Option<&'a Flag>,
+    /// `grade_low` at warning: a D.
+    low: Option<&'a Flag>,
+    old: Option<AgeEstimate>,
+    parts: Vec<&'a Flag>,
+    under: Vec<&'a Flag>,
+    /// Measurement-queue findings that need attention.
+    caveats: Vec<&'a Flag>,
+}
+
+impl Evidence<'_> {
+    /// The rule. `performance: false` judges the machine as if no performance
+    /// figure existed, which is how `uncertain` asks whether one mattered.
+    fn verdict(&self, performance: bool) -> Verdict {
+        let failing = performance && self.failing.is_some();
+        let slow = failing || (performance && self.low.is_some());
+        let under = performance && !self.under.is_empty();
+        let old = self.old.is_some();
+        // A weak component is a part finding read off the benchmark: the
+        // drive's own counters and the battery's capacity stand whatever the
+        // run measured, but a disk graded F on a throttled or partial run is
+        // the same doubtful figure as a low overall grade.
+        let parts = self
+            .parts
+            .iter()
+            .any(|f| performance || f.code != MEASURED_PART);
+        if failing || (old && (slow || parts)) {
+            Verdict::Replace
+        } else if parts {
+            Verdict::Repair
+        } else if under {
+            Verdict::Investigate
+        } else if old || slow {
+            Verdict::Watch
+        } else {
+            Verdict::Keep
+        }
+    }
+}
+
+/// A machine's lifecycle verdict, from its own findings and its age.
+fn lifecycle(m: &MachineView, flags: &[&Flag], th: &Thresholds) -> Lifecycle {
+    let grade = flags.iter().copied().find(|f| f.code == "grade_low");
+    let e = Evidence {
+        failing: grade.filter(|f| f.severity == Severity::Critical),
+        low: grade.filter(|f| f.severity != Severity::Critical),
+        old: m
+            .age_estimate
+            .filter(|a| a.months as f64 >= th.replace_age_years * 12.0),
+        parts: flags
+            .iter()
+            .copied()
+            .filter(|f| PART_FINDINGS.contains(&f.code))
+            .collect(),
+        under: flags
+            .iter()
+            .copied()
+            .filter(|f| UNDERPERFORMING.contains(&f.code))
+            .collect(),
+        caveats: flags
+            .iter()
+            .copied()
+            .filter(|f| f.kind == FlagKind::Measurement && needs_attention(f.severity))
+            .collect(),
+    };
+    let verdict = e.verdict(true);
+
+    // Every piece of evidence present, in one fixed order, with whichever
+    // decided the verdict moved to the front: the reader sees why first, and
+    // then what else is true of the machine — a worn battery is worth knowing
+    // about on a machine being investigated, if only so it is fixed at the
+    // same visit.
+    let headline = |f: &&Flag| f.headline.clone();
+    let mut groups: Vec<(u8, Vec<String>)> = vec![
+        (0, e.failing.iter().map(headline).collect()),
+        (1, e.old.iter().map(AgeEstimate::sentence).collect()),
+        (2, e.low.iter().map(headline).collect()),
+        (3, e.parts.iter().map(headline).collect()),
+        (4, e.under.iter().map(headline).collect()),
+    ];
+    let first = match verdict {
+        Verdict::Replace if e.failing.is_some() => 0,
+        Verdict::Replace | Verdict::Watch if e.old.is_some() => 1,
+        Verdict::Watch => 2,
+        Verdict::Repair => 3,
+        Verdict::Investigate => 4,
+        _ => 0,
+    };
+    groups.sort_by_key(|(g, _)| *g != first);
+    let reasons = groups.into_iter().flat_map(|(_, r)| r).collect();
+
+    let uncertain = !e.caveats.is_empty() && e.verdict(false) != verdict;
+    Lifecycle {
+        verdict,
+        reasons,
+        uncertain,
+        caveats: if uncertain {
+            e.caveats.iter().map(headline).collect()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// Machines per lifecycle verdict. Always adds up to the machines it was
+/// counted over.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct LifecycleCounts {
+    pub replace: usize,
+    pub repair: usize,
+    pub investigate: usize,
+    pub watch: usize,
+    pub keep: usize,
+}
+
+impl LifecycleCounts {
+    fn of<'a>(machines: impl IntoIterator<Item = &'a MachineView>) -> Self {
+        let mut c = Self::default();
+        for m in machines {
+            *match m.lifecycle.verdict {
+                Verdict::Replace => &mut c.replace,
+                Verdict::Repair => &mut c.repair,
+                Verdict::Investigate => &mut c.investigate,
+                Verdict::Watch => &mut c.watch,
+                Verdict::Keep => &mut c.keep,
+            } += 1;
+        }
+        c
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -521,6 +874,8 @@ pub struct Summary {
     /// Configurations present across the fleet. More than one means part of the
     /// estate cannot be compared with the rest.
     pub configurations: Vec<(String, usize)>,
+    /// Machines per lifecycle verdict; adds up to `machines`.
+    pub lifecycle: LifecycleCounts,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -794,6 +1149,16 @@ fn assess(
 
     let firmware = newest_firmware(&machines);
     let flags = evaluate(&machines, &by_id, &firmware, th);
+
+    let mut flags_of: HashMap<&str, Vec<&Flag>> = HashMap::new();
+    for f in &flags {
+        flags_of.entry(f.machine_key.as_str()).or_default().push(f);
+    }
+    for m in &mut machines {
+        let own = flags_of.get(m.key.as_str()).map_or(&[][..], Vec::as_slice);
+        m.lifecycle = lifecycle(m, own, th);
+    }
+
     let summary = summarise(&machines, &cohorts, &flags, th);
 
     Ok(Snapshot {
@@ -990,10 +1355,20 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
                 .and_then(|l| months_since(l, instant(&taken_at)?)),
             _ => r.get(29)?,
         };
+        let drives = drives.remove(&run_id).unwrap_or_default();
+        let drive_wear_pct: Option<i64> = r.get(33)?;
         Ok(MachineView {
             // Set by `place`, against whichever "now" this run is seen from.
             max_age_months_now: None,
+            age_estimate: None,
             age_days: None,
+            // Set by `assess`, once the findings it rests on exist.
+            lifecycle: Lifecycle::default(),
+            worst_drive_wear_pct: drives
+                .iter()
+                .filter_map(|d| d.percentage_used)
+                .max()
+                .or(drive_wear_pct),
             runs: 1,
             first_seen: taken_at.clone(),
             max_age_months,
@@ -1031,7 +1406,7 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
             firmware_dated: r.get(30)?,
             firmware_likely_original: r.get(31)?,
             drive_power_on_hours: r.get(32)?,
-            drive_wear_pct: r.get(33)?,
+            drive_wear_pct,
             drive_hours_undercounted: r.get(34)?,
             power_plan: r.get(35)?,
             power_mode: r.get(36)?,
@@ -1047,7 +1422,7 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
             disk_low_mount: r.get(40)?,
             disk_low_free_pct: r.get(41)?,
             disk_low_free_bytes: r.get(42)?,
-            drives: drives.remove(&run_id).unwrap_or_default(),
+            drives,
             low_confidence_cpu_subtests: low_conf.get(&run_id).copied().unwrap_or(0),
             tags: tags.remove(&run_id).unwrap_or_default(),
             components: components.remove(&run_id).unwrap_or_default(),
@@ -1069,6 +1444,12 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
 fn place(m: &mut MachineView, runs: &[&RunRow], now: OffsetDateTime) {
     m.age_days = age_days(&m.taken_at, now);
     m.max_age_months_now = m.cpu_launched.as_deref().and_then(|l| months_since(l, now));
+    m.age_estimate = best_age(
+        m.cpu_launched.as_deref(),
+        m.firmware_dated.as_deref().or(m.bios_date.as_deref()),
+        m.firmware_likely_original,
+        now,
+    );
     if let Some(first) = runs.first() {
         m.runs = runs.len();
         m.first_seen = first.taken_at.clone();
@@ -1799,6 +2180,7 @@ fn summarise(
             .min()
             .map(str::to_string),
         configurations,
+        lifecycle: LifecycleCounts::of(machines),
     }
 }
 
@@ -1832,6 +2214,9 @@ pub struct Filter {
     pub search: Option<String>,
     /// Only machines carrying a flag with this code.
     pub flag: Option<String>,
+    /// Only machines with this lifecycle verdict — what the Groups view's
+    /// replace and repair counts drill into.
+    pub lifecycle: Option<Verdict>,
     /// **Authorization**, not a preference: tag sets, any one of which a
     /// machine may match, or empty for the whole fleet. Set from the caller's
     /// session and never from the query string, which is what makes it
@@ -1874,6 +2259,11 @@ impl Filter {
             return false;
         }
         if self.flag.is_some() && !flagged.contains(m.key.as_str()) {
+            return false;
+        }
+        if let Some(v) = self.lifecycle
+            && m.lifecycle.verdict != v
+        {
             return false;
         }
         if let Some(v) = &self.system_model
@@ -2160,6 +2550,10 @@ pub struct Group {
     /// over the members whose CPU the launch table knows.
     pub median_max_age_months: Option<f64>,
     pub with_age: usize,
+    /// Members whose lifecycle verdict is replace, and repair: the two that
+    /// cost money, so "which site needs budget" is a sort on these.
+    pub replace: usize,
+    pub repair: usize,
 }
 
 /// Group the machines in a snapshot by one dimension.
@@ -2232,6 +2626,7 @@ pub fn groups(snap: &Snapshot, by: &GroupBy) -> Vec<Group> {
                     .map(|a| a as f64),
             );
             let med = |v: &[f64]| (!v.is_empty()).then(|| median(v));
+            let decided = LifecycleCounts::of(ms.iter().copied());
 
             Group {
                 value: value.map(str::to_string),
@@ -2260,6 +2655,8 @@ pub fn groups(snap: &Snapshot, by: &GroupBy) -> Vec<Group> {
                 stale: ms.iter().filter(|m| is_stale(m, th)).count(),
                 median_max_age_months: med(&ages),
                 with_age: ages.len(),
+                replace: decided.replace,
+                repair: decided.repair,
             }
         })
         .collect();
@@ -2305,6 +2702,71 @@ pub fn grouping(snap: &Snapshot, by: Option<GroupBy>) -> Grouping {
         machines: snap.machines.len(),
         thresholds: snap.thresholds.clone(),
         groups: groups(snap, &by),
+    }
+}
+
+/// One machine on the lifecycle list.
+#[derive(Debug, Clone, Serialize)]
+pub struct Candidate {
+    pub machine_key: String,
+    pub hostname: Option<String>,
+    #[serde(flatten)]
+    pub lifecycle: Lifecycle,
+    pub age_estimate: Option<AgeEstimate>,
+    pub grade: String,
+    pub score: Option<f64>,
+    pub system_model: Option<String>,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// The lifecycle list, as `report --lifecycle --json` prints it.
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleReport {
+    pub generated_at: String,
+    /// Machines in view; `counts` adds up to it.
+    pub machines: usize,
+    pub counts: LifecycleCounts,
+    pub replace_age_years: f64,
+    /// Every machine with a verdict other than keep, most urgent first and
+    /// then by name. Keep is only counted: it is most of a healthy estate, and
+    /// a list of machines with nothing to say about them is not a list anyone
+    /// reads.
+    pub candidates: Vec<Candidate>,
+}
+
+pub fn lifecycle_report(snap: &Snapshot) -> LifecycleReport {
+    let mut candidates: Vec<Candidate> = snap
+        .machines
+        .iter()
+        .filter(|m| m.lifecycle.verdict != Verdict::Keep)
+        .map(|m| Candidate {
+            machine_key: m.key.clone(),
+            hostname: m.hostname.clone(),
+            lifecycle: m.lifecycle.clone(),
+            age_estimate: m.age_estimate,
+            grade: m.grade.clone(),
+            score: m.score,
+            system_model: m.system_model.clone(),
+            tags: m.tags.clone(),
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        a.lifecycle.verdict.cmp(&b.lifecycle.verdict).then_with(|| {
+            let name = |c: &Candidate| {
+                c.hostname
+                    .as_deref()
+                    .unwrap_or(&c.machine_key)
+                    .to_lowercase()
+            };
+            name(a).cmp(&name(b))
+        })
+    });
+    LifecycleReport {
+        generated_at: snap.generated_at.clone(),
+        machines: snap.summary.machines,
+        counts: snap.summary.lifecycle,
+        replace_age_years: snap.thresholds.replace_age_years,
+        candidates,
     }
 }
 
@@ -5211,5 +5673,542 @@ mod tests {
             changes.new_findings.len()
         );
         assert_eq!(view.points.last().unwrap().machines, machines);
+    }
+
+    /* --------------------------------------------------------- lifecycle */
+
+    /// The CPU launched in this month, as loadbearer 1.6.0+ records it. The
+    /// fixture's own CPU launched in 2023-01, which on `now()` is a machine
+    /// well under the five-year line.
+    fn launched(ym: &'static str) -> impl FnOnce(&mut Value) {
+        move |d: &mut Value| {
+            d["machine"]["age"] = json!({ "as_of": "2026-09", "cpu_launched": ym });
+        }
+    }
+
+    /// A battery under `battery_health_pct`, on a run that was on mains — a
+    /// part problem and no measurement caveat.
+    fn worn_battery(d: &mut Value) {
+        d["machine"]["battery"] = json!({
+            "charge_pct": 80.0, "state": "charging", "health_pct": 61.0, "cycle_count": 812
+        });
+    }
+
+    fn decided<'a>(s: &'a Snapshot, host: &str) -> &'a Lifecycle {
+        &machine(s, host).lifecycle
+    }
+
+    /// A CPU of its own, launched in `ym`: no peers, so no cohort finding can
+    /// join the evidence and a test of one rule tests only that rule.
+    fn own_cpu<'a>(host: &'a str, ym: &'static str) -> impl FnOnce(&mut Value) + use<'a> {
+        move |d: &mut Value| {
+            d["machine"]["cpu_model"] = json!(format!("Test CPU for {host}"));
+            launched(ym)(d);
+        }
+    }
+
+    /// Each rule, and which wins when more than one could. One estate, so the
+    /// precedence is read off side by side rather than spread over a dozen
+    /// tests that could each pass for a different reason.
+    #[test]
+    fn each_lifecycle_rule_and_its_precedence() {
+        let mut e = Estate::new();
+        let at = "2026-09-08T10:00:00Z";
+        let (young, old) = ("2023-01", "2019-01");
+        e.add_with("F-YOUNG", 300.0, at, own_cpu("F-YOUNG", young));
+        e.add_with("D-OLD", 500.0, at, own_cpu("D-OLD", old));
+        e.add_with("BATTERY-OLD", 1000.0, at, |d| {
+            own_cpu("BATTERY-OLD", old)(d);
+            worn_battery(d);
+        });
+        e.add_with("BATTERY-YOUNG", 1000.0, at, |d| {
+            own_cpu("BATTERY-YOUNG", young)(d);
+            worn_battery(d);
+        });
+        e.add_with("SOUND-OLD", 1000.0, at, own_cpu("SOUND-OLD", old));
+        e.add_with("D-YOUNG", 500.0, at, own_cpu("D-YOUNG", young));
+        e.add_with("CLEAN", 1000.0, at, own_cpu("CLEAN", young));
+        // Regressed by 20% against its own past, with a drive most of the way
+        // through its rated endurance: a part *and* a slowdown.
+        for (score, taken) in [
+            (1000.0, "2026-07-01T10:00:00Z"),
+            (1000.0, "2026-08-01T10:00:00Z"),
+        ] {
+            e.add_with(
+                "DRIVE-REGRESSED",
+                score,
+                taken,
+                own_cpu("DRIVE-REGRESSED", young),
+            );
+        }
+        e.add_with("DRIVE-REGRESSED", 800.0, at, |d| {
+            own_cpu("DRIVE-REGRESSED", young)(d);
+            with_drives(vec![nvme_with("Boot SSD", "percentage_used", json!(93))])(d);
+        });
+
+        let s = e.snap();
+        let want = [
+            ("F-YOUNG", Verdict::Replace),
+            ("D-OLD", Verdict::Replace),
+            ("BATTERY-OLD", Verdict::Replace),
+            ("BATTERY-YOUNG", Verdict::Repair),
+            ("DRIVE-REGRESSED", Verdict::Repair),
+            ("SOUND-OLD", Verdict::Watch),
+            ("D-YOUNG", Verdict::Watch),
+            ("CLEAN", Verdict::Keep),
+        ];
+        for (host, verdict) in want {
+            assert_eq!(
+                decided(&s, host).verdict,
+                verdict,
+                "{host}: {:?}",
+                decided(&s, host)
+            );
+        }
+
+        assert_eq!(
+            decided(&s, "F-YOUNG").reasons,
+            ["Graded F against the reference baseline"],
+            "an F is the whole reason, and says what it is measured against"
+        );
+        assert_eq!(
+            decided(&s, "DRIVE-REGRESSED").reasons,
+            [
+                "Boot SSD has used 93% of its rated endurance",
+                "20% slower than its own earlier runs"
+            ],
+            "the part that decided it first, and the slowdown still said"
+        );
+        assert_eq!(
+            decided(&s, "SOUND-OLD").reasons,
+            ["At most 7.7 years old, by its CPU's launch date"]
+        );
+        assert!(
+            decided(&s, "CLEAN").reasons.is_empty(),
+            "keep has no reasons"
+        );
+        assert!(
+            s.machines.iter().all(|m| !m.lifecycle.uncertain),
+            "nothing here carries a measurement caveat"
+        );
+    }
+
+    /// Slower than identical machines and nothing else wrong: find out why
+    /// before spending anything — even on a machine old enough to watch.
+    #[test]
+    fn a_machine_slower_than_its_clones_is_investigated() {
+        let mut e = Estate::new();
+        for i in 0..5 {
+            e.add(&format!("PC-{i}"), 1000.0, "2026-09-08T10:00:00Z");
+        }
+        e.add("PC-SLOW", 700.0, "2026-09-08T10:00:00Z");
+        e.add_with("OLD-0", 1000.0, "2026-09-08T10:00:00Z", |d| {
+            d["machine"]["cpu_model"] = json!("Some Other CPU");
+            launched("2019-01")(d);
+        });
+
+        let s = e.snap();
+        let slow = decided(&s, "PC-SLOW");
+        assert_eq!(slow.verdict, Verdict::Investigate);
+        assert_eq!(slow.reasons, ["30% slower than identical machines"]);
+        assert_eq!(decided(&s, "PC-0").verdict, Verdict::Keep);
+
+        // The same shortfall on old hardware: still investigate, since the
+        // machine is slower than its own hardware should be, and the age
+        // follows the reason that decided it.
+        let mut e = Estate::new();
+        for i in 0..5 {
+            e.add_with(
+                &format!("PC-{i}"),
+                1000.0,
+                "2026-09-08T10:00:00Z",
+                launched("2019-01"),
+            );
+        }
+        e.add_with(
+            "PC-SLOW",
+            700.0,
+            "2026-09-08T10:00:00Z",
+            launched("2019-01"),
+        );
+        let s = e.snap();
+        assert_eq!(decided(&s, "PC-0").verdict, Verdict::Watch);
+        let slow = decided(&s, "PC-SLOW");
+        assert_eq!(slow.verdict, Verdict::Investigate);
+        assert_eq!(
+            slow.reasons,
+            [
+                "30% slower than identical machines",
+                "At most 7.7 years old, by its CPU's launch date"
+            ]
+        );
+    }
+
+    /// Five years exactly is old; a month short of it is not. Months are what
+    /// the age is counted in, so that is the resolution of the boundary.
+    #[test]
+    fn the_age_boundary_is_inclusive_at_the_threshold() {
+        let mut e = Estate::new();
+        // `now()` is 2026-09: sixty months after 2021-09, fifty-nine after 2021-10.
+        e.add_with("SIXTY", 500.0, "2026-09-08T10:00:00Z", launched("2021-09"));
+        e.add_with(
+            "FIFTY-NINE",
+            500.0,
+            "2026-09-08T10:00:00Z",
+            launched("2021-10"),
+        );
+        let s = e.snap();
+        assert_eq!(machine(&s, "SIXTY").age_estimate.unwrap().months, 60);
+        assert_eq!(decided(&s, "SIXTY").verdict, Verdict::Replace);
+        assert_eq!(decided(&s, "FIFTY-NINE").verdict, Verdict::Watch);
+        assert_eq!(
+            decided(&s, "FIFTY-NINE").reasons,
+            ["Graded D against the reference baseline"],
+            "a young D is watched for its grade alone"
+        );
+    }
+
+    #[test]
+    fn the_best_age_is_a_firmware_dating_inside_the_cpu_bound() {
+        let now = datetime!(2026-09-09 12:00:00 UTC);
+        let upper = |months| {
+            Some(AgeEstimate {
+                months,
+                basis: AgeBasis::UpperBound,
+            })
+        };
+        let dated = |months| {
+            Some(AgeEstimate {
+                months,
+                basis: AgeBasis::Firmware,
+            })
+        };
+
+        // The CPU alone bounds it.
+        assert_eq!(best_age(Some("2020-09"), None, None, now), upper(72));
+        // Original firmware dates it, more closely.
+        assert_eq!(
+            best_age(Some("2020-09"), Some("2021-06"), Some(true), now),
+            dated(63)
+        );
+        // Firmware updated since it shipped says nothing about the machine.
+        assert_eq!(
+            best_age(Some("2020-09"), Some("2025-06"), Some(false), now),
+            upper(72)
+        );
+        assert_eq!(
+            best_age(Some("2020-09"), Some("2021-06"), None, now),
+            upper(72),
+            "not judged original is not original"
+        );
+        // A machine cannot predate its CPU, so firmware claiming it does is
+        // the firmware being wrong, and the bound stands.
+        assert_eq!(
+            best_age(Some("2020-09"), Some("2019-01"), Some(true), now),
+            upper(72)
+        );
+        // A BIOS date in full reads as its month.
+        assert_eq!(
+            best_age(Some("2020-09"), Some("2021-06-02"), Some(true), now),
+            dated(63)
+        );
+        // Original firmware on a CPU the launch table doesn't know still dates it.
+        assert_eq!(best_age(None, Some("2022-09"), Some(true), now), dated(48));
+        // A date in the future is no date.
+        assert_eq!(
+            best_age(Some("2020-09"), Some("2027-01"), Some(true), now),
+            upper(72)
+        );
+        // Nothing to go on: no answer rather than a guess.
+        assert_eq!(best_age(None, None, None, now), None);
+        assert_eq!(best_age(None, Some("2021-06"), Some(false), now), None);
+
+        assert_eq!(
+            upper(74).unwrap().sentence(),
+            "At most 6.2 years old, by its CPU's launch date"
+        );
+        assert_eq!(
+            dated(49).unwrap().sentence(),
+            "About 4.1 years old, by its original firmware's date"
+        );
+    }
+
+    /// Through the real ingest path: the age block's original firmware dates
+    /// the machine, and the reason says it is a dating rather than a bound.
+    #[test]
+    fn a_firmware_dating_reaches_the_verdict_and_its_wording() {
+        let mut e = Estate::new();
+        e.add_with("DATED", 500.0, "2026-09-08T10:00:00Z", |d| {
+            d["machine"]["age"] = json!({
+                "as_of": "2026-09", "cpu_launched": "2019-01",
+                "firmware_dated": "2020-05", "firmware_likely_original": true
+            });
+        });
+        let s = e.snap();
+        let m = machine(&s, "DATED");
+        assert_eq!(
+            m.age_estimate,
+            Some(AgeEstimate {
+                months: 76,
+                basis: AgeBasis::Firmware
+            })
+        );
+        assert_eq!(m.lifecycle.verdict, Verdict::Replace);
+        assert_eq!(
+            m.lifecycle.reasons,
+            [
+                "About 6.3 years old, by its original firmware's date",
+                "Graded D against the reference baseline"
+            ]
+        );
+    }
+
+    /// A CPU the launch table doesn't know and no firmware dating: the machine
+    /// has no age, and that must never be read as old.
+    #[test]
+    fn no_age_evidence_never_makes_a_machine_old() {
+        let mut e = Estate::new();
+        let vm = |d: &mut Value| {
+            d["machine"]["cpu_model"] = json!("QEMU Virtual CPU version 2.5+");
+        };
+        e.add_with("VM-D", 500.0, "2026-09-08T10:00:00Z", vm);
+        e.add_with("VM-BATTERY", 1000.0, "2026-09-08T10:00:00Z", |d| {
+            vm(d);
+            worn_battery(d);
+        });
+        e.add_with("VM-OK", 1000.0, "2026-09-08T10:00:00Z", vm);
+        let s = e.snap();
+        assert!(s.machines.iter().all(|m| m.age_estimate.is_none()));
+        assert_eq!(decided(&s, "VM-D").verdict, Verdict::Watch);
+        assert_eq!(decided(&s, "VM-BATTERY").verdict, Verdict::Repair);
+        assert_eq!(decided(&s, "VM-OK").verdict, Verdict::Keep);
+    }
+
+    /// A measurement caveat makes a verdict uncertain only where a performance
+    /// figure decided it: a throttled run cannot cast doubt on a worn battery.
+    #[test]
+    fn a_verdict_resting_on_a_caveated_measurement_is_uncertain() {
+        let mut e = Estate::new();
+        let at = "2026-09-08T10:00:00Z";
+        // Old and graded D: without the grade it would only be watched.
+        e.add_with("OLD-D-HOT", 500.0, at, |d| {
+            launched("2019-01")(d);
+            hot(d);
+        });
+        // Old with a worn battery: replaced whatever the run measured.
+        e.add_with("OLD-BATTERY-HOT", 500.0, at, |d| {
+            launched("2019-01")(d);
+            worn_battery(d);
+            hot(d);
+        });
+        // Graded D, measured on battery.
+        e.add_with("D-ON-BATTERY", 500.0, at, |d| {
+            d["gates"] = json!({ "on_ac": false });
+        });
+        // Nothing performance-related decided it, so nothing to doubt.
+        e.add_with("CLEAN-HOT", 1000.0, at, hot);
+        e.add_with("OLD-D-COOL", 500.0, at, launched("2019-01"));
+
+        let s = e.snap();
+        let hot_d = decided(&s, "OLD-D-HOT");
+        assert_eq!(hot_d.verdict, Verdict::Replace);
+        assert!(hot_d.uncertain, "{hot_d:?}");
+        assert_eq!(hot_d.caveats, ["Clocks fell during the run"]);
+
+        let parts = decided(&s, "OLD-BATTERY-HOT");
+        assert_eq!(parts.verdict, Verdict::Replace);
+        assert!(!parts.uncertain, "age and a part decide it: {parts:?}");
+        assert!(parts.caveats.is_empty());
+
+        let on_battery = decided(&s, "D-ON-BATTERY");
+        assert_eq!(on_battery.verdict, Verdict::Watch);
+        assert!(on_battery.uncertain);
+        assert_eq!(on_battery.caveats, ["Measured on battery"]);
+
+        assert_eq!(decided(&s, "CLEAN-HOT").verdict, Verdict::Keep);
+        assert!(!decided(&s, "CLEAN-HOT").uncertain);
+        assert!(!decided(&s, "OLD-D-COOL").uncertain, "no caveat, no doubt");
+    }
+
+    /// A weak component is a part finding, but one read off the benchmark:
+    /// a disk graded F on a throttled run is doubted like a low grade is,
+    /// where a worn battery on the same run is not.
+    #[test]
+    fn a_weak_component_on_a_caveated_run_is_uncertain() {
+        let weak_disk = |d: &mut Value| {
+            for c in d["components"].as_array_mut().expect("array") {
+                if c["id"] == json!("disk") {
+                    c["grade"] = json!("F");
+                    c["score"] = json!(180.0);
+                }
+            }
+        };
+        let mut e = Estate::new();
+        let at = "2026-09-08T10:00:00Z";
+        e.add_with("WEAK-HOT", 1000.0, at, |d| {
+            weak_disk(d);
+            hot(d);
+        });
+        e.add_with("WEAK-COOL", 1000.0, at, weak_disk);
+        // The battery decides it with or without the disk figure.
+        e.add_with("WEAK-BATTERY-HOT", 1000.0, at, |d| {
+            weak_disk(d);
+            worn_battery(d);
+            hot(d);
+        });
+
+        let s = e.snap();
+        let hot_weak = decided(&s, "WEAK-HOT");
+        assert_eq!(hot_weak.verdict, Verdict::Repair);
+        assert!(hot_weak.uncertain, "{hot_weak:?}");
+        assert_eq!(hot_weak.caveats, ["Clocks fell during the run"]);
+
+        let cool = decided(&s, "WEAK-COOL");
+        assert_eq!(cool.verdict, Verdict::Repair);
+        assert!(!cool.uncertain, "no caveat, no doubt");
+
+        let both = decided(&s, "WEAK-BATTERY-HOT");
+        assert_eq!(both.verdict, Verdict::Repair);
+        assert!(!both.uncertain, "the battery stands: {both:?}");
+    }
+
+    /// Every piece of evidence, the decisive first: on a replace, the F, then
+    /// the age, then the parts — those in the findings' own order, most
+    /// severe first.
+    #[test]
+    fn reasons_lead_with_what_decided_the_verdict() {
+        let mut e = Estate::new();
+        e.add_with("EVERYTHING", 300.0, "2026-09-08T10:00:00Z", |d| {
+            launched("2019-01")(d);
+            worn_battery(d);
+            with_drives(vec![
+                nvme_with("Boot SSD", "media_errors", json!(2)),
+                nvme_with("Data SSD", "critical_warning", json!(4)),
+            ])(d);
+        });
+        let s = e.snap();
+        let l = decided(&s, "EVERYTHING");
+        assert_eq!(l.verdict, Verdict::Replace);
+        assert_eq!(
+            l.reasons,
+            [
+                "Graded F against the reference baseline",
+                "At most 7.7 years old, by its CPU's launch date",
+                "Data SSD is reporting a critical warning",
+                "Battery at 61% of design capacity",
+                "Boot SSD has recorded 2 media error(s)",
+            ]
+        );
+    }
+
+    /// The counts add up to the machines in view, in the summary and after a
+    /// filter; a group counts its own; and the filter selects a verdict.
+    #[test]
+    fn lifecycle_counts_add_up_and_the_filter_selects_a_verdict() {
+        let mut e = Estate::new();
+        let at = "2026-09-08T10:00:00Z";
+        e.add_with("GLA-F", 300.0, at, tagged("glasgow"));
+        e.add_with("GLA-BATTERY", 1000.0, at, |d| {
+            tagged("glasgow")(d);
+            worn_battery(d);
+        });
+        e.add_with("GLA-OK", 1000.0, at, tagged("glasgow"));
+        e.add_with("EDI-F", 300.0, at, tagged("edinburgh"));
+        e.add_with("EDI-D", 500.0, at, tagged("edinburgh"));
+
+        let s = e.snap();
+        let c = s.summary.lifecycle;
+        assert_eq!(
+            (c.replace, c.repair, c.investigate, c.watch, c.keep),
+            (2, 1, 0, 1, 1)
+        );
+        assert_eq!(
+            c.replace + c.repair + c.investigate + c.watch + c.keep,
+            s.summary.machines
+        );
+
+        let gs = groups(&s, &site_tag());
+        let gla = group(&gs, Some("glasgow"));
+        assert_eq!((gla.replace, gla.repair), (1, 1));
+        let edi = group(&gs, Some("edinburgh"));
+        assert_eq!((edi.replace, edi.repair), (1, 0));
+
+        let th = Thresholds::default();
+        let replace = s.filtered(
+            &Filter {
+                lifecycle: Some(Verdict::Replace),
+                ..Default::default()
+            },
+            &th,
+        );
+        let mut hosts: Vec<_> = replace
+            .machines
+            .iter()
+            .filter_map(|m| m.hostname.as_deref())
+            .collect();
+        hosts.sort_unstable();
+        assert_eq!(hosts, ["EDI-F", "GLA-F"]);
+        assert_eq!(replace.summary.lifecycle.replace, 2);
+        assert_eq!(replace.summary.machines, 2);
+        assert_eq!(replace.summary.lifecycle.keep, 0);
+        assert!(
+            replace
+                .flags
+                .iter()
+                .all(|f| f.hostname.as_deref() != Some("GLA-BATTERY")),
+            "the findings narrow with the machines"
+        );
+
+        // With another filter, both apply.
+        let mut tags = BTreeMap::new();
+        tags.insert("site".to_string(), "glasgow".to_string());
+        let glasgow_replace = s.filtered(
+            &Filter {
+                tags,
+                lifecycle: Some(Verdict::Replace),
+                ..Default::default()
+            },
+            &th,
+        );
+        assert_eq!(glasgow_replace.summary.machines, 1);
+
+        let report = lifecycle_report(&s);
+        assert_eq!(report.machines, 5);
+        let order: Vec<_> = report
+            .candidates
+            .iter()
+            .map(|c| (c.lifecycle.verdict, c.hostname.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (Verdict::Replace, "EDI-F"),
+                (Verdict::Replace, "GLA-F"),
+                (Verdict::Repair, "GLA-BATTERY"),
+                (Verdict::Watch, "EDI-D"),
+            ],
+            "most urgent first, then by name, and keep only counted"
+        );
+    }
+
+    #[test]
+    fn a_verdict_parses_from_its_own_name_only() {
+        for v in Verdict::ALL {
+            assert_eq!(v.as_str().parse::<Verdict>(), Ok(v));
+            assert_eq!(
+                serde_json::to_value(v).unwrap(),
+                json!(v.as_str()),
+                "the query parameter and the JSON spell it the same"
+            );
+        }
+        let err = "retire".parse::<Verdict>().unwrap_err();
+        assert!(
+            err.contains("replace, repair, investigate, watch or keep"),
+            "{err}"
+        );
+        assert!(
+            "Replace".parse::<Verdict>().is_err(),
+            "exact, like the JSON"
+        );
     }
 }

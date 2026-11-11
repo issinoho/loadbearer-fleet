@@ -170,6 +170,76 @@ fn report_changes_writes_the_changes_to_stdout() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `report --lifecycle` prints the candidates, and with `--json` a document of
+/// them whose counts add up to the machines. It refuses to be combined with
+/// `--by` or `--changes`, on stderr, rather than quietly answering one of them.
+#[test]
+fn report_lifecycle_writes_the_candidates_to_stdout() {
+    let dir = scratch("report-lifecycle");
+    let index = dir.join("i.db");
+    let index = index.to_str().expect("path");
+    stdout_of(&["--index", index, "scan", fixtures().to_str().expect("path")]);
+
+    let json = stdout_of(&["--index", index, "report", "--lifecycle", "--json"]);
+    let r: serde_json::Value = serde_json::from_str(&json).unwrap_or_else(|e| {
+        panic!(
+            "stdout did not parse as JSON ({e}). The first 200 bytes were:\n{}",
+            &json[..json.len().min(200)]
+        )
+    });
+    let counts = r["counts"].as_object().expect("counts");
+    let total: u64 = counts.values().map(|n| n.as_u64().expect("count")).sum();
+    assert_eq!(Some(total), r["machines"].as_u64(), "the counts add up");
+    let candidates = r["candidates"].as_array().expect("candidates");
+    assert_eq!(
+        candidates.len() as u64,
+        total - r["counts"]["keep"].as_u64().expect("keep"),
+        "every machine but those to keep"
+    );
+    for c in candidates {
+        assert!(
+            c["reasons"].as_array().is_some_and(|a| !a.is_empty()),
+            "{c}"
+        );
+    }
+    assert!(!json.contains('\u{1b}'), "stdout carried ANSI escape codes");
+
+    // The fixtures have machines to watch and nothing costlier: counted, and
+    // listed only with --all.
+    let text = stdout_of(&["--index", index, "report", "--lifecycle"]);
+    assert!(
+        text.starts_with("Lifecycle:"),
+        "stdout should open with the list's own heading, got:\n{}",
+        &text[..text.len().min(200)]
+    );
+    assert!(text.contains("Age alone is never a reason"), "{text}");
+    assert!(text.contains("pass --all to list them"), "{text}");
+    let all = stdout_of(&["--index", index, "report", "--lifecycle", "--all"]);
+    assert!(all.contains("\nWatch · "), "{all}");
+    assert!(all.contains("years old, by its CPU's launch date"), "{all}");
+    assert!(!all.contains('\u{1b}'), "stdout carried ANSI escape codes");
+
+    for other in [["--by", "os"], ["--changes", "4"]] {
+        let refused = Command::new(EXE)
+            .args(["--index", index, "report", "--lifecycle"])
+            .args(other)
+            .output()
+            .expect("run the binary");
+        assert!(
+            !refused.status.success(),
+            "--lifecycle with {other:?} must fail"
+        );
+        assert!(refused.stdout.is_empty(), "and print nothing to stdout");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("cannot be used with"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The same property with a log file configured, which the test above cannot
 /// see: without one there is nothing to announce.
 ///

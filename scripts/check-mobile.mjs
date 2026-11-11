@@ -60,7 +60,16 @@ const SIZES = [
 // `overview-quarter` is the overview comparing with thirteen weeks back, which
 // for the fixtures is before anything was measured — the "no baseline" state
 // of "What changed", where the plain overview has its lists.
-const VIEWS = ['overview', 'overview-quarter', 'cohorts', 'groups', 'machines', 'drilled', 'machine', 'compare'];
+//
+// `lifecycle` is the sixth tab, the one that made the strip scroll on a phone,
+// and `lifecycle-keep` the same view with a tile chosen.
+const VIEWS = ['overview', 'overview-quarter', 'cohorts', 'groups', 'lifecycle', 'lifecycle-keep', 'machines',
+  'drilled', 'machine', 'compare'];
+
+/** The tab each view should mark as current. */
+const TAB_OF = {
+  'overview-quarter': 'overview', 'lifecycle-keep': 'lifecycle', drilled: 'machines', machine: 'machines',
+};
 
 // A control smaller than this is a control you miss. 40px is the floor here
 // rather than Apple's 44 because the theme toggle is square and 44 looks
@@ -185,6 +194,57 @@ const MEASURE = `(() => {
   });
 })()`;
 
+/*
+ * The tab strip, which is allowed to scroll — six tabs do not fit a phone —
+ * on three conditions, measured here rather than trusted: the current tab is
+ * wholly inside the strip's visible box, every tab can be scrolled to, and the
+ * fade that says "more this way" is on exactly the edges that hide something.
+ */
+const TABS = `(() => {
+  const strip = document.querySelector('#tabs');
+  const s = strip.getBoundingClientRect();
+  const active = strip.querySelector('[aria-current="page"]');
+  const a = active ? active.getBoundingClientRect() : null;
+  const tabs = [...strip.querySelectorAll('.tab')].map((t) => {
+    const r = t.getBoundingClientRect();
+    // Where the tab sits in the strip's scrollable content, not on screen.
+    return { view: t.dataset.view, width: r.width, from: r.left - s.left + strip.scrollLeft, to: r.right - s.left + strip.scrollLeft,
+      shown: getComputedStyle(t).display !== 'none' && getComputedStyle(t).visibility !== 'hidden' };
+  });
+  return JSON.stringify({
+    overflowX: getComputedStyle(strip).overflowX,
+    hidden: strip.scrollWidth - strip.clientWidth,
+    scrollWidth: strip.scrollWidth,
+    scrollLeft: strip.scrollLeft,
+    before: strip.classList.contains('more-before'),
+    after: strip.classList.contains('more-after'),
+    active: active ? active.dataset.view : null,
+    activeLeft: a ? a.left - s.left : null,
+    activeRight: a ? s.right - a.right : null,
+    tabs,
+  });
+})()`;
+
+function checkTabs(where, t, want) {
+  check(where, t.active === want, `the current tab is ${t.active}, not ${want}`);
+  check(where, t.activeLeft !== null && t.activeLeft >= -1 && t.activeRight >= -1,
+    `the current tab is not wholly in view (${t.activeLeft?.toFixed(0)}px from the left edge, `
+    + `${t.activeRight?.toFixed(0)}px from the right)`);
+  for (const tab of t.tabs) {
+    check(where, tab.shown && tab.width > 0 && tab.from >= -1 && tab.to <= t.scrollWidth + 1,
+      `the ${tab.view} tab cannot be scrolled to`);
+  }
+  if (t.hidden > 1) {
+    check(where, ['auto', 'scroll'].includes(t.overflowX), `the strip hides ${t.hidden}px and cannot scroll`);
+    check(where, t.after === t.scrollLeft < t.hidden - 1,
+      `${t.after ? 'a' : 'no'} fade on the right with ${Math.round(t.hidden - t.scrollLeft)}px of tabs past it`);
+    check(where, t.before === t.scrollLeft > 1,
+      `${t.before ? 'a' : 'no'} fade on the left with ${Math.round(t.scrollLeft)}px of tabs past it`);
+  } else {
+    check(where, !t.before && !t.after, 'a fade says there are more tabs when every one is in view');
+  }
+}
+
 /* ------------------------------------------------------------- the fixtures */
 
 const root = join(import.meta.dirname, '..');
@@ -307,6 +367,7 @@ try {
       if (view === 'compare') hash = `compare/${compareRuns.join(',')}`;
       if (view === 'drilled') hash = `machines?cpu=${encodeURIComponent(longestCpu)}`;
       if (view === 'overview-quarter') hash = 'overview?changes=13';
+      if (view === 'lifecycle-keep') hash = 'lifecycle?decision=keep';
       const where = `${size.name}/${view}`;
       // A fresh navigation rather than a hash change, so each measurement is of
       // a page that laid itself out at this size from the start.
@@ -382,8 +443,38 @@ try {
       check(where, m.topbarHeight <= ceiling,
         `the topbar is ${m.topbarHeight}px at ${size.width}px wide (ceiling ${ceiling}px)`);
 
+      // Read on load, which is a fresh navigation straight to this view.
+      const tabs = JSON.parse((await cdp.send('Runtime.evaluate', { expression: TABS, returnByValue: true })).result.value);
+      checkTabs(where, tabs, TAB_OF[view] || view);
+
       notes.push(`${where}: ${m.documentWidth}px wide, topbar ${m.topbarHeight}px, `
-        + `${m.controls.length} control(s), ${m.selfScrolls.length} scroller(s)`);
+        + `${m.controls.length} control(s), ${m.selfScrolls.length} scroller(s), `
+        + `tab strip hides ${Math.max(0, tabs.hidden)}px`);
+
+      // And on change: from the Lifecycle view, which on a phone leaves the
+      // strip scrolled part-way, to the last tab and then the first — each the
+      // far end of the strip from the one before.
+      if (view === 'lifecycle') {
+        for (const next of ['compare', 'overview', 'lifecycle']) {
+          await cdp.send('Runtime.evaluate', {
+            expression: `document.querySelector('.tab[data-view="${next}"]').click()`,
+          });
+          const switched = `(() => {
+            const m = document.querySelector('main');
+            return document.querySelector('.tab[aria-current="page"]')?.dataset.view === '${next}'
+              && !!m && !m.classList.contains('loading') && m.innerText.length > 100;
+          })()`;
+          let done = false;
+          for (let i = 0; i < 60 && !done; i++) {
+            done = (await cdp.send('Runtime.evaluate', { expression: switched, returnByValue: true })).result.value === true;
+            if (!done) await sleep(250);
+          }
+          check(`${where}→${next}`, done, 'the tab did not switch the view');
+          await sleep(100);
+          const after = JSON.parse((await cdp.send('Runtime.evaluate', { expression: TABS, returnByValue: true })).result.value);
+          checkTabs(`${where}→${next}`, after, next);
+        }
+      }
 
       // The overview's history cards fill in after the rest, from their own
       // requests: that they arrived, and arrived as content rather than as a

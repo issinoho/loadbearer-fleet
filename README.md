@@ -425,6 +425,7 @@ loadbearer-fleet report --all                      # include informational flags
 loadbearer-fleet report --json                     # the whole snapshot, as the UI sees it
 loadbearer-fleet report --by tag:site              # per site: worst share needing attention first
 loadbearer-fleet report --changes 4                # what changed in the last 4 weeks (1, 4 or 13)
+loadbearer-fleet report --lifecycle                # what to replace, repair or investigate, and why
 loadbearer-fleet serve \\fileserver\loadbearer     # the dashboard, on http://127.0.0.1:8787
 loadbearer-fleet init-config > fleet.toml          # a starter config, placeholders included
 loadbearer-fleet serve --config fleet.toml         # with single sign-on
@@ -579,8 +580,14 @@ Usually the first question about an estate, and nothing on a PC records the
 answer. What does carry a date is the CPU: every generation has a launch, and
 a machine can't be older than its CPU. So the **Age** on a machine page —
 `≤ 3.8 yr — built Jan 2023 or later` — is an upper bound, counted to today
-rather than to the last run, and the machine table sorts by it. That sort is
-the replacement list.
+rather than to the last run, and the machine table sorts by it.
+
+Where loadbearer judged the firmware to be as shipped, its date places the
+machine more closely, and the lifecycle verdict uses that instead — so a
+machine's **best-estimate age** is worded as one or the other: "at most 6.2
+years old" from the CPU, "about 4.1 years old" from the firmware. A firmware
+date earlier than the CPU's launch is the firmware being wrong, and the bound
+stands. See [What to do about each machine](#what-to-do-about-each-machine).
 
 loadbearer 1.6.0 and later record the evidence with each run: the CPU's
 launch, the firmware's date and whether it's probably what the machine
@@ -653,16 +660,19 @@ documents.
 loadbearer-fleet serve \\fileserver\loadbearer
 ```
 
-Scans the folder, then serves five views on `127.0.0.1:8787`: an executive
+Scans the folder, then serves six views on `127.0.0.1:8787`: an executive
 **overview** (how many machines need attention, what changed since a week, a
 month or a quarter ago, grade distribution, findings by queue, score spread,
 the ranked list of what to look at, and the same figures week by week over
 the last half-year), a **cohort
 explorer** (each machine against the median of the machines like it), **groups**
-(the estate by site, system model, CPU, OS or any tag), a sortable **machine
-table**, and a **drilldown** per machine with its score history, its
-components, its findings in full, its drives, and every subtest of its latest
-run.
+(the estate by site, system model, CPU, OS or any tag), **lifecycle** (what
+each machine calls for — replace, repair, investigate, watch or keep — and
+why), a sortable **machine table**, and a **drilldown** per machine with its
+score history, its components, its findings in full, its drives, and every
+subtest of its latest run. On a phone the six tabs scroll sideways inside
+their strip, with the current one kept in view and a fade on the edge where
+more are hidden.
 
 ### Which site is in the worst shape
 
@@ -683,10 +693,73 @@ the *share* of each group needing attention and its grade mix, so a big group
 does not look worst for being big. Machines with no value — untagged, or no
 system model recorded — are a group of their own, so the groups always add up
 to the machines in view, and the filter row applies as it does everywhere
-else. Clicking a group opens the machine table filtered to it.
+else. Clicking a group opens the machine table filtered to it. The table also
+counts each group's machines to **replace** and to **repair** — the two
+lifecycle decisions that cost money, so "which site needs budget" is a sort —
+and clicking either count opens just those machines.
 
 `report --by <dimension>` prints the same thing at a prompt — `model`, `cpu`,
 `os`, or `tag:<key>` — and `--json` gives the document the dashboard draws.
+
+### What to do about each machine
+
+Findings say what is wrong with a machine; the decision that follows is a
+different question, and the answers differ in kind and in cost. The
+**Lifecycle** tab gives every machine one of five verdicts, from a short rule
+over evidence the dashboard already has — never a score — with the reasons
+that fired it written out:
+
+| Verdict | When (first match wins) |
+| --- | --- |
+| **Replace** | Graded **F**; or **old** and either graded D or F or with a **part problem** |
+| **Repair** | A part problem on a machine that is neither: a part, not the platform |
+| **Investigate** | Slower than identical machines, or than its own earlier runs |
+| **Watch** | Old, or graded D |
+| **Keep** | None of the above |
+
+- **Old** is at least five years by the machine's best-estimate age — the
+  upper bound from its CPU, or the dating from original firmware where there
+  is one (see [How old a machine is](#how-old-a-machine-is)). The reason says
+  which: "At most 6.2 years old, by its CPU's launch date" or "About 4.1 years
+  old, by its original firmware's date". A machine with no age evidence is
+  never old; it is not guessed.
+- **A part problem** is a worn battery, a drive raising its own critical
+  warning, media errors or a worn drive, or one component graded well below
+  the rest. Not a nearly full disk, which is housekeeping, and not firmware.
+- **Slower than identical machines or its own past** is the cohort and
+  regression findings: it should be faster than it is, and finding out why
+  costs less than buying.
+
+Two consequences are deliberate. **Age alone is not a reason to buy**: an old
+machine that still performs and whose parts are sound is *watch*, not
+*replace*. And **an F is against the reference baseline**, so *replace* for a
+grade means "inadequate against that reference" — an estate with modest needs
+may reasonably disagree, and the reason says "Graded F against the reference
+baseline" so nobody mistakes it for a fault.
+
+A verdict that rests on a performance figure — the grade, one component graded
+far below the rest, or being slower than its peers or its past — is marked **re-measure first** when the same run was
+throttled, on battery, held back by its power settings, incomplete or measured
+against a RAM-backed disk: the measurement condemning the machine may be what
+is wrong. One resting only on age and on parts that report their own condition
+is not, since no measurement caveat changes a worn battery or a drive's own
+counters.
+
+The tab opens with a tile per verdict — choosing one lists those machines —
+then **Age against score**, one mark per machine at its best-estimate age:
+replace in the critical colour as squares, repair in the warning colour as
+triangles, the rest gray circles, with a line at five years. Hollow marks are
+upper bounds (the machine sits on or left of its mark), filled ones are
+dated, and machines with no age estimate are counted beside the chart rather
+than placed. Below is the list, most urgent first: decision, reasons, age,
+grade, score, battery health, worst drive wear, system model and tags. Each
+machine's page states its verdict too, and the Overview counts the machines
+to replace.
+
+`report --lifecycle` prints the replace, repair and investigate lists with
+their reasons (`--all` adds the machines to watch), and `--json` the counts
+and every machine that is not *keep*. The five-year line is
+`replace_age_years` in the `thresholds` every snapshot carries.
 
 ### What changed, and the fleet over time
 
@@ -748,7 +821,12 @@ returns exactly what the dashboard draws, so any view can be scripted or
 diffed; `GET /api/groups?by=<dimension>` is the Groups tab, taking the same
 filter parameters; `GET /api/changes?window=1|4|13` and
 `GET /api/timeline?weeks=4…26` are the overview's "What changed" and its
-charts, taking the same filter parameters too; and `GET /api/machine/{key}` is the drilldown payload. Every endpoint, the
+charts, taking the same filter parameters too; and `GET /api/machine/{key}` is the drilldown payload. The lifecycle
+verdicts ride in the snapshot and the drilldown — each machine's `lifecycle`
+and `age_estimate`, and the counts in `summary.lifecycle` — so there is no
+endpoint of its own; `lifecycle=replace|repair|investigate|watch|keep` is a
+filter parameter like the others, and any other value is refused with a 400
+naming the five rather than answered with an empty fleet. Every endpoint, the
 filter parameters they share with the dashboard, and how authorization is
 applied are in
 [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API).

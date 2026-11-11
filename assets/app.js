@@ -638,6 +638,204 @@ export function lineChart(host, {
   host.append(root);
 }
 
+/** Half the width of a mark. With its 2px ring a mark is 12px across: small
+ *  enough that a few hundred share a plot, and above the 8px floor. */
+const MARK_R = 4;
+
+/**
+ * One scatter mark: a circle, a square or a triangle, of about equal area so no
+ * shape reads as bigger news than another. Filled marks carry the surface ring
+ * every marker does and a little transparency, so where they crowd they stay
+ * countable; a hollow mark is the outline alone, in its colour.
+ */
+function markNode(cx, cy, { shape = 'circle', colour, hollow = false }) {
+  const paint = hollow
+    ? { fill: 'none', stroke: colour, 'stroke-width': 2, 'stroke-opacity': 0.9 }
+    : { fill: colour, 'fill-opacity': 0.85, stroke: ink('--surface-1'), 'stroke-width': 2 };
+  if (shape === 'square') {
+    const h = MARK_R * 0.9;
+    return svg('path', {
+      d: `M${cx - h},${cy - h}L${cx + h},${cy - h}L${cx + h},${cy + h}L${cx - h},${cy + h}Z`, ...paint,
+    });
+  }
+  if (shape === 'triangle') {
+    const h = MARK_R * 1.25;
+    return svg('path', {
+      d: `M${cx},${cy - h}L${cx + h},${cy + h * 0.7}L${cx - h},${cy + h * 0.7}Z`, ...paint,
+    });
+  }
+  return svg('circle', { cx, cy, r: MARK_R, ...paint });
+}
+
+/** A legend whose keys are the marks themselves, for a chart where shape and
+ *  fill carry meaning as well as colour. */
+export function markLegend(items) {
+  return el('div', { class: 'legend' }, items.map((it) => el('span', { class: 'legend-item' }, [
+    svg('svg', {
+      class: 'legend-mark', width: 14, height: 14, viewBox: '0 0 14 14', 'aria-hidden': 'true',
+    }, [markNode(7, 7, it)]),
+    el('span', { text: it.label }),
+  ])));
+}
+
+/**
+ * Two continuous measures, one mark per thing. Each point is `{ x, y, colour,
+ * shape, hollow, layer }`: the layer orders the paint, lowest first, so the
+ * marks that call for a decision sit on top of the ones that don't.
+ *
+ * Not a hit target per mark. At a few hundred marks those overlap into each
+ * other and put a few hundred stops in the tab order, so — as the line chart's
+ * crosshair finds the nearest date — one overlay finds the nearest mark, the
+ * arrow keys step through them in x order, and Enter does what a click does.
+ * On touch the first tap shows a mark and a second opens it, since there is no
+ * hover to preview with.
+ *
+ * `xRef` draws a reference line, labelled `xRefLabel`. Nothing to plot draws
+ * nothing: an empty frame is noise, and `empty` says why instead.
+ */
+export function scatterChart(host, {
+  points, xTitle, yTitle, xRef = null, xRefLabel = '', readout, onSelect,
+  ariaLabel = 'Scatter plot', empty = 'Nothing to plot.',
+}) {
+  if (!points.length) {
+    host.append(el('div', { class: 'empty', text: empty }));
+    return;
+  }
+  const width = Math.max(320, host.clientWidth || 520);
+  const m = { top: 26, right: 16, bottom: 44, left: 48 };
+  const plotH = 260;
+  const height = plotH + m.top + m.bottom;
+  const plotW = width - m.left - m.right;
+  const yScale = niceTicks(Math.max(...points.map((p) => p.y), 0), 4, 1);
+  // Room for a whole-number tick roughly every 56px, so a phone gets fewer.
+  const xScale = niceTicks(Math.max(...points.map((p) => p.x), xRef ?? 0, 1),
+    Math.max(2, Math.min(8, Math.floor(plotW / 56))), 1);
+  const x = (v) => m.left + (v / xScale.max) * plotW;
+  const y = (v) => m.top + plotH - (v / yScale.max) * plotH;
+  const root = svg('svg', { class: 'chart', viewBox: `0 0 ${width} ${height}`, width, height });
+
+  for (const t of yScale.ticks) {
+    root.append(svg('line', {
+      x1: m.left, x2: m.left + plotW, y1: y(t), y2: y(t),
+      stroke: t === 0 ? ink('--axis') : ink('--grid'), 'stroke-width': 1,
+    }));
+    root.append(svg('text', {
+      x: m.left - 8, y: y(t) + 4, 'text-anchor': 'end',
+      fill: ink('--text-muted'), 'font-size': 11, 'font-variant-numeric': 'tabular-nums',
+    }, [document.createTextNode(nf0.format(t))]));
+  }
+  for (const t of xScale.ticks) {
+    root.append(svg('line', {
+      x1: x(t), x2: x(t), y1: m.top, y2: m.top + plotH,
+      stroke: t === 0 ? ink('--axis') : ink('--grid'), 'stroke-width': 1,
+    }));
+    root.append(svg('text', {
+      x: x(t), y: m.top + plotH + 16, 'text-anchor': 'middle',
+      fill: ink('--text-muted'), 'font-size': 11, 'font-variant-numeric': 'tabular-nums',
+    }, [document.createTextNode(nf0.format(t))]));
+  }
+  root.append(svg('text', {
+    x: m.left + plotW / 2, y: height - 6, 'text-anchor': 'middle', fill: ink('--text-secondary'), 'font-size': 11,
+  }, [document.createTextNode(xTitle)]));
+  root.append(svg('text', {
+    x: 4, y: m.top - 12, 'text-anchor': 'start', fill: ink('--text-secondary'), 'font-size': 11,
+  }, [document.createTextNode(yTitle)]));
+
+  // A threshold, not data: a solid hairline in the axis's ink, labelled on
+  // whichever side has room so it never runs off the plot.
+  if (xRef !== null) {
+    const rx = x(xRef);
+    root.append(svg('line', {
+      x1: rx, x2: rx, y1: m.top, y2: m.top + plotH, stroke: ink('--text-muted'), 'stroke-width': 1,
+    }));
+    const right = rx + 6 + textWidth(xRefLabel, 11) <= m.left + plotW;
+    root.append(svg('text', {
+      x: right ? rx + 6 : rx - 6, y: m.top + 12, 'text-anchor': right ? 'start' : 'end',
+      fill: ink('--text-secondary'), 'font-size': 11,
+    }, [document.createTextNode(xRefLabel)]));
+  }
+
+  const painted = points.slice().sort((a, b) => (a.layer || 0) - (b.layer || 0) || a.x - b.x);
+  for (const p of painted) root.append(markNode(x(p.x), y(p.y), p));
+
+  // Keyboard order: left to right, and top to bottom at one age.
+  const order = points.slice().sort((a, b) => a.x - b.x || b.y - a.y);
+  const ring = svg('circle', {
+    cx: x(order[0].x), cy: y(order[0].y), r: MARK_R * 2, fill: 'none',
+    stroke: ink('--text-primary'), 'stroke-width': 2, visibility: 'hidden',
+  });
+  root.append(ring);
+
+  const overlay = svg('rect', {
+    x: m.left - 6, y: m.top - 6, width: plotW + 12, height: plotH + 12, fill: 'transparent', tabindex: '0',
+    role: 'img',
+    'aria-label': `${ariaLabel}. ${points.length} mark(s); the arrow keys step through them`
+      + `${onSelect ? ' and Enter opens one' : ''}. The table view lists every one.`,
+  });
+  const view = (e) => {
+    const box = root.getBoundingClientRect();
+    return [((e.clientX - box.left) / box.width) * width, ((e.clientY - box.top) / box.height) * height];
+  };
+  const nearest = ([vx, vy]) => {
+    let best = null;
+    let bestD = 14 * 14;
+    for (const p of points) {
+      const d = (x(p.x) - vx) ** 2 + (y(p.y) - vy) ** 2;
+      if (d <= bestD) { bestD = d; best = p; }
+    }
+    return best;
+  };
+  // Marks that land on the same pixel are one mark to a pointer, so the
+  // tooltip owns up to the rest.
+  const stacked = (p) => points.filter((q) => Math.abs(x(q.x) - x(p.x)) < 1 && Math.abs(y(q.y) - y(p.y)) < 1).length - 1;
+  let current = null;
+  const show = (p, ev) => {
+    current = p;
+    ring.setAttribute('cx', x(p.x));
+    ring.setAttribute('cy', y(p.y));
+    ring.setAttribute('visibility', 'visible');
+    const box = root.getBoundingClientRect();
+    const at = ev || {
+      clientX: box.left + (x(p.x) / width) * box.width,
+      clientY: box.top + (y(p.y) / height) * box.height,
+    };
+    tip.show(at, () => readout(p, stacked(p)));
+  };
+  const clear = () => {
+    current = null;
+    ring.setAttribute('visibility', 'hidden');
+    overlay.setAttribute('cursor', 'default');
+    tip.hide();
+  };
+  overlay.addEventListener('pointermove', (e) => {
+    const p = nearest(view(e));
+    if (!p) { clear(); return; }
+    overlay.setAttribute('cursor', onSelect ? 'pointer' : 'default');
+    show(p, e);
+  });
+  overlay.addEventListener('pointerleave', clear);
+  overlay.addEventListener('click', (e) => {
+    const p = nearest(view(e));
+    if (!p) return;
+    if (e.pointerType === 'touch' && current !== p) { show(p, e); return; }
+    if (onSelect) onSelect(p);
+  });
+  overlay.addEventListener('focus', () => show(current || order[0]));
+  overlay.addEventListener('blur', clear);
+  overlay.addEventListener('keydown', (e) => {
+    const i = Math.max(0, order.indexOf(current));
+    const step = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[e.key];
+    let next = null;
+    if (step) next = order[(i + step + order.length) % order.length];
+    else if (e.key === 'Home') next = order[0];
+    else if (e.key === 'End') next = order[order.length - 1];
+    else if (e.key === 'Enter' && current && onSelect) { onSelect(current); return; }
+    if (next) { e.preventDefault(); show(next); }
+  });
+  root.append(overlay);
+  host.append(root);
+}
+
 /* ------------------------------------------------------------ chart cards */
 
 const redraws = [];
@@ -762,6 +960,46 @@ const QUEUES = {
   coverage: 'The data we hold',
 };
 
+/*
+ * The lifecycle decisions, most urgent first, as the server orders them. Only
+ * the two that cost money get a colour, and it is a status role that already
+ * means "critical" and "warning" here — the rest share the de-emphasis gray,
+ * because a third or fourth hue for "investigate" would be a new palette
+ * entry with nothing validating it. Shape repeats what colour says, so no
+ * decision rests on colour alone.
+ */
+const DECISIONS = [
+  { key: 'replace', label: 'Replace', role: '--status-critical', dot: 'critical', shape: 'square', layer: 2,
+    sub: 'the machine, not a part' },
+  { key: 'repair', label: 'Repair', role: '--status-warning', dot: 'warning', shape: 'triangle', layer: 1,
+    sub: 'a part, not the platform' },
+  { key: 'investigate', label: 'Investigate', role: '--deemph', shape: 'circle', layer: 0,
+    sub: 'slower than its hardware should be' },
+  { key: 'watch', label: 'Watch', role: '--deemph', shape: 'circle', layer: 0, sub: 'old, or graded D' },
+  { key: 'keep', label: 'Keep', role: '--deemph', shape: 'circle', layer: 0, sub: 'nothing calls for a decision' },
+];
+
+const decisionOf = (key) => DECISIONS.find((d) => d.key === key) || DECISIONS[DECISIONS.length - 1];
+const decisionRank = (key) => DECISIONS.findIndex((d) => d.key === key);
+
+/** "at most 6.2 yr" or "about 4.1 yr": the server's best estimate of a
+ *  machine's age, worded as the bound from its CPU's launch or as a dating
+ *  from its original firmware — which are different claims. */
+function ageWords(est) {
+  if (!est) return null;
+  const yr = (est.months / 12).toFixed(1);
+  return est.basis === 'firmware' ? `about ${yr} yr` : `at most ${yr} yr`;
+}
+
+/** The decision and its reasons in one line, for the drilldown. */
+function lifecycleFact(m) {
+  const l = m.lifecycle;
+  if (!l) return null;
+  if (l.verdict === 'keep') return 'Keep — nothing in the latest run calls for a decision';
+  return `${decisionOf(l.verdict).label} — ${l.reasons.join('; ')}`
+    + (l.uncertain ? `. Re-measure before acting: ${l.caveats.join('; ').toLowerCase()}` : '');
+}
+
 // Exported, with the view functions, so `scripts/check-ui.mjs` can render every
 // view against a real snapshot outside a browser. That check is the only thing
 // standing between a typo in here and a blank panel in production.
@@ -775,10 +1013,13 @@ export const state = {
   by: null,
   /// How many weeks back the overview's "What changed" compares with.
   window: 1,
+  /// The decision the Lifecycle view's table is showing, or null for every
+  /// one but keep.
+  decision: null,
 };
 
 /** The filter fields the URL carries, all sent to the server as they are. */
-const FILTER_KEYS = ['since_days', 'tags', 'flag', 'q', 'cohort', 'model', 'cpu', 'os'];
+const FILTER_KEYS = ['since_days', 'tags', 'flag', 'q', 'cohort', 'model', 'cpu', 'os', 'lifecycle'];
 
 function parseHash() {
   const raw = location.hash.replace(/^#\/?/, '');
@@ -790,7 +1031,7 @@ function parseHash() {
     const v = params.get(k);
     if (v) filter[k] = v;
   }
-  const named = ['overview', 'cohorts', 'groups', 'machines', 'compare'];
+  const named = ['overview', 'cohorts', 'groups', 'lifecycle', 'machines', 'compare'];
   const view = parts[0] === 'machine'
     ? 'machine'
     : (named.includes(parts[0]) ? parts[0] : 'overview');
@@ -809,16 +1050,21 @@ function parseHash() {
     // The same, for the overview's comparison. Passed to the server as it
     // is, so a hand-edited window is refused there, with its reason.
     window: Number(params.get('changes')) || 1,
+    // The Lifecycle view's tile, which picks the rows of its table. Not the
+    // `lifecycle` filter: that narrows the whole fleet, the tiles' own counts
+    // included, so choosing a tile through it would zero every other tile.
+    decision: params.get('decision') || null,
     filter,
   };
 }
 
 function writeHash({
   view = state.view, key = state.key, filter = state.filter, runs = state.runs, by = state.by,
-  window: weeks = state.window,
+  window: weeks = state.window, decision = state.decision,
 } = {}) {
   const params = new URLSearchParams(filter);
   if (view === 'groups' && by) params.set('by', by);
+  if (view === 'lifecycle' && decision) params.set('decision', decision);
   if (view === 'overview' && weeks && weeks !== 1) params.set('changes', String(weeks));
   const q = params.toString();
   let path = view;
@@ -1020,20 +1266,50 @@ function syncFilterControls() {
   // A group drilled into from the Groups view. There is no list of values to
   // offer, and a filter nobody can see is one nobody thinks to clear — so
   // each is shown as itself, and pressing it lets go of it.
+  const shown = (k) => (k === 'lifecycle' ? decisionOf(state.filter[k]).label : state.filter[k]);
   $('#f-exact').replaceChildren(...EXACT_FILTERS.filter(([k]) => state.filter[k]).map(([k, label]) => (
     el('span', { class: 'field filter-exact' }, [
       el('span', { class: 'field-label', text: label }),
       el('button', {
-        type: 'button', class: 'btn', title: state.filter[k],
-        'aria-label': `${label} is ${state.filter[k]}. Stop filtering by it`,
+        type: 'button', class: 'btn', title: shown(k),
+        'aria-label': `${label} is ${shown(k)}. Stop filtering by it`,
         onclick: () => applyFilter({ [k]: undefined }),
-      }, [el('span', { class: 'filter-exact-value', text: state.filter[k] }), el('span', { text: ' ✕', 'aria-hidden': 'true' })]),
+      }, [el('span', { class: 'filter-exact-value', text: shown(k) }), el('span', { text: ' ✕', 'aria-hidden': 'true' })]),
     ])
   )));
 }
 
-/** The exact-match filters, by query parameter, with what to call each. */
-const EXACT_FILTERS = [['model', 'System model'], ['cpu', 'CPU'], ['os', 'OS']];
+/** The exact-match filters, by query parameter, with what to call each. A
+ *  decision is set from the Groups view's replace and repair counts. */
+const EXACT_FILTERS = [['model', 'System model'], ['cpu', 'CPU'], ['os', 'OS'], ['lifecycle', 'Decision']];
+
+/**
+ * The tab strip scrolls inside itself where the tabs outgrow the row — a
+ * phone, with six of them — which leaves two jobs no scrollbar does: keep
+ * the current tab in view, since it may be the one scrolled off, and show
+ * that there is more to either side. The strip hides its scrollbar (a bar
+ * under the navigation is worse than none), so the cue is a fade on the edge
+ * where tabs continue, set here because only script knows the scroll offset.
+ *
+ * `reveal` is for a view change or a resize; a scroll by hand only updates the
+ * fade, so the strip does not fight the reader's finger.
+ */
+function syncTabStrip(reveal) {
+  const strip = $('#tabs');
+  if (!strip) return;
+  const active = strip.querySelector('[aria-current="page"]');
+  if (reveal && active) {
+    // Clear of the 28px fade, so the current tab is never the faded one.
+    const pad = 28;
+    const s = strip.getBoundingClientRect();
+    const t = active.getBoundingClientRect();
+    if (t.left < s.left + pad) strip.scrollLeft -= s.left + pad - t.left;
+    else if (t.right > s.right - pad) strip.scrollLeft += t.right - (s.right - pad);
+  }
+  const hidden = strip.scrollWidth - strip.clientWidth;
+  strip.classList.toggle('more-before', hidden > 1 && strip.scrollLeft > 1);
+  strip.classList.toggle('more-after', hidden > 1 && strip.scrollLeft < hidden - 1);
+}
 
 function applyFilter(patch) {
   const filter = { ...state.filter, ...patch };
@@ -1053,6 +1329,8 @@ function wireFilters() {
     const btn = e.target.closest('.tab');
     if (btn) writeHash({ view: btn.dataset.view, key: null });
   });
+  $('#tabs').addEventListener('scroll', () => syncTabStrip(false), { passive: true });
+  window.addEventListener('resize', debounce(() => syncTabStrip(true), 150));
 
   $('#rescan').addEventListener('click', async () => {
     const btn = $('#rescan');
@@ -1170,6 +1448,8 @@ export async function renderOverview(main) {
       `${s.thermally_limited} throttled, ${s.partial} partial`),
     tile('Stale', nf0.format(s.stale), `not measured in ${nf0.format(state.snap.thresholds.stale_days)} days`),
     tile('Weak identity', nf0.format(s.weak_identity), 'identifier resets on reimage'),
+    s.lifecycle ? tile('To replace', nf0.format(s.lifecycle.replace),
+      `${s.lifecycle.repair} to repair, ${s.lifecycle.investigate} to investigate · see Lifecycle`) : null,
   ])]);
 
   const grades = s.grades.filter((g) => g[0] !== 'unrecognised' || g[1] > 0);
@@ -1648,6 +1928,24 @@ function drillInto(g, by) {
   writeHash({ view: 'machines', key: null, filter: { ...state.filter, ...patch } });
 }
 
+/** A group's replace or repair count, which opens those machines when there
+ *  are any and the group is one a filter can select — "which site needs
+ *  budget" answered, and then shown. */
+function decidedIn(g, by, verdict) {
+  const n = g[verdict];
+  if (n === undefined || n === null) return null;
+  const patch = groupFilter(g, by);
+  if (!n || !patch) return n;
+  return el('button', {
+    type: 'button', class: 'link-button', text: nf0.format(n),
+    'aria-label': `${nf0.format(n)} to ${verdict} in ${groupLabel(g, by)}: show them`,
+    onclick: (e) => {
+      e.stopPropagation();
+      writeHash({ view: 'machines', key: null, filter: { ...state.filter, ...patch, lifecycle: verdict } });
+    },
+  });
+}
+
 /** "-7.5% · 6 machines, thin", the headline figure as the table states it. */
 function vsIdentical(g) {
   if (g.median_cohort_delta_pct === null) return 'no peer group';
@@ -1861,7 +2159,8 @@ export async function renderGroups(main) {
     }),
     dataTable({
       columns: [{ label: 'Group' }, { label: 'Machines', num: true }, { label: 'Flagged', num: true },
-        { label: 'Critical', num: true }, { label: 'Median score', num: true },
+        { label: 'Critical', num: true }, { label: 'Replace', num: true }, { label: 'Repair', num: true },
+        { label: 'Median score', num: true },
         { label: 'vs identical', num: true }, { label: 'Trend', num: true }, { label: 'Stale', num: true },
         { label: 'Median age', num: true }, { label: 'Top findings', wrap: true }],
       rows: groups.map((g) => ({
@@ -1876,6 +2175,8 @@ export async function renderGroups(main) {
           g.machines,
           `${g.flagged} (${pct(share(g.flagged, g.machines))})`,
           g.machines_critical,
+          decidedIn(g, by, 'replace'),
+          decidedIn(g, by, 'repair'),
           num(g.median_score, 0),
           vsIdentical(g),
           g.median_trend_pct === null ? '—' : `${signed(g.median_trend_pct, 1)} · ${g.with_trend}`,
@@ -1886,6 +2187,7 @@ export async function renderGroups(main) {
             : '—',
         ],
         sort: [groupLabel(g, by).toLowerCase(), g.machines, share(g.flagged, g.machines), g.machines_critical,
+          g.replace ?? null, g.repair ?? null,
           g.median_score, g.median_cohort_delta_pct, g.median_trend_pct, g.stale, g.median_max_age_months,
           g.top_flags[0]?.machines ?? null],
       })),
@@ -1897,6 +2199,188 @@ export async function renderGroups(main) {
   main.append(el('div', { class: 'grid' }, groups.length
     ? [intro, identicalCard, attentionCard, gradesCard, tableCard]
     : [intro, el('div', { class: 'card col-12' }, [el('div', { class: 'empty', text: 'No machines in view to group.' })])]));
+}
+
+/** Tag keys across the machines in view, one table column each. */
+function tagKeysOf(machines) {
+  return [...new Set(machines.flatMap((m) => Object.keys(m.tags || {})))].sort();
+}
+
+/**
+ * What each machine calls for: replace, repair, investigate, watch or keep.
+ *
+ * The server has decided every verdict and written down why; this lays it out.
+ * The tiles choose which decision the table lists — a view setting carried in
+ * the hash beside the filter, like the Groups view's dimension, because it
+ * picks rows here rather than narrowing the fleet everywhere.
+ */
+export function renderLifecycle(main) {
+  const snap = state.snap;
+  const counts = snap.summary.lifecycle || {};
+  const years = nf0.format(snap.thresholds.replace_age_years);
+  const chosen = DECISIONS.some((d) => d.key === state.decision) ? state.decision : null;
+
+  const tiles = el('div', { class: 'tiles decision-tiles', role: 'group', 'aria-label': 'List machines by decision' },
+    DECISIONS.map((d) => el('button', {
+      type: 'button',
+      class: `card decision-tile${d.key === 'keep' ? ' decision-quiet' : ''}`,
+      'aria-pressed': chosen === d.key ? 'true' : 'false',
+      onclick: () => writeHash({ view: 'lifecycle', decision: chosen === d.key ? null : d.key }),
+    }, [
+      el('div', { class: 'tile-label' }, [
+        d.dot ? el('span', { class: `chip-dot dot-${d.dot}` }) : null,
+        el('span', { text: d.label }),
+      ]),
+      el('div', { class: 'tile-value', text: nf0.format(counts[d.key] ?? 0) }),
+      el('div', { class: 'tile-sub', text: d.sub }),
+    ])));
+
+  const intro = el('div', { class: 'card col-12' }, [
+    el('div', { class: 'card-head' }, [el('h3', { text: 'What each machine calls for' })]),
+    tiles,
+    el('p', {
+      class: 'card-sub lifecycle-rule',
+      text: `Replace a machine graded F, or one at least ${years} years old that is also graded D or F or has a `
+        + 'part problem. Repair a part — a worn battery, a failing or worn drive, one weak component — on a '
+        + 'machine otherwise worth keeping. Investigate one slower than identical machines or than its own past: '
+        + 'it should be faster, and finding out why costs less than buying. Watch one that is old or graded D. '
+        + 'Age alone is never a reason to buy: an old machine that performs and whose parts are sound is watched, '
+        + 'not replaced. Grades are against the reference baseline, so an F means inadequate against that '
+        + 'reference, which an estate with modest needs may reasonably disagree with. A decision marked '
+        + '“re-measure first” rests on a run that was throttled, on battery, held back or incomplete.',
+    }),
+  ]);
+
+  // Plotted: machines with both an age estimate and a score. The rest are
+  // counted in the note rather than placed at a guessed age.
+  const aged = snap.machines.filter((m) => m.age_estimate && m.score !== null && m.lifecycle);
+  const noAge = snap.machines.filter((m) => !m.age_estimate).length;
+  const noScore = snap.machines.filter((m) => m.age_estimate && m.score === null).length;
+  const pointsFor = () => aged.map((m) => {
+    const d = decisionOf(m.lifecycle.verdict);
+    return {
+      x: m.age_estimate.months / 12, y: m.score, shape: d.shape, layer: d.layer, colour: ink(d.role),
+      hollow: m.age_estimate.basis !== 'firmware', m, d,
+    };
+  });
+  const readout = (p, more) => tipBlock(p.m.hostname || p.m.key, [
+    ['', p.d.label + (p.m.lifecycle.uncertain ? ' · re-measure first' : ''), p.colour],
+    ['old', ageWords(p.m.age_estimate)],
+    [`graded ${p.m.grade || '—'}`, nf0.format(p.m.score)],
+    ...(p.m.lifecycle.reasons.length ? [[p.m.lifecycle.reasons[0], '']] : []),
+    ...(more > 0 ? [[`more machine(s) at this point`, nf0.format(more)]] : []),
+  ]);
+  const scatterCard = chartCard({
+    title: 'Age against score',
+    subtitle: `Each machine’s best-estimate age against its overall score. The line is ${years} years, from `
+      + 'where a machine counts as old. Select a mark to open the machine.',
+    note: [
+      'Hollow marks are upper bounds from the CPU’s launch: the machine is at most that old, so its true place is '
+        + 'on or left of its mark. Filled marks are dated by firmware that looks original.',
+      noAge ? `${nf0.format(noAge)} machine(s) with no age estimate are left off — their CPU isn’t in the launch `
+        + 'table and nothing else dates them.' : null,
+      noScore ? `${nf0.format(noScore)} without an overall score are left off.` : null,
+    ].filter(Boolean).join(' '),
+    span: 'col-12',
+    draw: (host) => {
+      if (aged.length) {
+        host.append(markLegend([
+          { label: 'Replace', shape: 'square', colour: ink('--status-critical') },
+          { label: 'Repair', shape: 'triangle', colour: ink('--status-warning') },
+          { label: 'Investigate, watch or keep', shape: 'circle', colour: ink('--deemph') },
+          { label: 'Dated', shape: 'circle', colour: ink('--text-secondary') },
+          { label: 'At most', shape: 'circle', colour: ink('--text-secondary'), hollow: true },
+        ]));
+      }
+      scatterChart(host, {
+        points: pointsFor(),
+        xTitle: 'Age, years — best estimate',
+        yTitle: 'Score',
+        xRef: snap.thresholds.replace_age_years,
+        xRefLabel: `old from ${years} yr`,
+        readout,
+        onSelect: (p) => writeHash({ view: 'machine', key: p.m.key }),
+        ariaLabel: 'Each machine’s age against its score, marked by decision',
+        empty: 'No machine in view has both an age estimate and a score.',
+      });
+    },
+    table: () => dataTable({
+      columns: [{ label: 'Machine' }, { label: 'Decision' }, { label: 'Age', num: true },
+        { label: 'Score', num: true }, { label: 'Grade' }],
+      rows: aged.map((m) => ({
+        key: m.key,
+        cells: [m.hostname || m.key, decisionOf(m.lifecycle.verdict).label, ageWords(m.age_estimate),
+          num(m.score, 0), m.grade || '—'],
+        sort: [(m.hostname || m.key).toLowerCase(), decisionRank(m.lifecycle.verdict), m.age_estimate.months,
+          m.score, gradeSort(m.grade)],
+      })),
+      onRow: (r) => writeHash({ view: 'machine', key: r.key }),
+      sortable: true,
+    }),
+  });
+
+  const listed = snap.machines
+    .filter((m) => m.lifecycle && (chosen ? m.lifecycle.verdict === chosen : m.lifecycle.verdict !== 'keep'))
+    .sort((a, b) => decisionRank(a.lifecycle.verdict) - decisionRank(b.lifecycle.verdict)
+      || (a.hostname || a.key).localeCompare(b.hostname || b.key));
+  const tagKeys = tagKeysOf(listed);
+  const pctOf = (v) => (v === null || v === undefined ? null : `${nf0.format(v)}%`);
+  const decisionCell = (m) => {
+    const d = decisionOf(m.lifecycle.verdict);
+    return el('span', { class: 'decision-cell' }, [
+      d.dot ? el('span', { class: `chip-dot dot-${d.dot}` }) : null,
+      el('span', { text: d.label }),
+      m.lifecycle.uncertain
+        ? el('span', { class: 'chip', text: 're-measure first', title: m.lifecycle.caveats.join('; ') })
+        : null,
+    ]);
+  };
+  const keepHidden = !chosen && counts.keep
+    ? ` ${nf0.format(counts.keep)} to keep are not listed; choose Keep above to see them.` : '';
+  const tableCard = el('div', { class: 'card col-12' }, [
+    el('div', { class: 'card-head' }, [el('h3', {
+      text: chosen ? `${decisionOf(chosen).label} · ${listed.length}` : `${listed.length} machine(s) calling for a decision`,
+    })]),
+    el('p', {
+      class: 'card-sub',
+      text: 'Most urgent first, then by name; the reasons lead with what decided it. Click a column to sort, or a '
+        + `machine to open it.${keepHidden}`,
+    }),
+    listed.length
+      ? dataTable({
+        columns: [{ label: 'Machine' }, { label: 'Decision' }, { label: 'Reasons', wrap: true },
+          { label: 'Age', num: true }, { label: 'Grade' }, { label: 'Score', num: true },
+          { label: 'Battery', num: true }, { label: 'Worst drive wear', num: true }, { label: 'System model' },
+          ...tagKeys.map((k) => ({ label: k }))],
+        rows: listed.map((m) => ({
+          key: m.key,
+          cells: [
+            machineLink(m), decisionCell(m), m.lifecycle.reasons.join(' · ') || '—', ageWords(m.age_estimate),
+            m.grade || '—', num(m.score, 0), pctOf(m.battery_health), pctOf(m.worst_drive_wear_pct),
+            m.system_model, ...tagKeys.map((k) => m.tags?.[k] ?? '—'),
+          ],
+          sort: [(m.hostname || m.key).toLowerCase(), decisionRank(m.lifecycle.verdict),
+            m.lifecycle.reasons.length, m.age_estimate?.months ?? null, gradeSort(m.grade),
+            m.score, m.battery_health ?? null, m.worst_drive_wear_pct ?? null,
+            m.system_model?.toLowerCase() ?? null, ...tagKeys.map((k) => m.tags?.[k]?.toLowerCase() ?? null)],
+        })),
+        onRow: (r) => writeHash({ view: 'machine', key: r.key }),
+        sortable: true,
+      })
+      : el('div', {
+        class: 'empty',
+        text: chosen ? `No machine in view to ${chosen}.` : 'Nothing in view calls for a decision.',
+      }),
+  ]);
+
+  main.append(el('div', { class: 'grid' }, [intro, scatterCard, tableCard]));
+}
+
+/** A grade as a sort key, best first: the letters do not sort themselves, and
+ *  one this build does not know sorts last, as every missing value does. */
+function gradeSort(g) {
+  const i = ['S', 'A', 'B', 'C', 'D', 'F'].indexOf(g);
+  return i < 0 ? null : i;
 }
 
 export function renderMachines(main) {
@@ -1978,6 +2462,7 @@ export async function renderMachine(main, key) {
     ...(m.system_model ? [['System', m.system_model]] : []),
     ['CPU', m.cpu_model],
     ['Age', age.built || 'unknown — the CPU isn’t in the launch table'],
+    ...(lifecycleFact(m) ? [['Lifecycle', lifecycleFact(m)]] : []),
     ...(age.firmware ? [['Firmware', age.firmware]] : []),
     ...(age.drive ? [['Drive', age.drive]] : []),
     ...(fullest ? [['Fullest volume', fullest]] : []),
@@ -2433,6 +2918,7 @@ function render() {
       || (state.view === 'machine' && tab.dataset.view === 'machines');
     if (on) tab.setAttribute('aria-current', 'page'); else tab.removeAttribute('aria-current');
   }
+  syncTabStrip(true);
   // Filters scope a fleet, so a drilldown of one machine hides them. The
   // comparison keeps them: its picker is built from the filtered snapshot, so
   // the filter is what decides which machines are on offer, and hiding the
@@ -2445,14 +2931,15 @@ function render() {
   if (state.view === 'machine') { renderMachine(main, state.key); return; }
   if (state.view === 'compare') { renderCompare(main, state.runs); return; }
   if (state.view === 'groups') return renderGroups(main);
-  if (state.view === 'cohorts') renderCohorts(main);
+  if (state.view === 'lifecycle') renderLifecycle(main);
+  else if (state.view === 'cohorts') renderCohorts(main);
   else if (state.view === 'machines') renderMachines(main);
   else return renderOverview(main);
 }
 
 async function route() {
   const {
-    view, key, filter, runs, by, window: weeks,
+    view, key, filter, runs, by, window: weeks, decision,
   } = parseHash();
   state.view = view;
   state.key = key;
@@ -2462,6 +2949,7 @@ async function route() {
   // kept for the way back. The overview's window likewise.
   if (view === 'groups') state.by = by;
   if (view === 'overview') state.window = weeks;
+  if (view === 'lifecycle') state.decision = decision;
   const main = $('#main');
   main.classList.add('loading');
   try {

@@ -114,6 +114,18 @@ enum Command {
             conflicts_with = "by"
         )]
         changes: Option<usize>,
+        /// What to do about each machine: the replace, repair and investigate
+        /// candidates, each with the reasons its verdict rests on (`--all`
+        /// adds the machines to watch).
+        ///
+        /// A short rule over the findings and the best estimate of each
+        /// machine's age — replace a failing or old-and-struggling machine,
+        /// repair a part, investigate one slower than its own hardware should
+        /// be — and a verdict resting on a run with a measurement caveat says
+        /// to re-measure first. With `--json`, every machine that is not
+        /// "keep", with the counts.
+        #[arg(long, conflicts_with_all = ["by", "changes"])]
+        lifecycle: bool,
     },
     /// Serve the web dashboard.
     Serve {
@@ -623,11 +635,21 @@ fn main() -> Result<()> {
             all,
             by,
             changes,
+            lifecycle,
         } => {
             let idx = index::Index::open_existing(&config.server.index)?;
             let th = Thresholds::default();
             let now = OffsetDateTime::now_utc();
             let snap = analytics::snapshot(idx.conn(), &th, now)?;
+            if *lifecycle {
+                let report = analytics::lifecycle_report(&snap);
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_lifecycle(&report, *all);
+                }
+                return Ok(());
+            }
             if let Some(window) = changes {
                 // Only as far back as the comparison needs, rather than the
                 // half-year the server keeps for its charts.
@@ -1077,6 +1099,68 @@ fn print_changes(c: &analytics::Changes, snap: &analytics::Snapshot, show_info: 
     }
     if hidden > 0 {
         println!("\n{hidden} informational change(s) hidden — pass --all to see them.");
+    }
+}
+
+/// `report --lifecycle`: the counts, the rule in a sentence, then each
+/// decision that costs something — replace, repair, investigate — with its
+/// machines and their reasons. Machines to watch are counted, and listed with
+/// `--all`; machines to keep are only counted.
+fn print_lifecycle(r: &analytics::LifecycleReport, show_watch: bool) {
+    use analytics::Verdict;
+    let c = &r.counts;
+    println!(
+        "Lifecycle: {} to replace, {} to repair, {} to investigate, {} to watch, {} to keep \
+         ({} machine(s))",
+        c.replace, c.repair, c.investigate, c.watch, c.keep, r.machines
+    );
+    println!(
+        "  Replace: graded F, or at least {years} years old and graded D or F or with a part\n  \
+         problem. Repair: a part problem on a machine that is otherwise worth keeping.\n  \
+         Investigate: slower than identical machines or than its own past. Watch: {years}\n  \
+         years or older, or graded D. Age alone is never a reason to replace, and grades are\n  \
+         against the reference baseline, so an F means inadequate against that reference.",
+        years = r.replace_age_years
+    );
+
+    let mut listed = vec![Verdict::Replace, Verdict::Repair, Verdict::Investigate];
+    if show_watch {
+        listed.push(Verdict::Watch);
+    }
+    for v in listed {
+        let these: Vec<_> = r
+            .candidates
+            .iter()
+            .filter(|m| m.lifecycle.verdict == v)
+            .collect();
+        if these.is_empty() {
+            continue;
+        }
+        let mut title = v.as_str().to_string();
+        title[..1].make_ascii_uppercase();
+        println!("\n{title} · {}", these.len());
+        for m in these {
+            println!(
+                "  {}  {}",
+                m.hostname.as_deref().unwrap_or(&m.machine_key),
+                m.lifecycle.reasons.join("; ")
+            );
+            if m.lifecycle.uncertain {
+                println!(
+                    "      re-measure before acting: {}",
+                    m.lifecycle.caveats.join("; ").to_lowercase()
+                );
+            }
+        }
+    }
+    if !show_watch && c.watch > 0 {
+        println!(
+            "\n{} machine(s) to watch — pass --all to list them.",
+            c.watch
+        );
+    }
+    if c.replace + c.repair + c.investigate == 0 && (!show_watch || c.watch == 0) {
+        println!("\nNothing to replace, repair or investigate.");
     }
 }
 
