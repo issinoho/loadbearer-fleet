@@ -400,6 +400,47 @@ function host(w = 700) {
   auditChart('lineChart/same-instant', h);
 }
 
+// The fleet's timeline: two series on one axis, every week of a half-year, a
+// week with no median at all, and the two lines ending on the same value —
+// where their end labels would print one over the other.
+{
+  const h = host(420);
+  const points = [];
+  for (let k = 26; k >= 0; k -= 1) {
+    const d = new Date(Date.UTC(2026, 10, 11) - k * 7 * 86400000).toISOString().slice(0, 10);
+    points.push({
+      at: d, machines: 40 + (26 - k), machines_flagged: 3 + (k % 4), machines_critical: k % 3,
+      median_score: k === 20 ? null : 1000 + k * 3,
+    });
+  }
+  points[points.length - 1].machines_critical = points[points.length - 1].machines_flagged;
+  mod.lineChart(h, {
+    points,
+    time: (p) => `${p.at}T12:00:00Z`,
+    series: [
+      { label: 'Need attention', colour: '#2a78d6', value: (p) => p.machines_flagged },
+      { label: 'Critical', colour: '#d03b3b', value: (p) => p.machines_critical },
+    ],
+    readout: () => null,
+  });
+  auditChart('lineChart/series', h);
+  const svgRoot = h.children.find((c) => c.tagName === 'svg');
+  const lines = svgRoot.children.filter((c) => c.tagName === 'path' && c.attrs.fill === 'none');
+  check('lineChart/series', lines.length === 2, `${lines.length} line(s) for two series`);
+  const ends = svgRoot.children.filter((c) => c.tagName === 'text' && c.attrs['text-anchor'] === undefined);
+  const ys = ends.map((t) => Number(t.attrs.y));
+  check('lineChart/series', ys.length === 2 && Math.abs(ys[0] - ys[1]) >= 12,
+    `the two end labels sit ${Math.abs(ys[0] - ys[1])}px apart and print over each other`);
+
+  const g = host(420);
+  mod.lineChart(g, {
+    points,
+    time: (p) => `${p.at}T12:00:00Z`,
+    series: [{ label: 'Median score', colour: '#2a78d6', value: (p) => p.median_score }],
+  });
+  auditChart('lineChart/median-with-a-gap', g);
+}
+
 /* ------------------------------------------------------------------- views */
 
 /*
@@ -505,6 +546,33 @@ function realGrouping(by) {
   }
 }
 
+/** `report --changes <weeks> --json`: the same document `/api/changes` sends. */
+function realChanges(weeks) {
+  const target = process.env.CARGO_TARGET_DIR || 'target';
+  const exe = join(
+    target,
+    'debug',
+    process.platform === 'win32' ? 'loadbearer-fleet.exe' : 'loadbearer-fleet',
+  );
+  const db = join(tmpdir(), `lbf-check-chg-${process.pid}.db`);
+  const run = (args) => {
+    const r = spawnSync(exe, ['--index', db, '--log-level', 'warn', ...args], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      console.error(`\n${exe} ${args.join(' ')} failed:\n${r.stderr || r.stdout}`);
+      process.exit(1);
+    }
+    return r.stdout;
+  };
+  try {
+    run(['scan', 'tests/fixtures']);
+    return JSON.parse(run(['report', '--changes', String(weeks), '--json']));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try { rmSync(db + suffix); } catch { /* already gone */ }
+    }
+  }
+}
+
 const snapshot = realSnapshot();
 check('snapshot', snapshot.machines.length > 0, 'the fixtures produced no machines');
 notes.push(`snapshot: ${snapshot.machines.length} machine(s), ${snapshot.flags.length} finding(s), `
@@ -577,6 +645,142 @@ renderView('machines', (h) => mod.renderMachines(h));
   };
   mod.state.snap = { ...snapshot, machines: members, cohorts: [cohort], flags: [] };
   renderView('cohorts/with-peers', (h) => mod.renderCohorts(h));
+  mod.state.snap = snapshot;
+}
+
+/*
+ * The overview fetches its own history: "What changed" from `/api/changes`
+ * and the charts from `/api/timeline`. Answered with what the binary says
+ * about the fixtures — which, measured within a day of each other, have
+ * either nothing to compare against or nothing that changed — then with a
+ * synthetic estate where every list is populated and one is long enough to
+ * collapse, and a half-year of weeks. The timeline is synthetic because
+ * nothing but the server sends one; its fields are `TimelinePoint`'s.
+ */
+async function renderOverviewWith(name, { changes, timeline }) {
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    const body = u.startsWith('/api/changes') ? changes : u.startsWith('/api/timeline') ? timeline : null;
+    if (body instanceof Error) return Promise.resolve({ ok: false, text: () => Promise.resolve(body.message) });
+    return Promise.resolve(body
+      ? { ok: true, json: () => Promise.resolve(body), text: () => Promise.resolve('') }
+      : { ok: false, text: () => Promise.resolve('unexpected request') });
+  };
+  const h = host(1200);
+  try {
+    await mod.renderOverview(h);
+  } catch (err) {
+    failures.push(`${name}: threw ${err.message}`);
+    return null;
+  }
+  const text = textOf(h);
+  check(name, text.includes('What changed'), 'the "What changed" card is missing');
+  check(name, text.includes('judged by today’s rules'), 'the reconstruction is not explained');
+  check(name, !text.includes('undefined'), 'the word "undefined" reached the page');
+  check(name, !text.includes('NaN'), 'the word "NaN" reached the page');
+  check(name, !text.includes('Loading…'), 'a placeholder was left behind');
+  notes.push(`${name}: ${auditTree(name, h)} chart(s), ${text.length} chars of text`);
+  return text;
+}
+
+function weeksOf(n, shape = (k) => ({})) {
+  const points = [];
+  for (let k = n - 1; k >= 0; k -= 1) {
+    const at = new Date(Date.UTC(2026, 10, 11) - k * 7 * 86400000).toISOString().slice(0, 10);
+    const machines = 30 + (n - k);
+    points.push({
+      at,
+      machines,
+      grades: [['S', 2], ['A', 8], ['B', machines - 16], ['C', 4], ['D', 1], ['F', 1]],
+      median_score: 1010 - k * 2,
+      machines_flagged: 4 + (k % 5),
+      machines_critical: 1 + (k % 2),
+      critical: 2,
+      warnings: 6,
+      info: 9,
+      queues: { machine: 8, measurement: 5, coverage: 4 },
+      stale: k % 3,
+      ...shape(k),
+    });
+  }
+  return { generated_at: '2026-11-11T12:00:00Z', weeks: 26, points };
+}
+
+{
+  const real = [realChanges(1), realChanges(13)];
+  const halfYear = weeksOf(27);
+  for (const [i, changes] of real.entries()) {
+    const text = await renderOverviewWith(`overview/real-${changes.window_weeks}`, { changes, timeline: halfYear });
+    if (text) {
+      check(`overview/real-${i}`, changes.baseline_empty
+        ? text.includes('nothing to compare against')
+        : text.includes('Nothing changed between') || text.includes('New findings'),
+      'the fixtures\' changes were not described');
+      check(`overview/real-${i}`, text.includes('Over time') && text.includes('Fleet size and grade mix'),
+        'the over-time charts are missing');
+    }
+  }
+
+  // Every list, one of them long enough to collapse, and every severity.
+  const flags = snapshot.flags.length ? snapshot.flags : [{ machine_key: snapshot.machines[0].key }];
+  const who = (i) => {
+    const m = snapshot.machines[i % snapshot.machines.length];
+    return { machine_key: m.key, hostname: m.hostname };
+  };
+  const finding = (i, severity, extra = {}) => ({
+    ...who(i), code: flags[i % flags.length].code || 'thermal_limited', severity, kind: 'machine',
+    headline: `A headline for change ${i}, long enough to wrap on a phone screen`, new_machine: false, ...extra,
+  });
+  const severities = ['critical', 'warning', 'warning', 'info'];
+  const synthetic = {
+    window_weeks: 4, from: '2026-10-14', to: '2026-11-11', baseline_empty: false,
+    counts: {
+      new_findings: { critical: 3, warning: 6, info: 3 }, new_machine_findings: { critical: 0, warning: 1, info: 0 },
+      resolved: { critical: 1, warning: 0, info: 0 }, worsened: 1, eased: 1,
+      machines_added: 1, machines_added_flagged: 1, grades_down: 1, grades_up: 1,
+    },
+    new_findings: [
+      ...Array.from({ length: 12 }, (_, i) => finding(i, severities[i % 4])),
+      { ...finding(0, 'warning'), machine_key: 'SN-ARRIVED', hostname: 'ARRIVED-01', new_machine: true },
+    ],
+    worsened: [{ ...who(1), code: 'disk_nearly_full', kind: 'machine', from: 'warning', to: 'critical', headline: 'Only 3.0% free on C:\\' }],
+    machines_added: [{ machine_key: 'SN-ARRIVED', hostname: 'ARRIVED-01', grade: 'B', flagged: true }],
+    grade_changes: [
+      { ...who(2), from: 'C', to: 'D', direction: 'down' },
+      { ...who(3), from: 'B', to: 'A', direction: 'up' },
+    ],
+    resolved: [finding(3, 'critical')],
+    eased: [{ ...who(0), code: 'disk_nearly_full', kind: 'machine', from: 'critical', to: 'warning', headline: 'Only 8.0% free on C:\\' }],
+  };
+  const text = await renderOverviewWith('overview/every-change', { changes: synthetic, timeline: halfYear });
+  if (text) {
+    for (const want of ['New findings · 12', 'Worse · 1', 'Machines added · 1', 'Findings on machines added · 1',
+      'Grades · 2', 'Resolved · 1', 'Eased · 1', 'Show all 12', 'was warning', 'C → D', 'ARRIVED-01']) {
+      check('overview/every-change', text.includes(want), `missing ${JSON.stringify(want)}`);
+    }
+    check('overview/every-change', text.indexOf('New findings ·') < text.indexOf('Worse ·')
+      && text.indexOf('Worse ·') < text.indexOf('Resolved ·'), 'new and worse do not come first');
+    check('overview/every-change', !text.includes('SN-ARRIVED'),
+      'a machine with a hostname was shown by its key');
+  }
+
+  // Two weeks of data is not a trend, and must not be drawn as one.
+  const short = await renderOverviewWith('overview/two-weeks', { changes: real[0], timeline: weeksOf(2) });
+  if (short) {
+    check('overview/two-weeks', short.includes('claims a trend that isn’t there'),
+      'two points were drawn as a line rather than explained');
+  }
+
+  // The server refusing a hand-edited window: its reason, and the way back.
+  const refused = await renderOverviewWith('overview/refused', {
+    changes: new Error('"2" is not a change window. Use 1, 4 or 13 (weeks)'),
+    timeline: halfYear,
+  });
+  if (refused) {
+    check('overview/refused', refused.includes('is not a change window') && refused.includes('a week ago instead'),
+      "the server's reason and the way back were not shown");
+    check('overview/refused', refused.includes('Machines needing attention'), 'one failure took the charts with it');
+  }
   mod.state.snap = snapshot;
 }
 

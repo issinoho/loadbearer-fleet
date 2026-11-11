@@ -97,6 +97,23 @@ enum Command {
         /// the same document `/api/groups` sends.
         #[arg(long, value_name = "DIMENSION", value_parser = parse_group_by)]
         by: Option<analytics::GroupBy>,
+        /// What changed since 1, 4 or 13 weeks ago (1 if no number is given):
+        /// findings new, resolved, worse or eased, machines added, grades moved.
+        ///
+        /// The past is reconstructed from the runs the index already holds —
+        /// each machine as it was last measured by then, judged by today's
+        /// rules — so it needs nothing recorded in advance. With `--json`, the
+        /// same document `/api/changes` sends; `--all` lists informational
+        /// changes too.
+        #[arg(
+            long,
+            value_name = "WEEKS",
+            num_args = 0..=1,
+            default_missing_value = "1",
+            value_parser = parse_window,
+            conflicts_with = "by"
+        )]
+        changes: Option<usize>,
     },
     /// Serve the web dashboard.
     Serve {
@@ -601,10 +618,28 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Report { json, all, by } => {
+        Command::Report {
+            json,
+            all,
+            by,
+            changes,
+        } => {
             let idx = index::Index::open_existing(&config.server.index)?;
             let th = Thresholds::default();
-            let snap = analytics::snapshot(idx.conn(), &th, OffsetDateTime::now_utc())?;
+            let now = OffsetDateTime::now_utc();
+            let snap = analytics::snapshot(idx.conn(), &th, now)?;
+            if let Some(window) = changes {
+                // Only as far back as the comparison needs, rather than the
+                // half-year the server keeps for its charts.
+                let timeline = analytics::Timeline::build(idx.conn(), &th, &snap, now, *window)?;
+                let changes = timeline.changes(&snap, *window);
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&changes)?);
+                } else {
+                    print_changes(&changes, &snap, *all);
+                }
+                return Ok(());
+            }
             if let Some(by) = by {
                 let grouping = analytics::grouping(&snap, Some(by.clone()));
                 if *json {
@@ -883,6 +918,165 @@ fn print_report(snap: &analytics::Snapshot, show_info: bool) {
             "\n{} informational flag(s) hidden — pass --all to see them.",
             s.info
         );
+    }
+}
+
+/// `--changes`'s parser: 1, 4 or 13, refused by clap otherwise.
+fn parse_window(s: &str) -> Result<usize, String> {
+    analytics::parse_window(s)
+}
+
+fn severity_word(s: Severity) -> &'static str {
+    match s {
+        Severity::Critical => "critical",
+        Severity::Warning => "warning",
+        Severity::Info => "info",
+    }
+}
+
+fn queue_word(k: FlagKind) -> &'static str {
+    match k {
+        FlagKind::Machine => "machine",
+        FlagKind::Measurement => "measurement",
+        FlagKind::Coverage => "coverage",
+    }
+}
+
+/// `report --changes`: the headline counts, then each list — new and worse
+/// first, as the dashboard orders them. Informational changes are counted but
+/// only listed with `--all`, for the same reason `report` hides them.
+fn print_changes(c: &analytics::Changes, snap: &analytics::Snapshot, show_info: bool) {
+    let weeks = if c.window_weeks == 1 {
+        "1 week".to_string()
+    } else {
+        format!("{} weeks", c.window_weeks)
+    };
+    println!("Changes over {weeks}: {} to {}", c.from, c.to);
+    println!(
+        "  The fleet as it was last measured by each date, judged by today's rules. A result\n  \
+         collected late changes the past, because it is dated when it was measured."
+    );
+    if c.baseline_empty {
+        println!(
+            "\nNo machine had been measured by {}, so there is nothing to compare against{}.",
+            c.from,
+            snap.summary
+                .oldest_run
+                .as_deref()
+                .map(|r| format!(" — the earliest run is from {}", &r[..r.len().min(10)]))
+                .unwrap_or_default()
+        );
+        return;
+    }
+    if c.is_empty() {
+        println!("\nNothing changed between {} and {}.", c.from, c.to);
+        return;
+    }
+
+    let n = &c.counts;
+    let split = |s: &analytics::BySeverity| {
+        format!(
+            "{} critical or warning ({} critical, {} warning), {} informational",
+            s.critical + s.warning,
+            s.critical,
+            s.warning,
+            s.info
+        )
+    };
+    println!("  new findings    {}", split(&n.new_findings));
+    println!("  resolved        {}", split(&n.resolved));
+    println!("  worse / eased   {} / {}", n.worsened, n.eased);
+    println!(
+        "  machines added  {} ({} needing attention)",
+        n.machines_added, n.machines_added_flagged
+    );
+    println!(
+        "  grades          {} down, {} up",
+        n.grades_down, n.grades_up
+    );
+
+    let mut hidden = 0usize;
+    let mut finding = |f: &analytics::FindingChange| {
+        if !show_info && f.severity == Severity::Info {
+            hidden += 1;
+            return;
+        }
+        println!(
+            "  [{:<8}] {:<11} {}  {}",
+            severity_word(f.severity),
+            queue_word(f.kind),
+            f.hostname.as_deref().unwrap_or(&f.machine_key),
+            f.headline
+        );
+    };
+
+    let existing: Vec<_> = c.new_findings.iter().filter(|f| !f.new_machine).collect();
+    if !existing.is_empty() {
+        println!("\nNew findings");
+        existing.into_iter().for_each(&mut finding);
+    }
+    if !c.worsened.is_empty() {
+        println!("\nWorse");
+        for w in &c.worsened {
+            println!(
+                "  [{:<8}] {:<11} {}  {} (was {})",
+                severity_word(w.to),
+                queue_word(w.kind),
+                w.hostname.as_deref().unwrap_or(&w.machine_key),
+                w.headline,
+                severity_word(w.from)
+            );
+        }
+    }
+    if !c.machines_added.is_empty() {
+        println!("\nMachines added");
+        for m in &c.machines_added {
+            println!(
+                "  {}  graded {}{}",
+                m.hostname.as_deref().unwrap_or(&m.machine_key),
+                if m.grade.is_empty() { "—" } else { &m.grade },
+                if m.flagged {
+                    " — needs attention"
+                } else {
+                    ""
+                }
+            );
+        }
+        c.new_findings
+            .iter()
+            .filter(|f| f.new_machine)
+            .for_each(&mut finding);
+    }
+    if !c.grade_changes.is_empty() {
+        println!("\nGrades");
+        for g in &c.grade_changes {
+            println!(
+                "  {}  {} → {}",
+                g.hostname.as_deref().unwrap_or(&g.machine_key),
+                g.from,
+                g.to
+            );
+        }
+    }
+    if !c.resolved.is_empty() {
+        println!("\nResolved");
+        c.resolved.iter().for_each(&mut finding);
+    }
+    if !c.eased.is_empty() {
+        println!("\nEased");
+        for w in &c.eased {
+            println!(
+                "  [{:<8}] {:<11} {}  {} (was {})",
+                severity_word(w.to),
+                queue_word(w.kind),
+                w.hostname.as_deref().unwrap_or(&w.machine_key),
+                w.headline,
+                severity_word(w.from)
+            );
+        }
+    }
+    if hidden > 0 {
+        println!("\n{hidden} informational change(s) hidden — pass --all to see them.");
     }
 }
 

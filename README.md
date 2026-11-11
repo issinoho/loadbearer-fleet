@@ -424,6 +424,7 @@ loadbearer-fleet report                            # summary, cohorts and red fl
 loadbearer-fleet report --all                      # include informational flags
 loadbearer-fleet report --json                     # the whole snapshot, as the UI sees it
 loadbearer-fleet report --by tag:site              # per site: worst share needing attention first
+loadbearer-fleet report --changes 4                # what changed in the last 4 weeks (1, 4 or 13)
 loadbearer-fleet serve \\fileserver\loadbearer     # the dashboard, on http://127.0.0.1:8787
 loadbearer-fleet init-config > fleet.toml          # a starter config, placeholders included
 loadbearer-fleet serve --config fleet.toml         # with single sign-on
@@ -485,6 +486,10 @@ resets when they're reimaged" is something an estate owner should know.
 - [x] Submitting results through the dashboard and over the API, with ingest
       tokens for machines nobody is sitting at — see [When a machine cannot
       reach the share](#when-a-machine-cannot-reach-the-share)
+- [x] The fleet over time — what changed in the last week, month or quarter,
+      and the estate's figures week by week, reconstructed from the runs
+      already indexed — see [What changed, and the fleet over
+      time](#what-changed-and-the-fleet-over-time)
 
 ## Analysis
 
@@ -649,8 +654,10 @@ loadbearer-fleet serve \\fileserver\loadbearer
 ```
 
 Scans the folder, then serves five views on `127.0.0.1:8787`: an executive
-**overview** (how many machines need attention, grade distribution, findings by
-queue, score spread, and the ranked list of what to look at), a **cohort
+**overview** (how many machines need attention, what changed since a week, a
+month or a quarter ago, grade distribution, findings by queue, score spread,
+the ranked list of what to look at, and the same figures week by week over
+the last half-year), a **cohort
 explorer** (each machine against the median of the machines like it), **groups**
 (the estate by site, system model, CPU, OS or any tag), a sortable **machine
 table**, and a **drilldown** per machine with its score history, its
@@ -681,10 +688,67 @@ else. Clicking a group opens the machine table filtered to it.
 `report --by <dimension>` prints the same thing at a prompt — `model`, `cpu`,
 `os`, or `tag:<key>` — and `--json` gives the document the dashboard draws.
 
+### What changed, and the fleet over time
+
+Every other figure on the dashboard describes the fleet *now*. The overview
+also says what changed — since a week, four weeks or thirteen weeks ago, chosen
+on the card and kept in the URL — and charts the estate week by week over the
+last half-year: how many machines needed attention and how many of those were
+critical, the median score, and the fleet's size and grade mix.
+
+"What changed" compares two dates finding by finding, a finding being the same
+rule on the same machine: findings that are **new**, **worse** (warning to
+critical, say), **resolved** or **eased**; machines **added** since, whose
+findings are listed apart because a machine new to the fleet is news of a
+different kind; and machines whose **grade** moved. The headline counts
+critical and warning changes, with informational ones beside them rather than
+in them — a dozen machines going stale is real, and is not the same news as one
+drive failing. When nothing in view had been measured that far back, it says so
+rather than reporting the whole fleet as new.
+
+**None of this is recorded as it happens; it is reconstructed.** The index
+already keeps every run with the time it was taken, so the fleet as it was
+known at any date can be worked out again: each machine as of its latest run
+by then, judged with that date as "today", against only the runs it had by
+then. That has real advantages — an index that has been collecting for a year
+has a year of history the first time this version opens it, a rebuilt index
+rebuilds its past with it, there is no schema change, and the past is judged
+by *today's* rules, so a line that moves moved because the fleet did rather
+than because a threshold was tuned — and some consequences worth knowing:
+
+- **A machine you `forget` leaves the past too**, not just the present.
+- **A result collected late changes the past.** A run taken a month ago and
+  ingested today appears a month ago — it is dated when the machine was
+  measured, not when the server heard — so a past week's figures can move
+  after the week is over.
+- **Old runs only know what was indexed from them.** A field a later version
+  of this tool reads (drive health, for one) is empty on runs indexed before
+  it until `scan --reindex`, so a drive finding cannot appear in a week before
+  the drive data does.
+- **A machine is shown under the tags it carries now**, in every week — the
+  history is projected onto your current view, so the filter and your sign-in
+  scope apply exactly as they do everywhere else, and a machine that moved
+  from one site to another brings its history with it, as its drilldown
+  already does.
+- **A run dated in the future, or with a timestamp that cannot be read**, is
+  in today's view as it always was, but cannot be placed in the past — so
+  until its date arrives it counts as newly added.
+
+The server keeps the last 26 weeks, rebuilt with the snapshot whenever the
+index changes, so reading them costs nothing extra. As a guide to size: at
+2,000 machines with eight runs each it takes about 0.3 s on top of the
+snapshot and holds about 5 MB.
+
+`report --changes [WEEKS]` prints the same comparison at a prompt — 1, 4 or 13
+weeks, a week if no number is given — with `--all` to list informational
+changes too and `--json` for the document the dashboard draws.
+
 `POST /api/rescan` — the Rescan button — re-reads the folder. `GET /api/snapshot`
 returns exactly what the dashboard draws, so any view can be scripted or
 diffed; `GET /api/groups?by=<dimension>` is the Groups tab, taking the same
-filter parameters, and `GET /api/machine/{key}` is the drilldown payload. Every endpoint, the
+filter parameters; `GET /api/changes?window=1|4|13` and
+`GET /api/timeline?weeks=4…26` are the overview's "What changed" and its
+charts, taking the same filter parameters too; and `GET /api/machine/{key}` is the drilldown payload. Every endpoint, the
 filter parameters they share with the dashboard, and how authorization is
 applied are in
 [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API).

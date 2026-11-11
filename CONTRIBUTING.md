@@ -80,6 +80,7 @@ trade-off, not restate what the code already says.
 | `src/schema.rs` | reads `loadbearer.result/1`. Tolerant by design — unknown fields ignored, almost everything optional, open enumerations left as strings |
 | `src/index.rs` | the SQLite index, ingest, the document archive, `backup`, `forget` |
 | `src/analytics.rs` | cohorts, the red-flag engine, the executive summary, the filter projection |
+| `src/analytics/timeline.rs` | the fleet over time, reconstructed from the runs already indexed, and what changed between two dates |
 | `src/web.rs` | the HTTP layer, the snapshot cache, authorization applied as part of the projection |
 | `src/auth.rs` | OIDC sign-in, sessions, roles and tag scopes |
 | `src/config.rs` | the config file, and the validation that refuses placeholders |

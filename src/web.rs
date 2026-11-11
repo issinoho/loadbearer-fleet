@@ -41,7 +41,9 @@ use tower_http::compression::CompressionLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::analytics::{self, Cohort, Detail, Filter, Flag, MachineView, Snapshot, Thresholds};
+use crate::analytics::{
+    self, Cohort, Detail, Filter, Flag, MachineView, Snapshot, Thresholds, Timeline,
+};
 use crate::auth::{self, Authenticator, Caller, IngestTokens, Submitter, token_matches};
 use crate::compare;
 use crate::config::{AuthMode, Config, Metrics as MetricsConfig};
@@ -56,11 +58,39 @@ const APP_JS: &str = include_str!("../assets/app.js");
 // else instead of needing `include_bytes!` and a binary in the repository.
 const LOGO_SVG: &str = include_str!("../assets/logo-mark.svg");
 
+/// The fleet-wide analysis: the snapshot, and the timeline whose newest point
+/// *is* that snapshot. Cached together and replaced together, so a request
+/// never projects one generation's timeline through another's snapshot.
+struct Analysis {
+    snapshot: Arc<Snapshot>,
+    timeline: Arc<Timeline>,
+}
+
+impl Analysis {
+    /// The whole of what a rescan or an external change has to rebuild. The
+    /// timeline is built here and nowhere else, so no request pays for it.
+    fn compute(index: &Index, thresholds: &Thresholds) -> Result<Self> {
+        let now = OffsetDateTime::now_utc();
+        let snapshot = analytics::snapshot(index.conn(), thresholds, now)?;
+        let timeline = Timeline::build(
+            index.conn(),
+            thresholds,
+            &snapshot,
+            now,
+            analytics::TIMELINE_WEEKS,
+        )?;
+        Ok(Self {
+            snapshot: Arc::new(snapshot),
+            timeline: Arc::new(timeline),
+        })
+    }
+}
+
 pub struct AppState {
     index: Mutex<Index>,
     /// The fleet-wide analysis. Replaced wholesale on rescan; readers never
-    /// block on a scan because they hold the previous `Arc` until it is.
-    cache: RwLock<Arc<Snapshot>>,
+    /// block on a scan because they hold the previous `Arc`s until it is.
+    cache: RwLock<Arc<Analysis>>,
     /// The `data_version` the cache was computed at, so a commit by another
     /// process — `forget` from a terminal, most obviously — is noticed rather
     /// than waited out.
@@ -86,11 +116,11 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(index: Index, config: &Config, thresholds: Thresholds) -> Result<Arc<Self>> {
-        let snap = analytics::snapshot(index.conn(), &thresholds, OffsetDateTime::now_utc())?;
+        let analysis = Analysis::compute(&index, &thresholds)?;
         let version = index.data_version().unwrap_or(0);
         Ok(Arc::new(Self {
             index: Mutex::new(index),
-            cache: RwLock::new(Arc::new(snap)),
+            cache: RwLock::new(Arc::new(analysis)),
             data_version: Mutex::new(version),
             thresholds,
             root: config.server.collection_dir.clone(),
@@ -178,6 +208,11 @@ impl AppState {
     /// against an already-open connection, and the rebuild only happens when
     /// the answer has actually changed.
     fn snapshot(&self) -> Arc<Snapshot> {
+        Arc::clone(&self.analysis().snapshot)
+    }
+
+    /// The snapshot and its timeline, from one generation. See `snapshot`.
+    fn analysis(&self) -> Arc<Analysis> {
         if self.index_changed_elsewhere() {
             // A failure here is not worth refusing the request over: the
             // previous snapshot is still a true answer, just an older one.
@@ -209,11 +244,11 @@ impl AppState {
 
     fn recompute(&self) -> Result<()> {
         let idx = self.index.lock().expect("index lock");
-        let snap = analytics::snapshot(idx.conn(), &self.thresholds, OffsetDateTime::now_utc())?;
+        let analysis = Analysis::compute(&idx, &self.thresholds)?;
         // Taken *before* publishing, so a commit that lands during the analysis
         // is noticed next time rather than being taken as already included.
         let version = idx.data_version().unwrap_or(0);
-        *self.cache.write().expect("cache lock") = Arc::new(snap);
+        *self.cache.write().expect("cache lock") = Arc::new(analysis);
         *self.data_version.lock().expect("data version lock") = version;
         Ok(())
     }
@@ -364,9 +399,21 @@ impl FilterParams {
 
 /// The one place a request's visible fleet is decided.
 fn visible(state: &AppState, caller: &Caller, params: FilterParams) -> Snapshot {
+    visible_in(&state.snapshot(), state, caller, params)
+}
+
+/// `visible`, over a snapshot the caller already holds — for a request that
+/// needs the timeline cached beside it and so must take both from one
+/// generation.
+fn visible_in(
+    snap: &Snapshot,
+    state: &AppState,
+    caller: &Caller,
+    params: FilterParams,
+) -> Snapshot {
     let mut filter = params.into_filter();
     filter.scopes = caller.0.scopes.clone();
-    state.snapshot().filtered(&filter, &state.thresholds)
+    snap.filtered(&filter, &state.thresholds)
 }
 
 async fn get_snapshot(
@@ -409,6 +456,60 @@ async fn get_groups(
         .map_err(AppError::bad_request)?;
     let snap = visible(&state, &caller, params);
     Ok(Json(analytics::grouping(&snap, by)))
+}
+
+/// The one parameter `/api/timeline` takes beyond the filter.
+#[derive(Debug, Deserialize, Default)]
+struct TimelineParams {
+    /// 4 to `TIMELINE_WEEKS`; absent for all the server keeps.
+    weeks: Option<String>,
+}
+
+/// The fleet at each of the last few weeks, as the caller sees it now.
+///
+/// Projected onto the caller's *current* view, so the filter and the scope are
+/// applied by `visible` exactly as they are for the snapshot, and the timeline
+/// needs no authorization of its own: every machine at every point is one the
+/// caller can see today. See `analytics::timeline` for what that implies for a
+/// machine that has moved.
+async fn get_timeline(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Query(params): Query<TimelineParams>,
+    Query(filter): Query<FilterParams>,
+) -> Result<Json<analytics::TimelineView>, AppError> {
+    // Judged before the fleet is looked at, as `/api/groups` does.
+    let weeks = match params.weeks.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(s) => analytics::parse_weeks(s).map_err(AppError::bad_request)?,
+        None => analytics::TIMELINE_WEEKS,
+    };
+    let analysis = state.analysis();
+    let view = visible_in(&analysis.snapshot, &state, &caller, filter);
+    Ok(Json(analysis.timeline.view(&view, weeks)))
+}
+
+/// The one parameter `/api/changes` takes beyond the filter.
+#[derive(Debug, Deserialize, Default)]
+struct ChangesParams {
+    /// 1, 4 or 13 weeks; absent for one.
+    window: Option<String>,
+}
+
+/// What changed in the caller's view between now and a week, a month or a
+/// quarter ago. Projected exactly as `get_timeline` is.
+async fn get_changes(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Query(params): Query<ChangesParams>,
+    Query(filter): Query<FilterParams>,
+) -> Result<Json<analytics::Changes>, AppError> {
+    let window = match params.window.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(s) => analytics::parse_window(s).map_err(AppError::bad_request)?,
+        None => analytics::CHANGE_WINDOWS[0],
+    };
+    let analysis = state.analysis();
+    let view = visible_in(&analysis.snapshot, &state, &caller, filter);
+    Ok(Json(analysis.timeline.changes(&view, window)))
 }
 
 /// Everything the drilldown needs for one machine, in one round trip.
@@ -792,6 +893,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/me", get(auth::me))
         .route("/api/snapshot", get(get_snapshot))
         .route("/api/groups", get(get_groups))
+        .route("/api/timeline", get(get_timeline))
+        .route("/api/changes", get(get_changes))
         .route("/api/machine/{key}", get(get_machine))
         .route("/api/compare", get(get_compare))
         .route("/api/rescan", post(post_rescan))
@@ -2293,6 +2396,132 @@ mod tests {
         .await;
         assert_eq!(narrowed.status, StatusCode::OK, "{}", narrowed.body);
         assert_eq!(narrowed.json()["machines"], 2);
+    }
+
+    /// The timeline and the changes are projected onto the caller's current
+    /// view, so a scoped viewer's past is made of their machines only — and
+    /// the filter narrows it as it does everywhere, without widening the scope.
+    #[tokio::test]
+    async fn a_scoped_viewer_sees_only_their_own_machines_over_time() {
+        let state = state_for(&oidc_config());
+        let admin = session(&state, Role::Admin, &[]);
+        let glasgow = session(&state, Role::Viewer, &[&[("site", "glasgow")]]);
+
+        let all = get(&state, "/api/timeline", Some(&admin)).await;
+        assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+        let all = all.json();
+        assert_eq!(all["weeks"], analytics::TIMELINE_WEEKS);
+        let points = all["points"].as_array().expect("points");
+        assert!(!points.is_empty());
+        assert_eq!(points.last().expect("now")["machines"], 4);
+
+        let mine = get(&state, "/api/timeline?weeks=8", Some(&glasgow))
+            .await
+            .json();
+        assert_eq!(mine["weeks"], 8);
+        let points = mine["points"].as_array().expect("points");
+        assert!(points.len() <= 9);
+        assert!(
+            points.iter().all(|p| p["machines"].as_u64() <= Some(1)),
+            "one machine is tagged glasgow, at every point: {points:?}"
+        );
+        assert_eq!(points.last().expect("now")["machines"], 1);
+
+        // Asking for the other site gets nothing, not that site's past.
+        let elsewhere = get(
+            &state,
+            "/api/timeline?tags=site%3Dedinburgh",
+            Some(&glasgow),
+        )
+        .await
+        .json();
+        assert_eq!(elsewhere["points"].as_array().expect("points").len(), 0);
+        let narrowed = get(&state, "/api/timeline?tags=site%3Dedinburgh", Some(&admin))
+            .await
+            .json();
+        assert_eq!(
+            narrowed["points"]
+                .as_array()
+                .expect("points")
+                .last()
+                .expect("now")["machines"],
+            2
+        );
+
+        // Changes name only machines in view, in every list.
+        let snap = get(&state, "/api/snapshot", Some(&glasgow)).await.json();
+        let key = snap["machines"][0]["key"]
+            .as_str()
+            .expect("key")
+            .to_string();
+        for window in [1, 4, 13] {
+            let c = get(
+                &state,
+                &format!("/api/changes?window={window}"),
+                Some(&glasgow),
+            )
+            .await;
+            assert_eq!(c.status, StatusCode::OK, "{}", c.body);
+            let c = c.json();
+            assert_eq!(c["window_weeks"], window);
+            for list in [
+                "new_findings",
+                "worsened",
+                "machines_added",
+                "grade_changes",
+                "resolved",
+                "eased",
+            ] {
+                for item in c[list].as_array().expect("list") {
+                    assert_eq!(item["machine_key"], key.as_str(), "{list}: {item}");
+                }
+            }
+        }
+        let elsewhere = get(&state, "/api/changes?tags=site%3Dedinburgh", Some(&glasgow))
+            .await
+            .json();
+        assert_eq!(
+            elsewhere["baseline_empty"], true,
+            "nothing in view, then or now"
+        );
+    }
+
+    /// A window or a span that cannot mean anything is refused with the reason,
+    /// before the fleet is looked at — and both need a session like every
+    /// other read.
+    #[tokio::test]
+    async fn an_unknown_window_or_span_is_a_bad_request() {
+        let state = state_for(&oidc_config());
+        let cookie = session(&state, Role::Viewer, &[]);
+        for uri in [
+            "/api/changes?window=2",
+            "/api/changes?window=26",
+            "/api/changes?window=week",
+        ] {
+            let r = get(&state, uri, Some(&cookie)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.body);
+            assert!(r.body.contains("1, 4 or 13"), "{uri} said: {}", r.body);
+        }
+        for uri in [
+            "/api/timeline?weeks=3",
+            "/api/timeline?weeks=105",
+            "/api/timeline?weeks=x",
+        ] {
+            let r = get(&state, uri, Some(&cookie)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.body);
+        }
+        assert_eq!(
+            get(&state, "/api/changes", Some(&cookie)).await.json()["window_weeks"],
+            1,
+            "a week when nobody says"
+        );
+        for uri in ["/api/timeline", "/api/changes"] {
+            assert_eq!(
+                get(&state, uri, None).await.status,
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+        }
     }
 
     /// A dimension that cannot mean anything is the caller's mistake, and an

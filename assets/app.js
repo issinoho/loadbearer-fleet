@@ -501,17 +501,27 @@ export function stackedChart(host, {
 /**
  * Score over time. A crosshair finds the X so the reader aims at a date rather
  * than at a 2px line.
+ *
+ * One series by default — a machine's runs, with those measured another way
+ * muted. The fleet's timeline passes `series` instead, each a `{ label,
+ * colour, value(p) }` on one shared axis, with `time(p)` for where a point
+ * sits and `readout(p, series)` for its tooltip. Left out, every one of those
+ * falls back to what this drew before it took them.
  */
-export function lineChart(host, { points }) {
+export function lineChart(host, {
+  points, series, time = (p) => p.taken_at, readout: readoutOf,
+}) {
   const width = Math.max(320, host.clientWidth || 520);
   const m = { top: 20, right: 54, bottom: 34, left: 46 };
   const plotH = 180;
   const height = plotH + m.top + m.bottom;
   const plotW = width - m.left - m.right;
-  const times = points.map((p) => +new Date(p.taken_at));
+  const lines = series || [{ value: (p) => p.score, colour: ink('--series-1'), muted: (p) => !p.comparable }];
+  const has = (v) => v !== null && v !== undefined;
+  const times = points.map((p) => +new Date(time(p)));
   const t0 = Math.min(...times);
   const t1 = Math.max(...times);
-  const { max, ticks } = niceTicks(Math.max(...points.map((p) => p.score || 0)), 4, 1);
+  const { max, ticks } = niceTicks(Math.max(...lines.flatMap((s) => points.map((p) => s.value(p) || 0))), 4, 1);
   const x = (t) => (t1 === t0 ? m.left + plotW / 2 : m.left + ((t - t0) / (t1 - t0)) * plotW);
   const y = (v) => m.top + plotH - (v / max) * plotH;
   const root = svg('svg', { class: 'chart', viewBox: `0 0 ${width} ${height}`, width, height });
@@ -536,32 +546,46 @@ export function lineChart(host, { points }) {
     }, [document.createTextNode(day(new Date(t).toISOString()))]));
   }
 
-  const comparable = points.filter((p) => p.comparable && p.score !== null);
-  const path = comparable.map((p, i) => `${i ? 'L' : 'M'}${x(+new Date(p.taken_at))},${y(p.score)}`).join('');
-  if (comparable.length > 1) {
-    root.append(svg('path', {
-      d: path, fill: 'none', stroke: ink('--series-1'), 'stroke-width': 2,
-      'stroke-linejoin': 'round', 'stroke-linecap': 'round',
-    }));
+  // Every line before any marker, so a marker is never painted under another
+  // series' line.
+  for (const s of lines) {
+    const kept = points.filter((p) => !(s.muted && s.muted(p)) && has(s.value(p)));
+    const path = kept.map((p, i) => `${i ? 'L' : 'M'}${x(+new Date(time(p)))},${y(s.value(p))}`).join('');
+    if (kept.length > 1) {
+      root.append(svg('path', {
+        d: path, fill: 'none', stroke: s.colour, 'stroke-width': 2,
+        'stroke-linejoin': 'round', 'stroke-linecap': 'round',
+      }));
+    }
   }
 
-  points.forEach((p) => {
-    if (p.score === null) return;
-    // Runs measured under another configuration are context, not the series:
-    // the emphasis pattern rather than a second categorical hue.
-    const colour = p.comparable ? ink('--series-1') : ink('--deemph');
-    root.append(svg('circle', {
-      cx: x(+new Date(p.taken_at)), cy: y(p.score), r: 4.5, fill: colour,
-      stroke: ink('--surface-1'), 'stroke-width': 2,
-    }));
-  });
+  for (const s of lines) {
+    points.forEach((p) => {
+      if (!has(s.value(p))) return;
+      // Runs measured under another configuration are context, not the series:
+      // the emphasis pattern rather than a second categorical hue.
+      const colour = s.muted && s.muted(p) ? ink('--deemph') : s.colour;
+      root.append(svg('circle', {
+        cx: x(+new Date(time(p))), cy: y(s.value(p)), r: 4.5, fill: colour,
+        stroke: ink('--surface-1'), 'stroke-width': 2,
+      }));
+    });
+  }
 
+  // The latest value of each line, beside its end. Two lines ending close
+  // together would print one figure over the other, so a label that would
+  // collide steps down a line.
   const last = points[points.length - 1];
-  if (last && last.score !== null) {
+  const used = [];
+  for (const s of lines) {
+    if (!last || !has(s.value(last))) continue;
+    let ly = y(s.value(last)) + 4;
+    while (used.some((u) => Math.abs(u - ly) < 12)) ly += 12;
+    used.push(ly);
     root.append(svg('text', {
-      x: Math.min(x(+new Date(last.taken_at)) + 10, width - 4), y: y(last.score) + 4,
+      x: Math.min(x(+new Date(time(last))) + 10, width - 4), y: Math.min(ly, height),
       fill: ink('--text-secondary'), 'font-size': 11, 'font-variant-numeric': 'tabular-nums',
-    }, [document.createTextNode(nf0.format(last.score))]));
+    }, [document.createTextNode(nf0.format(s.value(last)))]));
   }
 
   const hair = svg('line', {
@@ -579,12 +603,12 @@ export function lineChart(host, { points }) {
     let best = points[0];
     let bestD = Infinity;
     for (const p of points) {
-      const d = Math.abs(x(+new Date(p.taken_at)) - px);
+      const d = Math.abs(x(+new Date(time(p))) - px);
       if (d < bestD) { bestD = d; best = p; }
     }
     return best;
   };
-  const readout = (p) => tipBlock(when(p.taken_at), [
+  const readout = readoutOf ? (p) => readoutOf(p, lines) : (p) => tipBlock(when(p.taken_at), [
     ['score', p.score === null ? '—' : nf0.format(p.score), p.comparable ? ink('--series-1') : ink('--deemph')],
     ['grade', p.grade || '—'],
     ...(p.comparable ? [] : [[`measured with ${p.comparability.preset} / ${p.comparability.build_isa}`, 'not comparable']]),
@@ -595,8 +619,8 @@ export function lineChart(host, { points }) {
   ]);
   overlay.addEventListener('pointermove', (e) => {
     const p = nearest(e.clientX);
-    hair.setAttribute('x1', x(+new Date(p.taken_at)));
-    hair.setAttribute('x2', x(+new Date(p.taken_at)));
+    hair.setAttribute('x1', x(+new Date(time(p))));
+    hair.setAttribute('x2', x(+new Date(time(p))));
     hair.setAttribute('visibility', 'visible');
     tip.show(e, () => readout(p));
   });
@@ -749,6 +773,8 @@ export const state = {
   /// What the Groups view groups by, or null for the server's default. Kept
   /// across a trip to another tab, so coming back finds the same grouping.
   by: null,
+  /// How many weeks back the overview's "What changed" compares with.
+  window: 1,
 };
 
 /** The filter fields the URL carries, all sent to the server as they are. */
@@ -780,15 +806,20 @@ function parseHash() {
     // Beside the filter in the query but not part of it: it says how to
     // arrange the machines in view, not which ones are in view.
     by: params.get('by') || null,
+    // The same, for the overview's comparison. Passed to the server as it
+    // is, so a hand-edited window is refused there, with its reason.
+    window: Number(params.get('changes')) || 1,
     filter,
   };
 }
 
 function writeHash({
   view = state.view, key = state.key, filter = state.filter, runs = state.runs, by = state.by,
+  window: weeks = state.window,
 } = {}) {
   const params = new URLSearchParams(filter);
   if (view === 'groups' && by) params.set('by', by);
+  if (view === 'overview' && weeks && weeks !== 1) params.set('changes', String(weeks));
   const q = params.toString();
   let path = view;
   if (view === 'machine') path = `machine/${encodeURIComponent(key)}`;
@@ -830,6 +861,20 @@ async function fetchGroups() {
   if (state.by) params.set('by', state.by);
   const q = params.toString();
   return fetchJson(`/api/groups${q ? `?${q}` : ''}`);
+}
+
+/** The fleet at each of the last few weeks, projected by the server onto the
+ *  same filtered, scoped view as the snapshot. */
+async function fetchTimeline() {
+  const q = new URLSearchParams(state.filter).toString();
+  return fetchJson(`/api/timeline${q ? `?${q}` : ''}`);
+}
+
+/** What changed in that view since `state.window` weeks ago. */
+async function fetchChanges() {
+  const params = new URLSearchParams(state.filter);
+  params.set('window', String(state.window));
+  return fetchJson(`/api/changes?${params}`);
 }
 
 /*
@@ -1095,7 +1140,7 @@ function findingRow(f, machinesByKey) {
 
 /* ------------------------------------------------------------------- views */
 
-export function renderOverview(main) {
+export async function renderOverview(main) {
   const s = state.snap.summary;
   const machinesByKey = new Map(state.snap.machines.map((m) => [m.key, m]));
 
@@ -1223,9 +1268,271 @@ export function renderOverview(main) {
     ])
     : null;
 
+  // The two history cards are placeholders until their data arrives: the
+  // rest of the overview comes out of the snapshot already in hand, and need
+  // not wait for them — nor disappear if they fail.
+  const changesSlot = el('div', { class: 'card col-12', dataset: { card: 'changes' } }, [
+    el('div', { class: 'card-head' }, [el('h3', { text: 'What changed' })]),
+    el('p', { class: 'card-sub', text: 'Loading…' }),
+  ]);
+  const overTimeSlot = el('div', { class: 'grid col-12', dataset: { card: 'over-time' } });
+
   main.append(el('div', { class: 'grid' }, [
-    hero, tiles, gradeCard, findingsCard, spreadCard, list, configs,
+    hero, tiles, changesSlot, gradeCard, findingsCard, spreadCard, list, configs, overTimeSlot,
   ]));
+
+  const [changes, timeline] = await Promise.all([
+    fetchChanges().catch((err) => err),
+    fetchTimeline().catch((err) => err),
+  ]);
+  changesSlot.replaceChildren(...changesCard(changes, machinesByKey));
+  overTimeSlot.replaceChildren(...overTimeCards(timeline));
+}
+
+/* --------------------------------------------------------------- over time */
+
+/** The comparisons on offer, as the server accepts them. */
+const WINDOWS = [[1, '1 week'], [4, '4 weeks'], [13, '13 weeks']];
+
+/** How the past is worked out, said the way an estate owner would want it. */
+const AS_MEASURED = 'as the fleet was last measured at each date, judged by today’s rules';
+
+/** "Nov 4" from a `YYYY-MM-DD`. A bare date parses as UTC midnight, which is
+ *  the previous evening west of Greenwich, so it is read and shown as UTC. */
+function calendarDay(ymd) {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  if (Number.isNaN(+d)) return ymd;
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+}
+
+/** Where a timeline point sits on a time axis: midday, so no time zone moves
+ *  it onto the neighbouring day's label. */
+const midday = (p) => `${p.at}T12:00:00Z`;
+
+/** A list that shows its first few rows and offers the rest. */
+function collapsible(rows, limit = 8) {
+  const list = el('div', { class: 'finding-list' }, rows.slice(0, limit));
+  if (rows.length <= limit) return list;
+  const more = el('button', { type: 'button', class: 'btn btn-quiet', text: `Show all ${rows.length}` });
+  let open = false;
+  more.addEventListener('click', () => {
+    open = !open;
+    list.replaceChildren(...(open ? rows : rows.slice(0, limit)));
+    more.textContent = open ? 'Show fewer' : `Show all ${rows.length}`;
+  });
+  return el('div', {}, [list, more]);
+}
+
+/** One line of a change list, shaped like a finding without its detail. */
+function changeRow(lead, who, what, note, machinesByKey) {
+  const m = machinesByKey.get(who.machine_key);
+  return el('div', { class: 'finding' }, [el('div', {}, [
+    el('div', { class: 'finding-head' }, [
+      lead,
+      m ? machineLink(m) : el('span', { class: 'finding-who', text: who.hostname || who.machine_key }),
+      el('span', { class: 'finding-who', text: what }),
+      note ? el('span', { class: 'finding-queue', text: note }) : null,
+    ]),
+  ])]);
+}
+
+const severityLabel = (sev) => SEVERITIES.find((s) => s.key === sev)?.label || sev;
+
+/**
+ * "What changed" between now and the chosen window back. The server has done
+ * the comparing; this lays out the headline and the lists, news first: new and
+ * worse findings, then machines added, grades, and what went away.
+ */
+export function changesCard(c, machinesByKey) {
+  const picker = el('select', {
+    'aria-label': 'Compare with',
+    onchange: (e) => { state.window = Number(e.target.value); writeHash({ view: 'overview' }); },
+  }, WINDOWS.map(([w, label]) => el('option', { value: String(w), text: `${label} ago` })));
+  picker.value = String(state.window);
+  const head = el('div', { class: 'card-head' }, [
+    el('h3', { text: 'What changed' }),
+    el('div', { class: 'card-actions' }, [el('label', { class: 'field' }, [picker])]),
+  ]);
+
+  if (c instanceof Error) {
+    return [head, el('div', { class: 'banner' }, [
+      el('span', { text: c.message }),
+      ' ',
+      el('button', {
+        type: 'button', class: 'link-button', text: 'Compare with a week ago instead',
+        onclick: () => { state.window = 1; writeHash({ view: 'overview', window: 1 }); },
+      }),
+    ])];
+  }
+
+  const weeks = WINDOWS.find(([w]) => w === c.window_weeks)?.[1] || `${c.window_weeks} weeks`;
+  const sub = el('p', {
+    class: 'card-sub',
+    text: `${calendarDay(c.from)} to ${calendarDay(c.to)}, ${AS_MEASURED}. A result collected late `
+      + 'counts from when it was measured, so a past week can still move.',
+  });
+
+  if (c.baseline_empty) {
+    const oldest = state.snap.summary.oldest_run;
+    return [head, sub, el('div', {
+      class: 'empty',
+      text: `Nothing in view had been measured ${weeks} ago, so there is nothing to compare against`
+        + (oldest ? ` — the earliest run is from ${day(oldest)}. Try a shorter window.` : '.'),
+    })];
+  }
+  const lists = ['new_findings', 'worsened', 'machines_added', 'grade_changes', 'resolved', 'eased'];
+  if (lists.every((k) => !c[k].length)) {
+    return [head, sub, el('div', {
+      class: 'empty', text: `Nothing changed between ${calendarDay(c.from)} and ${calendarDay(c.to)}.`,
+    })];
+  }
+
+  // Critical and warning lead the figures; informational changes are counted
+  // beside them rather than in them, because a dozen machines going stale is
+  // real but is not the same news as one drive failing.
+  const n = c.counts;
+  const serious = (s) => s.critical + s.warning;
+  const split = (s) => [`${s.critical} critical · ${s.warning} warning`, s.info ? `${s.info} info` : null]
+    .filter(Boolean).join(' · ');
+  const figure = (label, value, subtext) => el('div', {}, [
+    el('div', { class: 'tile-label', text: label }),
+    el('div', { class: 'tile-value', text: nf0.format(value) }),
+    el('div', { class: 'tile-sub', text: subtext }),
+  ]);
+  const figures = el('div', { class: 'tiles' }, [
+    figure('New findings', serious(n.new_findings), split(n.new_findings)),
+    figure('Worse', n.worsened, `${n.eased} eased`),
+    figure('Resolved', serious(n.resolved), split(n.resolved)),
+    figure('Machines added', n.machines_added, `${n.machines_added_flagged} need attention`),
+    figure('Grades down', n.grades_down, `${n.grades_up} up`),
+  ]);
+
+  const queue = (k) => QUEUES[k] || k;
+  const finding = (f) => changeRow(severityChip(f.severity), f, f.headline, queue(f.kind), machinesByKey);
+  const moved = (f) => changeRow(severityChip(f.to), f, f.headline,
+    `was ${severityLabel(f.from).toLowerCase()} · ${queue(f.kind)}`, machinesByKey);
+  const sections = [
+    ['New findings', c.new_findings.filter((f) => !f.new_machine).map(finding)],
+    ['Worse', c.worsened.map(moved)],
+    ['Machines added', c.machines_added.map((m) => changeRow(
+      el('span', { class: 'chip' }, [el('span', { text: 'new' })]), m, `graded ${m.grade || '—'}`,
+      m.flagged ? 'needs attention' : null, machinesByKey,
+    ))],
+    ['Findings on machines added', c.new_findings.filter((f) => f.new_machine).map(finding)],
+    ['Grades', c.grade_changes.map((g) => changeRow(
+      el('span', {
+        class: `chip grade ${g.direction === 'down' ? 'delta-down' : g.direction === 'up' ? 'delta-up' : ''}`.trim(),
+        text: `${g.from || '—'} → ${g.to || '—'}`,
+      }),
+      g, g.direction === 'down' ? 'graded lower' : g.direction === 'up' ? 'graded higher' : 'grade changed',
+      null, machinesByKey,
+    ))],
+    ['Resolved', c.resolved.map(finding)],
+    ['Eased', c.eased.map(moved)],
+  ].filter(([, rows]) => rows.length);
+
+  return [head, sub, figures, ...sections.flatMap(([title, rows]) => [
+    el('p', { class: 'card-sub change-section', text: `${title} · ${rows.length}` }),
+    collapsible(rows),
+  ])];
+}
+
+/** The fleet's figures week by week: a short explanation, then the charts. */
+export function overTimeCards(tl) {
+  const intro = (body) => el('div', { class: 'card col-12' }, [
+    el('div', { class: 'card-head' }, [el('h3', { text: 'Over time' })]),
+    el('p', {
+      class: 'card-sub',
+      text: `Week by week, ${AS_MEASURED}: each machine counts from its latest run by that date, under the `
+        + 'tags it carries now. A result collected late moves the week it was measured in.',
+    }),
+    body,
+  ]);
+  if (tl instanceof Error) {
+    return [intro(el('div', { class: 'banner' }, [el('span', { text: tl.message })]))];
+  }
+  const points = tl.points;
+  // A line through two points claims a trend that two points cannot show.
+  if (points.length < 3) {
+    return [intro(el('div', {
+      class: 'empty',
+      text: points.length
+        ? `${points.length === 1 ? 'One week' : 'Two weeks'} of data in view so far. The charts start at three, `
+          + 'because a line through fewer claims a trend that isn’t there.'
+        : 'No data in view yet.',
+    }))];
+  }
+
+  const newestFirst = points.slice().reverse();
+  const readout = (p, series) => tipBlock(`Week of ${calendarDay(p.at)}`, [
+    ...series.map((s) => [s.label, num(s.value(p), 0), s.colour]),
+    [`of ${nf0.format(p.machines)} machine(s) in view`, ''],
+  ]);
+  const line = (host, series) => lineChart(host, { points, series, time: midday, readout });
+  const keyed = (series) => legend(series.map((s) => ({ label: s.label, colour: s.colour, line: true })));
+
+  const attentionSeries = () => [
+    { label: 'Need attention', colour: ink('--series-1'), value: (p) => p.machines_flagged },
+    { label: 'Critical', colour: ink('--status-critical'), value: (p) => p.machines_critical },
+  ];
+  const attention = chartCard({
+    title: 'Machines needing attention',
+    subtitle: 'With a critical or warning finding, and how many of those are critical.',
+    span: 'col-4',
+    draw: (host) => {
+      const series = attentionSeries();
+      host.append(keyed(series));
+      line(host, series);
+    },
+    table: () => dataTable({
+      columns: [{ label: 'Week of' }, { label: 'Machines', num: true }, { label: 'Need attention', num: true },
+        { label: 'Critical', num: true }, { label: 'Stale', num: true }],
+      rows: newestFirst.map((p) => ({
+        cells: [calendarDay(p.at), p.machines, p.machines_flagged, p.machines_critical, p.stale],
+      })),
+    }),
+  });
+
+  const median = chartCard({
+    title: 'Median score',
+    subtitle: 'Moves when the machines change and when the mix of machines does — a refresh lifts it.',
+    span: 'col-4',
+    draw: (host) => line(host, [
+      { label: 'Median score', colour: ink('--series-1'), value: (p) => p.median_score },
+    ]),
+    table: () => dataTable({
+      columns: [{ label: 'Week of' }, { label: 'Machines', num: true }, { label: 'Median score', num: true }],
+      rows: newestFirst.map((p) => ({ cells: [calendarDay(p.at), p.machines, num(p.median_score, 0)] })),
+    }),
+  });
+
+  // Split at B, with the roles the Groups view's grade chart uses: six grades
+  // in one hue would be six lines nobody could tell apart. The table has all.
+  const count = (p, keys) => p.grades.filter(([g]) => keys.includes(g)).reduce((a, [, k]) => a + k, 0);
+  const gradeSeries = () => [
+    { label: 'S to B', colour: ink('--series-1'), value: (p) => count(p, ['S', 'A', 'B']) },
+    { label: 'C to F', colour: ink('--deemph'), value: (p) => count(p, ['C', 'D', 'F']) },
+  ];
+  const gradeKeys = points[points.length - 1].grades.map(([g]) => g);
+  const grades = chartCard({
+    title: 'Fleet size and grade mix',
+    subtitle: 'Machines graded S to B and C to F against the reference baseline.',
+    span: 'col-4',
+    draw: (host) => {
+      const series = gradeSeries();
+      host.append(keyed(series));
+      line(host, series);
+    },
+    table: () => dataTable({
+      columns: [{ label: 'Week of' }, { label: 'Machines', num: true },
+        ...gradeKeys.map((g) => ({ label: g, num: true }))],
+      rows: newestFirst.map((p) => ({
+        cells: [calendarDay(p.at), p.machines, ...gradeKeys.map((g) => p.grades.find(([k]) => k === g)?.[1] ?? 0)],
+      })),
+    }),
+  });
+
+  return [intro(null), attention, median, grades];
 }
 
 export function renderCohorts(main) {
@@ -2140,18 +2447,21 @@ function render() {
   if (state.view === 'groups') return renderGroups(main);
   if (state.view === 'cohorts') renderCohorts(main);
   else if (state.view === 'machines') renderMachines(main);
-  else renderOverview(main);
+  else return renderOverview(main);
 }
 
 async function route() {
-  const { view, key, filter, runs, by } = parseHash();
+  const {
+    view, key, filter, runs, by, window: weeks,
+  } = parseHash();
   state.view = view;
   state.key = key;
   state.filter = filter;
   state.runs = runs;
   // Only the Groups view's own URL names one; elsewhere the last choice is
-  // kept for the way back.
+  // kept for the way back. The overview's window likewise.
   if (view === 'groups') state.by = by;
+  if (view === 'overview') state.window = weeks;
   const main = $('#main');
   main.classList.add('loading');
   try {
