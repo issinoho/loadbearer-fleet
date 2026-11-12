@@ -61,7 +61,143 @@ pub struct Config {
     #[serde(default)]
     pub ingest: Ingest,
     #[serde(default)]
+    pub notify: Notify,
+    #[serde(default)]
     pub log: Log,
+}
+
+/// Outbound notifications: one JSON POST to a URL the operator chooses. Off
+/// unless `webhook_url` is set, and then the only connection this process
+/// opens that nobody asked it to.
+///
+/// Generic on purpose. A receiver that wants a Teams card or a Slack message
+/// builds it from the payload; this end stays one documented shape rather than
+/// one per vendor.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Notify {
+    /// Where to POST. Unset switches notifications off entirely.
+    ///
+    /// `https://`, because the payload names machines and says what is wrong
+    /// with them — the same reason the dashboard refuses to serve the estate
+    /// in the clear. `http://` is accepted only for a receiver on this host
+    /// (`localhost` or a loopback address), where nothing crosses a wire.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Signs every request: `X-Loadbearer-Signature: sha256=<hex>`, the
+    /// HMAC-SHA256 of the exact body with this as the key, so the receiver
+    /// can tell a request came from here. Empty sends no signature.
+    #[serde(default)]
+    pub secret: String,
+    /// Send as soon as a scan finds a new critical finding nobody has
+    /// quieted.
+    #[serde(default = "yes")]
+    pub critical: bool,
+    /// `off`, `daily` or `weekly` (Mondays): a summary of the fleet at
+    /// `digest_at`.
+    #[serde(default)]
+    pub digest: DigestSchedule,
+    /// When the digest goes, `HH:MM` in **UTC** — not the server's local time.
+    #[serde(default = "digest_at")]
+    pub digest_at: String,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn digest_at() -> String {
+    "08:00".to_string()
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self {
+            webhook_url: None,
+            secret: String::new(),
+            critical: yes(),
+            digest: DigestSchedule::default(),
+            digest_at: digest_at(),
+        }
+    }
+}
+
+/// Written by hand so the secret never reaches a log line or a panic message
+/// through `{:?}`. The URL is left out too: a webhook URL often carries a
+/// token of its own in the path or the query.
+impl std::fmt::Debug for Notify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Notify")
+            .field(
+                "webhook_url",
+                &self.webhook_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("secret", &(!self.secret.is_empty()).then_some("<redacted>"))
+            .field("critical", &self.critical)
+            .field("digest", &self.digest)
+            .field("digest_at", &self.digest_at)
+            .finish()
+    }
+}
+
+impl Notify {
+    /// `digest_at` as a time of day. Only meaningful on a validated config,
+    /// where it is known to parse.
+    pub fn digest_time(&self) -> Option<time::Time> {
+        time::Time::parse(
+            self.digest_at.trim(),
+            format_description!("[hour]:[minute]"),
+        )
+        .ok()
+    }
+}
+
+/// How often the digest goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DigestSchedule {
+    #[default]
+    Off,
+    Daily,
+    /// Mondays.
+    Weekly,
+}
+
+impl DigestSchedule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+        }
+    }
+}
+
+/// A webhook URL this will send to, or the reason it will not.
+///
+/// The rule is the dashboard's own: nothing about the estate goes over the
+/// network in the clear. Loopback is the exception because there is no
+/// network — a relay on the same host, or a test.
+pub fn webhook_url(raw: &str) -> Result<openidconnect::reqwest::Url> {
+    use openidconnect::url::Host;
+    let url = openidconnect::reqwest::Url::parse(raw.trim())
+        .map_err(|e| anyhow::anyhow!("notify.webhook_url is not a URL ({e})"))?;
+    let loopback = match url.host() {
+        Some(Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => bail!("notify.webhook_url has no host"),
+    };
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if loopback => Ok(url),
+        "http" => bail!(
+            "notify.webhook_url must be https: the payload carries hostnames and findings, and \
+             plain http would put them on the wire in the clear. http is accepted only for a \
+             receiver on this host (localhost or a loopback address)"
+        ),
+        other => bail!("notify.webhook_url must be an https:// URL, not {other}://"),
+    }
 }
 
 /// Machines submitting their own results, without a person and without a share.
@@ -383,6 +519,10 @@ pub struct Auth {
     ///
     /// Added to the built-in roots rather than replacing them, so a provider
     /// that later moves to a publicly-trusted certificate keeps working.
+    ///
+    /// `[notify]`'s webhook trusts it too. A receiver is as likely as a
+    /// provider to sit behind the same internal CA, and with no trust store
+    /// to fall back on there would otherwise be no way to reach one.
     #[serde(default)]
     pub ca_bundle: Option<PathBuf>,
     /// Group-to-role mapping. Order matters only as a tie-break; see
@@ -586,6 +726,7 @@ impl Config {
         }
         check_placeholder_path("log.file", self.log.file.as_deref())?;
         check_placeholder_path("auth.ca_bundle", self.auth.ca_bundle.as_deref())?;
+        self.validate_notify()?;
 
         // An upload has to become a file the next scan will find, or it lives
         // only in the index — and this documentation tells people the index is
@@ -774,6 +915,53 @@ impl Config {
         Ok(())
     }
 
+    /// `[notify]`, checked whether or not anybody signs in: it decides what
+    /// leaves this host, which matters either way.
+    fn validate_notify(&self) -> Result<()> {
+        let n = &self.notify;
+        if n.digest_time().is_none() {
+            bail!(
+                "notify.digest_at is {:?}; it wants a time of day as HH:MM, in UTC, such as \
+                 \"08:00\"",
+                n.digest_at
+            );
+        }
+        check_placeholder("notify.secret", &n.secret)?;
+        let Some(url) = &n.webhook_url else {
+            // Settings with nowhere to send would look like they applied.
+            if n.digest != DigestSchedule::Off {
+                bail!(
+                    "notify.digest is \"{}\" but there is no notify.webhook_url, so there is \
+                     nowhere to send it. Set the URL, or set digest = \"off\"",
+                    n.digest.as_str()
+                );
+            }
+            if !n.secret.is_empty() {
+                bail!(
+                    "notify.secret is set but there is no notify.webhook_url, so nothing would \
+                     ever be signed with it. Set the URL, or remove the secret"
+                );
+            }
+            return Ok(());
+        };
+        if url.trim().is_empty() {
+            bail!(
+                "notify.webhook_url is empty. Remove the line to switch notifications off, or \
+                 set the receiver's https:// URL"
+            );
+        }
+        // Not the value itself in the message: a webhook URL often carries a
+        // token, and this error is printed and logged.
+        if url.contains(PLACEHOLDER) {
+            bail!(
+                "notify.webhook_url still has the starter placeholder in it. Fill it in with the \
+                 receiver's https:// URL, or remove the line to switch notifications off"
+            );
+        }
+        webhook_url(url)?;
+        Ok(())
+    }
+
     /// A starter file. Every value that has to be filled in carries the
     /// placeholder marker, so a copy of this refuses to start until it has been
     /// edited rather than half-working.
@@ -913,7 +1101,8 @@ extra_scopes = []
 #
 # This trusts a built-in root set and does not read the machine's trust store,
 # so installing the CA on the server has no effect and this is the only way to
-# add it. Added to the built-in roots, not instead of them.
+# add it. Added to the built-in roots, not instead of them. The [notify]
+# webhook below trusts it too, for a receiver behind the same internal CA.
 #
 # ca_bundle = 'PUT-THE-PATH-TO-YOUR-CA-BUNDLE-HERE'
 
@@ -936,6 +1125,34 @@ enabled = false
 # Required as "Authorization: Bearer <token>" when set. Leave empty only if the
 # port is reachable from this host alone.
 token = ""
+
+[notify]
+# Off unless webhook_url is set, and then one JSON POST to that URL when a scan
+# finds a new critical finding, and a digest if you ask for one. Nothing else
+# leaves this host. Generic on purpose: no Teams or Slack card format - point
+# it at whatever relays to those. The payload is in the README.
+#
+# It carries hostnames, machine keys and the text of findings, for the whole
+# fleet regardless of anybody's scope, so it must be https. http is accepted
+# only for a receiver on this host (localhost or a loopback address).
+#
+# webhook_url = "https://PUT-THE-URL-OF-YOUR-WEBHOOK-RECEIVER-HERE"
+
+# Optional. Signs every request with X-Loadbearer-Signature: sha256=<hex>,
+# the HMAC-SHA256 of the body with this as the key, so the receiver can tell
+# it came from here. A secret: treat this file as you would any other that
+# holds one. Generate something long and random rather than choosing it.
+secret = ""
+
+# Send as soon as a scan finds a critical finding that was not critical before
+# and that nobody has acknowledged, snoozed or suppressed.
+critical = true
+
+# A summary of the fleet: "off", "daily", or "weekly" (Mondays), at digest_at.
+# digest_at is HH:MM in UTC, not the server's local time. If the server is not
+# running at that minute the digest is skipped, not sent late.
+digest = "off"
+digest_at = "08:00"
 
 # Who gets in, and over how much of the estate.
 #
@@ -1571,6 +1788,111 @@ mod tests {
                 .to_string();
             assert!(err.contains(want), "case {case}: {err}");
         }
+    }
+
+    fn notifying(url: &str) -> Config {
+        let mut c = Config::default();
+        c.notify.webhook_url = Some(url.to_string());
+        c
+    }
+
+    /// The payload names machines and what is wrong with them, so it goes
+    /// over https — except to a receiver on this host, where there is no wire.
+    #[test]
+    fn a_webhook_must_be_https_unless_it_is_on_this_host() {
+        for ok in [
+            "https://hooks.example.com/services/T000/B000/XXXX",
+            "https://10.0.0.5:8443/hook?token=abc",
+            "http://127.0.0.1:9000/hook",
+            "http://127.8.9.10/hook",
+            "http://localhost:9000/hook",
+            "http://LOCALHOST/hook",
+            "http://[::1]:9000/hook",
+        ] {
+            notifying(ok)
+                .validate()
+                .unwrap_or_else(|e| panic!("{ok} refused: {e:#}"));
+        }
+        for (bad, want) in [
+            ("http://hooks.example.com/hook", "must be https"),
+            ("http://10.0.0.5/hook", "must be https"),
+            ("http://localhost.example.com/hook", "must be https"),
+            ("ftp://hooks.example.com/hook", "https://"),
+            ("hooks.example.com/hook", "not a URL"),
+            ("", "empty"),
+            (
+                "https://PUT-THE-URL-OF-YOUR-WEBHOOK-RECEIVER-HERE",
+                "placeholder",
+            ),
+        ] {
+            let err = notifying(bad).validate().expect_err(bad).to_string();
+            assert!(err.contains("notify.webhook_url"), "{bad}: {err}");
+            assert!(err.contains(want), "{bad}: {err}");
+        }
+        // The value is not echoed: a webhook URL is often a credential.
+        let err = notifying("http://hooks.example.com/hook?token=do-not-print")
+            .validate()
+            .expect_err("refused")
+            .to_string();
+        assert!(!err.contains("do-not-print"), "{err}");
+    }
+
+    #[test]
+    fn notify_settings_without_a_webhook_are_refused_rather_than_ignored() {
+        let mut c = Config::default();
+        c.notify.digest = DigestSchedule::Daily;
+        let err = c.validate().expect_err("nowhere to send").to_string();
+        assert!(err.contains("notify.digest"), "{err}");
+
+        let mut c = Config::default();
+        c.notify.secret = "s3cret".into();
+        let err = c.validate().expect_err("nothing to sign").to_string();
+        assert!(err.contains("notify.secret"), "{err}");
+        assert!(!err.contains("s3cret"), "the secret is not echoed: {err}");
+
+        let mut c = notifying("https://hooks.example.com/x");
+        for bad in ["8:00", "24:00", "08:00:00", "noon", ""] {
+            c.notify.digest_at = bad.into();
+            let err = c.validate().expect_err(bad).to_string();
+            assert!(err.contains("HH:MM") && err.contains("UTC"), "{bad}: {err}");
+        }
+        c.notify.digest_at = "23:59".into();
+        c.notify.digest = DigestSchedule::Weekly;
+        c.validate()
+            .expect("a weekly digest at a minute to midnight");
+        assert_eq!(c.notify.digest_time(), Some(time::macros::time!(23:59)));
+    }
+
+    /// `{:?}` of the config must not carry the secret, or the URL that is
+    /// often a secret too.
+    #[test]
+    fn the_notify_secret_does_not_reach_debug_output() {
+        let mut c = notifying("https://hooks.example.com/x?token=url-token");
+        c.notify.secret = "hmac-secret".into();
+        let text = format!("{c:?}");
+        assert!(!text.contains("hmac-secret"), "{text}");
+        assert!(!text.contains("url-token"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    #[test]
+    fn the_notify_section_parses_from_the_file() {
+        let c: Config = toml::from_str(
+            "[notify]\nwebhook_url = \"https://hooks.example.com/x\"\nsecret = \"s\"\n\
+             critical = false\ndigest = \"weekly\"\ndigest_at = \"07:30\"\n",
+        )
+        .expect("parses");
+        c.validate().expect("valid");
+        assert!(!c.notify.critical);
+        assert_eq!(c.notify.digest, DigestSchedule::Weekly);
+        // Defaults: on for critical, no digest, 08:00.
+        let d = Notify::default();
+        assert!(d.critical);
+        assert_eq!(d.digest, DigestSchedule::Off);
+        assert_eq!(d.digest_at, "08:00");
+        let err = toml::from_str::<Config>("[notify]\ndigest = \"hourly\"\n")
+            .expect_err("not a schedule");
+        assert!(err.to_string().contains("hourly"), "{err}");
     }
 
     #[test]
