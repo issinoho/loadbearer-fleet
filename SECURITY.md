@@ -89,13 +89,26 @@ It:
 - serves every asset from its own binary — no CDN, no npm, nothing fetched at
   runtime — which is what lets it send `default-src 'self'` and mean it;
 - makes **no outbound connections** except to the identity provider's discovery,
-  JWKS and token endpoints during a sign-in, and only when `auth.mode = "oidc"`.
-  Those requests **do not follow redirects** — following one from a
-  discovery URL would make this an SSRF primitive — and they verify the
-  provider's certificate against a **built-in root set**, not the machine's
-  trust store. There is no option to skip verification; `auth.ca_bundle` adds
-  a private CA to the built-in roots for a self-hosted provider, and is the
-  only way to do it.
+  JWKS and token endpoints during a sign-in, and only when `auth.mode = "oidc"`
+  — and, **only when `[notify] webhook_url` is set**, to that one URL. Unset,
+  which is the default, nothing else leaves the host. Set, it receives a JSON
+  `POST` when a scan finds a new critical finding, a digest if one is
+  scheduled, and a `test` event when `notify test` is run. Those payloads
+  carry **hostnames, machine keys and the full text of findings for the whole
+  fleet**, built unscoped whatever any one user's grant allows. The URL must
+  be `https://`; plain `http://` is refused at startup unless the host is
+  `localhost` or a loopback address. With `[notify] secret` set, each request
+  carries `X-Loadbearer-Signature: sha256=<hex>`, an HMAC-SHA256 of the exact
+  body keyed with the secret, so the receiver can verify the sender; it
+  carries no timestamp, so replay protection is the receiver's, against
+  `sent_at`. The log names the receiver by scheme and host only, never its
+  path or query.
+  All of these requests **do not follow redirects** — following one from a
+  discovery URL, or from a receiver, would make this an SSRF primitive — and
+  they verify the certificate against a **built-in root set**, not the
+  machine's trust store. There is no option to skip verification;
+  `auth.ca_bundle` adds a private CA to the built-in roots, for a self-hosted
+  provider or a receiver behind the same CA, and is the only way to do it.
 
 It stores no user credentials — no passwords, and no tokens from the identity
 provider are kept after a sign-in. `client_secret` exists in the config for
@@ -103,7 +116,13 @@ providers that require one, but the intended shape is a public client with
 PKCE, so the field is normally empty.
 
 Two bearer credentials **can** live in the configuration file in plain text:
-`[metrics] token`, and an `[[ingest.tokens]]` entry written with `token`. An
+`[metrics] token`, and an `[[ingest.tokens]]` entry written with `token`.
+`[notify] secret`, the key the webhook's requests are signed with, is a third
+secret there, and has to be held in plain text because the server produces
+the signature rather than checking one — and `[notify] webhook_url` is often a
+credential in its own right, since many receivers put their token in the
+URL. Neither is logged or printed, and the config's debug form shows both as
+`<redacted>`. An
 ingest token written with `token_sha256` — the form `loadbearer-fleet token
 new` prints — holds only the secret's SHA-256, and the digest is not itself
 accepted, so a copy of the config leaks nothing anyone can submit with. A
@@ -204,6 +223,12 @@ been audited":
   a credential over its rate limit is refused before the document is parsed or
   written. The token fall-through and the rate limit were each watched failing
   with the guard removed before being kept.
+  On notifications: that nothing is built and nothing sent with no
+  `webhook_url`, that plain `http://` to anything but this host is refused,
+  that a suppressed finding is never sent, that the signature verifies against
+  the body as received and is absent without a secret, that a redirect is not
+  followed, and that neither the URL's path and query nor the secret appear in
+  an error, the `notify test` output or the config's debug form.
   Also, from the input side: that a real compression bomb — built in the test,
   not mocked — is refused *before* it is decompressed, that an oversized plain
   document is refused on its size alone, and that half-finished sign-ins cannot

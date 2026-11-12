@@ -87,11 +87,13 @@ trade-off, not restate what the code already says.
 | `src/config.rs` | the config file, and the validation that refuses placeholders |
 | `src/service.rs` | Windows service integration, and the systemd unit generator |
 | `src/metrics.rs` | the Prometheus exposition |
+| `src/notify.rs` | the `[notify]` webhook: which findings are news after a rebuild, the payloads, the digest schedule, signing, and delivery off the scan path |
 | `src/reference.rs` | builds the command-line and configuration reference from the clap definition and `Config::starter()` — see below |
 | `build.rs` | stamps the commit into the binary, so `--version`, the log, the snapshot, `build_info` and the dashboard footer can all name the build |
 | `assets/` | the dashboard — HTML, CSS, hand-rolled SVG charts, compiled into the binary with `include_str!` |
 | `tests/ingest.rs` | ingest against real result documents |
 | `tests/stdout_is_data.rs` | runs the **real binary** and parses its stdout, for the commands that print a document |
+| `tests/notify.rs` | runs `notify test` against a receiver on 127.0.0.1, for its exit status and what it prints |
 | `scripts/check-ui.mjs` | the chart and view geometry check |
 | `scripts/check-mobile.mjs` | the same page in a real browser, at four screen widths |
 

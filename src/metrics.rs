@@ -49,6 +49,9 @@ pub struct Runtime {
     pub tokens_refused_unlogged: u64,
     pub tokens_refused_logged_at: Option<std::time::Instant>,
     pub last_scan: Option<ScanStamp>,
+    /// Webhook deliveries by event and outcome. Shared with the task that
+    /// sends them, so it is counted there without taking this lock.
+    pub notifications: std::sync::Arc<crate::notify::Counters>,
 }
 
 impl Runtime {
@@ -64,6 +67,7 @@ impl Runtime {
             tokens_refused_unlogged: 0,
             tokens_refused_logged_at: None,
             last_scan: None,
+            notifications: std::sync::Arc::default(),
         }
     }
 }
@@ -363,6 +367,20 @@ pub fn render(
             ),
         ],
     );
+    let notifications: Vec<(Vec<(&str, &str)>, f64)> = runtime
+        .notifications
+        .rows()
+        .into_iter()
+        .map(|(event, result, n)| (vec![("event", event), ("result", result)], n as f64))
+        .collect();
+    out.family(
+        "notifications_total",
+        "Webhook notifications by event and result. `failed` is a receiver that refused or never \
+         answered, after three tries; `dropped` is one never sent because too many were already \
+         waiting. All zero when no webhook is configured.",
+        "counter",
+        &notifications,
+    );
     if let Some(scan) = &runtime.last_scan {
         out.gauge(
             "scan_last_success_timestamp_seconds",
@@ -441,6 +459,7 @@ mod tests {
                 ingested: 0,
                 rejected: 0,
             }),
+            notifications: std::sync::Arc::default(),
         }
     }
 
