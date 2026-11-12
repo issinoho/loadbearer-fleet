@@ -298,32 +298,16 @@ impl Authenticator {
     }
 
     async fn discover(&self) -> Result<(reqwest::Client, OidcClient, CoreProviderMetadata)> {
+        // Mirrored by `notify::Target::new` for the webhook, which trusts the
+        // same bundle and follows no redirects either.
         let mut builder = reqwest::ClientBuilder::new()
             // Following redirects from an identity provider's discovery URL
             // turns this into an SSRF primitive.
             .redirect(reqwest::redirect::Policy::none());
 
-        // The built-in roots will not include an internal CA, and this client
-        // deliberately does not read the machine's trust store — so for a
-        // self-hosted provider behind a private CA this is the only way in.
-        // Added to the built-in set rather than replacing it, so moving the
-        // provider onto a publicly-trusted certificate later doesn't break.
+        // See `ca_bundle` for why this is the only way to trust a private CA.
         if let Some(path) = &self.config.ca_bundle {
-            let pem = std::fs::read(path).with_context(|| {
-                format!(
-                    "reading auth.ca_bundle {} — it should be a PEM file holding the \
-                     certificate authorities to trust for the identity provider",
-                    path.display()
-                )
-            })?;
-            let certs = reqwest::Certificate::from_pem_bundle(&pem)
-                .with_context(|| format!("{} is not a PEM certificate bundle", path.display()))?;
-            // An empty file would otherwise leave the provider untrusted while
-            // looking configured, which is the worst of both.
-            if certs.is_empty() {
-                anyhow::bail!("auth.ca_bundle {} held no certificates", path.display());
-            }
-            for cert in certs {
+            for cert in ca_bundle(path)? {
                 builder = builder.add_root_certificate(cert);
             }
         }
@@ -553,6 +537,32 @@ impl Authenticator {
             Err((detail, advice)) => r.fail("authorization", detail, advice),
         }
     }
+}
+
+/// The certificate authorities in `auth.ca_bundle`, to add to the built-in
+/// roots of an HTTP client.
+///
+/// The built-in roots will not include an internal CA, and the clients here
+/// deliberately do not read the machine's trust store — so for a self-hosted
+/// provider, or a webhook receiver, behind a private CA this is the only way
+/// in. Added to the built-in set rather than replacing it, so moving onto a
+/// publicly-trusted certificate later doesn't break.
+pub(crate) fn ca_bundle(path: &std::path::Path) -> Result<Vec<reqwest::Certificate>> {
+    let pem = std::fs::read(path).with_context(|| {
+        format!(
+            "reading auth.ca_bundle {} — it should be a PEM file holding the certificate \
+             authorities to trust for the identity provider and the webhook",
+            path.display()
+        )
+    })?;
+    let certs = reqwest::Certificate::from_pem_bundle(&pem)
+        .with_context(|| format!("{} is not a PEM certificate bundle", path.display()))?;
+    // An empty file would otherwise leave the provider untrusted while
+    // looking configured, which is the worst of both.
+    if certs.is_empty() {
+        anyhow::bail!("auth.ca_bundle {} held no certificates", path.display());
+    }
+    Ok(certs)
 }
 
 /// What the provider's answer to an authorization request means.

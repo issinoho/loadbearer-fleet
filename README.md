@@ -446,6 +446,7 @@ loadbearer-fleet serve \\fileserver\loadbearer     # the dashboard, on http://12
 loadbearer-fleet init-config > fleet.toml          # a starter config, placeholders included
 loadbearer-fleet serve --config fleet.toml         # with single sign-on
 loadbearer-fleet check-auth --config fleet.toml    # check the identity provider settings
+loadbearer-fleet notify test --config fleet.toml   # send a test event to the [notify] webhook
 loadbearer-fleet backup fleet-2026-09-10.db        # consistent snapshot of the index and state file
 loadbearer-fleet forget PC-01                      # remove a decommissioned machine, and its triage
 ```
@@ -510,6 +511,9 @@ resets when they're reimaged" is something an estate owner should know.
 - [x] Acknowledge, snooze and suppress findings, kept in a state file of its
       own so the index stays disposable — see [Acknowledge, snooze,
       suppress](#acknowledge-snooze-suppress)
+- [x] A webhook when a scan finds a new critical finding, and a daily or weekly
+      digest — one generic, signed JSON POST, off unless configured — see
+      [Notifications](#notifications)
 
 ## Analysis
 
@@ -921,7 +925,9 @@ The HTML, CSS and JavaScript are compiled into the executable, and the charts
 are hand-rolled SVG. There is no npm, no bundler, and nothing is fetched from
 the internet at runtime — which is what makes it work on an air-gapped
 management network, and what lets the server send `default-src 'self'` and mean
-it.
+it. The one thing that ever *sends* anywhere unasked is the
+[notifications](#notifications) webhook, and only once `[notify] webhook_url`
+is set; unset, which is the default, nothing does.
 
 ### The charts
 
@@ -1407,6 +1413,13 @@ an alert written on them means what it always did. `findings_live` and
 `machines_flagged_live` leave the quieted ones out — alert on those if "in
 hand" should silence the alert — and `findings_quieted` counts them by state.
 
+`notifications_total{event, result}` counts the [webhook](#notifications)'s
+deliveries — `event` is `findings.critical` or `digest`, `result` is `sent`,
+`failed` (refused, or no answer, after three tries) or `dropped` (never sent,
+because too many were already waiting). A `failed` that rises means alerts are
+not reaching anybody, which is worth an alert of its own through some other
+route.
+
 A scan of a folder that can't be read fails loudly and increments
 `scan_failures_total` rather than reporting an empty folder, because "no
 machines need attention" is how an unreachable share would otherwise look.
@@ -1416,6 +1429,229 @@ The full surface is in
 also covers the one thing worth getting right in the alert rule: the `scan_*`
 detail metrics are **absent** until a scan has succeeded, so a rule written
 only on their age stays silent through exactly the outage it was written for.
+
+## Notifications
+
+A dashboard nobody opens is a failing drive nobody hears about. So the server
+can say so itself: one JSON `POST` to a URL you choose, when a scan finds a new
+critical finding, and if you like a daily or weekly digest. It is **off unless
+`[notify] webhook_url` is set**, and while it is off the process opens no
+connection it did not open before.
+
+**Generic on purpose.** There is no Teams card, Slack block or email: one
+documented payload, to whatever you point it at — an automation platform, a
+small relay, the incoming-webhook endpoint of a tool that accepts arbitrary
+JSON. Every payload carries a `text` field, a line or two of plain text a
+human can read as it is, for a receiver that only wants that.
+
+```toml
+[notify]
+webhook_url = "https://hooks.example.com/loadbearer/T0123"
+secret = "a long random string the receiver also holds"
+critical = true          # the default
+digest = "weekly"        # "off" (the default), "daily", or "weekly" (Mondays)
+digest_at = "08:00"      # HH:MM, in UTC
+```
+
+`webhook_url` must be **https**: the payload carries hostnames and findings,
+and the rule that stops the dashboard putting the estate on the wire in the
+clear applies to it too. `http://` is accepted only for a receiver on the same
+host — `localhost` or a loopback address — and anything else is refused at
+startup naming the setting. `loadbearer-fleet notify test --config fleet.toml`
+sends a `test` event and prints what the receiver answered, exiting non-zero
+unless it was a 2xx, so the wiring can be checked at deploy time rather than
+when a drive fails.
+
+### When a critical notification is sent
+
+After every scan — the timer, the Rescan button, the startup scan, a change by
+another process — the **live critical** findings are compared with the
+findings that were critical before that scan. Live means what it means on the
+Overview: nobody has acknowledged, snoozed or suppressed it. Anything critical
+and live now that was not critical before is sent, all of it in one request.
+A finding is "the same finding" if it is the same rule on the same machine.
+
+Comparing against what was *critical* before, rather than what was *live*
+before, is what keeps triage out of it:
+
+- A **suppressed** or **acknowledged** critical is not live, so is never sent.
+- A **snooze running out**, or an acknowledgement being **cleared**, makes a
+  finding live again without making it new, so it is not sent. Neither does
+  anything else done to triage — acknowledging, snoozing and suppressing never
+  send anything.
+- A **warning that becomes critical** is new as a critical, and is sent — even
+  if the warning had been acknowledged, because an acknowledgement lapses when
+  its finding gets worse.
+- A machine measured for the first time with a critical finding is sent.
+
+**The first scan sends nothing.** When the fleet before the scan was empty — a
+new install, or an index rebuilt from the folder after an upgrade — every
+critical finding in the estate would be "new", so that scan is taken as the
+baseline and the log says so. The baseline at startup is the index as it
+stood, so the startup scan does report what arrived in the folder while the
+server was down.
+
+What was sent is not recorded: the comparison is between the snapshot before a
+scan and the one after it, held in memory. A restart starts again from the
+index, which already holds what the last run had seen, so that loses nothing a
+scan can see. What it can miss is a critical finding that was already in the
+index when the server started — put there by a `scan` run from a terminal
+while it was down. The digest is the backstop for that, and for anything a
+receiver failed to take.
+
+### The digest
+
+`digest = "daily"` or `"weekly"` sends a summary at `digest_at` **UTC** —
+every day, or on Mondays. It is the Overview as an unscoped admin sees it:
+live findings by severity, quieted ones counted by how, machines needing
+attention out of machines in the index, and every live critical finding
+listed. A weekly digest adds what changed since a week before the last scan,
+counted from the same [reconstruction](#what-changed-and-the-fleet-over-time)
+the dashboard's "What changed" uses; a daily one has no comparison, because
+the history is held a week at a time and a day is not one of its points.
+
+The time is worked out against the clock. **If the server is not running at
+that minute, that digest is skipped, not sent late** — and so is one whose
+timer wakes more than five minutes after its slot, as on a host resumed from
+sleep.
+
+### What is sent
+
+Every request is `POST`, `Content-Type: application/json`, `User-Agent:
+loadbearer-fleet/<version>`, and four fields come first in every payload:
+`event`, `sent_at` (RFC 3339, UTC), `server` (your `public_url`) and `text`.
+A list of findings is capped at 50, with `more` counting the rest. Each
+finding's `url` is its machine's page on the dashboard. Abridged here; the
+`detail` is the finding's full explanation.
+
+`findings.critical`:
+
+```json
+{
+  "event": "findings.critical",
+  "sent_at": "2026-11-12T09:15:02Z",
+  "server": "https://fleet.example.com",
+  "text": "loadbearer-fleet: new critical finding on PC-0142: Only 3.0% free on D:\\",
+  "findings": [
+    {
+      "machine_key": "uuid:4c4c4544-0042-3510-8051-b4c04f4e3432",
+      "hostname": "PC-0142",
+      "code": "disk_nearly_full",
+      "severity": "critical",
+      "headline": "Only 3.0% free on D:\\",
+      "detail": "An SSD slows down as it fills …",
+      "url": "https://fleet.example.com/#/machine/uuid%3A4c4c4544-0042-3510-8051-b4c04f4e3432"
+    }
+  ],
+  "more": 0
+}
+```
+
+With more than one, `text` is two lines: `3 new critical findings on 2
+machines`, then the first of them and how many more.
+
+`digest`, weekly (`changes` is `null` on a daily digest, and on a weekly one
+when no machine had been measured a week before):
+
+```json
+{
+  "event": "digest",
+  "sent_at": "2026-11-16T08:00:00Z",
+  "server": "https://fleet.example.com",
+  "text": "loadbearer-fleet weekly digest: 2 critical, 31 warning across 27 of 412 machines; 9 quieted\nSince 2026-11-09: 6 new, 4 resolved, 1 worse",
+  "summary": {
+    "period": "weekly",
+    "machines": 412,
+    "machines_flagged": 27,
+    "live": { "critical": 2, "warning": 31, "info": 140 },
+    "quieted": { "acknowledged": 5, "snoozed": 1, "suppressed": 3 },
+    "changes": {
+      "since": "2026-11-09",
+      "new_findings": { "critical": 1, "warning": 3, "info": 2 },
+      "new_machine_findings": { "critical": 0, "warning": 1, "info": 3 },
+      "resolved": { "critical": 0, "warning": 4, "info": 0 },
+      "worsened": 1,
+      "eased": 0,
+      "machines_added": 2
+    }
+  },
+  "findings": [ { "machine_key": "…", "hostname": "PC-0142", "code": "disk_nearly_full", "…": "…" } ],
+  "more": 0
+}
+```
+
+`changes` is judged by the rules alone, as "What changed" is: triage plays no
+part in it. `new_machine_findings` are those carried by machines measured for
+the first time in the week, counted apart so they don't read as the fleet
+getting worse.
+
+`test`, from `notify test`, which says nothing about the fleet:
+
+```json
+{
+  "event": "test",
+  "sent_at": "2026-11-12T09:20:41Z",
+  "server": "https://fleet.example.com",
+  "text": "loadbearer-fleet: test notification from https://fleet.example.com. If you can read this, the webhook works."
+}
+```
+
+**What it reveals.** Hostnames, machine keys and the full text of findings,
+for the **whole fleet** — the payload is built unscoped, whatever any one
+person's grant allows them to see, so the receiver and everyone who can read
+what it relays sees across every site. Point it at somewhere you would let see
+the dashboard as an admin.
+
+### Telling it came from here
+
+With `secret` set, every request carries
+
+```
+X-Loadbearer-Signature: sha256=<64 lowercase hex characters>
+```
+
+the HMAC-SHA256 of the **exact bytes of the body**, keyed with the secret. The
+receiver recomputes it over the body as received — before parsing it, since
+re-serialised JSON is not the same bytes — and compares in constant time. In
+Node:
+
+```js
+const crypto = require('crypto');
+function fromLoadbearer(rawBody, header, secret) {
+  const want = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+  return typeof header === 'string' && header.length === want.length
+    && crypto.timingSafeEqual(Buffer.from(header), Buffer.from(want));
+}
+```
+
+The signature proves who sent a request, not when: it carries no timestamp, so
+a receiver that must refuse a replayed request can check `sent_at` against its
+own clock. Without a secret no signature is sent, and the receiver has only the
+URL's own secrecy to go on.
+
+### Delivery
+
+- **Never on the scan path.** A scan hands the event to a queue and carries
+  on; a task of its own sends it. A receiver that is slow, down or refusing
+  neither delays a scan nor fails one, nor the request that asked for it.
+- **One at a time, in order, up to three tries** each, with a 10-second
+  timeout per try and a short wait between them (2 s, then 4 s). A try is
+  repeated when there was no answer — no connection, a timeout — or the answer
+  was a 5xx or a 429; any other answer, including any other 4xx, ends it.
+  `Retry-After` is not read.
+- **Redirects are not followed**, for the same reason the sign-in's requests
+  don't follow them: the receiver configured is the only one. A 3xx is a
+  failure.
+- **The queue holds 16.** If it is full — the receiver has been failing for a
+  while — the new event is dropped, logged and counted; the digest is the
+  backstop.
+- **Certificates** are checked against the same built-in root set the sign-in
+  uses, not the machine's trust store. `[auth] ca_bundle` is trusted here too,
+  for a receiver behind an internal CA.
+- **The log** records each outcome with the event, the status and the
+  receiver's scheme and host — never its path or query string, which is where
+  a webhook URL usually keeps its own token, and never the secret.
+  `notifications_total` in [the metrics](#metrics) counts the same outcomes.
 
 ## Releases
 

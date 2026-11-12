@@ -22,6 +22,7 @@ mod config;
 mod index;
 mod launch;
 mod metrics;
+mod notify;
 mod ratelimit;
 mod reference;
 mod report;
@@ -222,6 +223,11 @@ enum Command {
     /// Contact the identity provider and report what the settings resolve to,
     /// so a wrong tenant fails at deploy time rather than at first sign-in.
     CheckAuth,
+    /// The `[notify]` webhook.
+    Notify {
+        #[command(subcommand)]
+        action: NotifyAction,
+    },
     /// Run as a service.
     Service {
         #[command(subcommand)]
@@ -255,6 +261,18 @@ enum TokenAction {
         #[arg(long, value_name = "N")]
         limit_per_minute: Option<u32>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum NotifyAction {
+    /// Send a `test` event to the configured webhook and say what it
+    /// answered, so the wiring can be checked without waiting for a drive to
+    /// fail.
+    ///
+    /// The same client, signature and retries as a real event. The payload
+    /// says nothing about the fleet. Exits non-zero if the receiver did not
+    /// answer with a 2xx.
+    Test,
 }
 
 #[derive(Subcommand, Debug)]
@@ -784,6 +802,18 @@ fn main() -> Result<()> {
             } else {
                 anyhow::bail!("sign-in is not configured correctly yet — see the FAIL lines above")
             }
+        }
+        Command::Notify {
+            action: NotifyAction::Test,
+        } => {
+            let (target, status) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(notify::send_test(&config))?;
+            // Scheme and host only: the rest of a webhook URL is often its
+            // credential.
+            println!("sent a test event to {target}: {status}");
+            Ok(())
         }
         Command::Service { action } => match action {
             ServiceAction::Run { allow_remote } => service::run(config, *allow_remote),

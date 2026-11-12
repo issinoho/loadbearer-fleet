@@ -52,9 +52,10 @@ use crate::analytics::{
 };
 use crate::auth::{self, Authenticator, Caller, IngestTokens, Submitter, token_matches};
 use crate::compare;
-use crate::config::{AuthMode, Config, Metrics as MetricsConfig};
+use crate::config::{AuthMode, Config, DigestSchedule, Metrics as MetricsConfig};
 use crate::index::{Index, ScanReport};
 use crate::metrics::{self, Runtime, ScanStamp};
+use crate::notify::{self, Notifier};
 use crate::ratelimit::Limiter;
 use crate::state::{self as triage, Book, Mark, Reach, Store, Suppression, Triage, TriageState};
 
@@ -128,6 +129,9 @@ pub struct AppState {
     /// from a terminal — which clears a machine's triage in the file — is
     /// noticed on the next request rather than at the next restart.
     book_version: Mutex<i64>,
+    /// The webhook, when one is configured. Fed after every rebuild of the
+    /// analysis and by the digest timer; sends from a task of its own.
+    notifier: Option<Notifier>,
 }
 
 impl AppState {
@@ -142,6 +146,12 @@ impl AppState {
         spend_marks(&store, &analysis.snapshot)?;
         let book = store.load()?;
         let book_version = store.data_version().unwrap_or(0);
+        let runtime = Runtime::new();
+        // Built here rather than in `serve`, so both entry points — the
+        // command line and the Windows service — get it the same way, and so
+        // the startup scan, which runs before there is a runtime to send
+        // from, can already raise an event for it to send once there is.
+        let notifier = Notifier::new(config, Arc::clone(&runtime.notifications))?;
         Ok(Arc::new(Self {
             store: Mutex::new(store),
             book: RwLock::new(Arc::new(book)),
@@ -156,7 +166,8 @@ impl AppState {
             ingest: IngestTokens::new(config),
             uploads: Limiter::new(config.server.upload_limit_per_minute),
             metrics_config: config.metrics.clone(),
-            runtime: Mutex::new(Runtime::new()),
+            runtime: Mutex::new(runtime),
+            notifier,
         }))
     }
 
@@ -271,7 +282,7 @@ impl AppState {
 
     fn recompute(&self) -> Result<()> {
         let idx = self.index.lock().expect("index lock");
-        let analysis = Analysis::compute(&idx, &self.thresholds)?;
+        let analysis = Arc::new(Analysis::compute(&idx, &self.thresholds)?);
         // Taken *before* publishing, so a commit that lands during the analysis
         // is noticed next time rather than being taken as already included.
         let version = idx.data_version().unwrap_or(0);
@@ -296,9 +307,57 @@ impl AppState {
                 );
             }
         }
-        *self.cache.write().expect("cache lock") = Arc::new(analysis);
+        // Swapped rather than overwritten, so the snapshot being replaced is
+        // still in hand for the comparison below. Rebuilds are serialised by
+        // the index lock, held until the comparison is done, so "the one it
+        // replaced" is exact.
+        let previous = std::mem::replace(
+            &mut *self.cache.write().expect("cache lock"),
+            Arc::clone(&analysis),
+        );
         *self.data_version.lock().expect("data version lock") = version;
+        self.notify_rebuild(&previous.snapshot, &analysis.snapshot);
+        drop(idx);
         Ok(())
+    }
+
+    /// Raise `findings.critical` for whatever the rebuild made newly critical
+    /// and live. Never waits on the receiver: raising an event is a
+    /// serialisation and a non-blocking hand-off. See `notify`.
+    fn notify_rebuild(&self, before: &Snapshot, after: &Snapshot) {
+        let Some(notifier) = self.notifier.as_ref().filter(|n| n.critical()) else {
+            return;
+        };
+        let now = OffsetDateTime::now_utc();
+        // The projection `/metrics` uses — no filter, no scope — with the
+        // book as it now stands, after this rebuild has spent its marks, so a
+        // finding the dashboard shows as quieted is never sent.
+        let book = Arc::clone(&self.book.read().expect("book lock"));
+        let live = after.filtered_with(&Filter::default(), &self.thresholds, &book, now);
+        notifier.after_rebuild(before, &live, now);
+    }
+
+    /// Raise the digest: the fleet as an unscoped Overview shows it, and for a
+    /// weekly one what changed over the week. Blocking, because the analysis
+    /// may need rebuilding first.
+    fn raise_digest(&self, period: DigestSchedule) {
+        let Some(notifier) = &self.notifier else {
+            return;
+        };
+        let now = OffsetDateTime::now_utc();
+        let analysis = self.analysis();
+        let live = analysis.snapshot.filtered_with(
+            &Filter::default(),
+            &self.thresholds,
+            &self.book(),
+            now,
+        );
+        // The timeline's points are a week apart, so a week is what it can
+        // compare without re-deriving anything. A day is not one of its
+        // points, so a daily digest leaves change out.
+        let changes = (period == DigestSchedule::Weekly)
+            .then(|| analysis.timeline.changes(&analysis.snapshot, 1));
+        notifier.raise_digest(period, &live, changes.as_ref(), now);
     }
 
     /// What the state file holds, re-read first if another process has
@@ -1615,6 +1674,36 @@ fn spawn_periodic_scan(state: Arc<AppState>, every: Duration) {
     });
 }
 
+/// Send the digest at its slot, by the clock, UTC. Each slot is worked out
+/// afresh from the time now, so a server that was down at that minute skips
+/// it rather than sending it late — and so does one that wakes long after it,
+/// on a host resumed from sleep.
+fn spawn_digest(state: Arc<AppState>, schedule: DigestSchedule, at: time::Time) {
+    tokio::spawn(async move {
+        loop {
+            let now = OffsetDateTime::now_utc();
+            let Some(slot) = notify::next_slot(now, schedule, at) else {
+                return;
+            };
+            tokio::time::sleep(Duration::try_from(slot - now).unwrap_or_default()).await;
+            if !notify::still_due(slot, OffsetDateTime::now_utc()) {
+                tracing::warn!(
+                    slot = %slot,
+                    "the digest timer woke too late for its slot; skipping it rather than \
+                     sending it late"
+                );
+                continue;
+            }
+            let raising = Arc::clone(&state);
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || raising.raise_digest(schedule)).await
+            {
+                tracing::error!(error = %e, "the digest task panicked");
+            }
+        }
+    });
+}
+
 /// Serve until interrupted.
 pub async fn serve(
     state: Arc<AppState>,
@@ -1693,6 +1782,26 @@ pub async fn serve(
         spawn_periodic_scan(Arc::clone(&state), every);
     } else if state.root.is_some() {
         tracing::info!("scan_interval_minutes is 0: the folder is only read on request");
+    }
+
+    if let Some(notifier) = &state.notifier {
+        // Started here because it needs the runtime; anything the startup
+        // scan raised has been waiting in the queue for it.
+        notifier.start();
+        tracing::info!(
+            target = notifier.target(),
+            critical = notifier.critical(),
+            digest = notifier.digest().map(|(schedule, at)| format!(
+                "{} at {:02}:{:02} UTC",
+                schedule.as_str(),
+                at.hour(),
+                at.minute()
+            )),
+            "notifications on"
+        );
+        if let Some((schedule, at)) = notifier.digest() {
+            spawn_digest(Arc::clone(&state), schedule, at);
+        }
     }
 
     axum::serve(listener, router(state))
@@ -4063,6 +4172,482 @@ mod tests {
                 .is_null(),
             "the dashboard should have noticed the external change"
         );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Notifications, driven through real rebuilds: real documents in a real
+    // folder, the real scan, a receiver on 127.0.0.1.
+
+    use crate::notify::receiver;
+
+    /// A collection folder of its own, holding the four fixtures.
+    fn notify_folder(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lbf-notify-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        for f in [
+            "win-modern.json",
+            "linux-throttled.json",
+            "low-end.json",
+            "legacy-1.2.4.json",
+        ] {
+            std::fs::copy(fixtures().join(f), dir.join(f)).expect("copy a fixture");
+        }
+        dir
+    }
+
+    /// A later run of a fixture machine with one of its volumes `free_pct`
+    /// free: under 10% is a warning, under 5% is critical.
+    fn later_run(fixture: &str, at: &str, disk: usize, free_pct: f64) -> String {
+        let text = std::fs::read_to_string(fixtures().join(fixture)).expect("fixture");
+        let mut doc: serde_json::Value = serde_json::from_str(&text).expect("json");
+        doc["timestamp"] = serde_json::json!(at);
+        let volume = &mut doc["machine"]["disks"][disk];
+        let total = volume["total_bytes"].as_u64().expect("a size");
+        volume["available_bytes"] = serde_json::json!((total as f64 * free_pct / 100.0) as u64);
+        serde_json::to_string(&doc).expect("json")
+    }
+
+    /// FLEET-WIN-01's D: drive at `free_pct`.
+    fn win_disk(dir: &std::path::Path, name: &str, at: &str, free_pct: f64) {
+        std::fs::write(
+            dir.join(name),
+            later_run("win-modern.json", at, 1, free_pct),
+        )
+        .expect("write a run");
+    }
+
+    /// A server over `dir`, its index already holding what is there unless
+    /// `empty`, sending to `url` if there is one. The sender is started, as
+    /// `serve` starts it.
+    fn notify_state(
+        dir: &std::path::Path,
+        url: Option<&str>,
+        secret: &str,
+        empty: bool,
+    ) -> Arc<AppState> {
+        let mut index = Index::open_in_memory().expect("index");
+        if !empty {
+            index.scan(dir).expect("scan");
+        }
+        let mut config = metrics_config(true, "");
+        config.server.collection_dir = Some(dir.to_path_buf());
+        config.notify.webhook_url = url.map(str::to_string);
+        config.notify.secret = secret.to_string();
+        config.validate().expect("a valid config");
+        let state = AppState::new(
+            index,
+            Store::open_in_memory().expect("state file"),
+            &config,
+            Thresholds::default(),
+        )
+        .expect("state");
+        if let Some(n) = &state.notifier {
+            n.start();
+        }
+        state
+    }
+
+    fn raised(state: &Arc<AppState>) -> u64 {
+        state.notifier.as_ref().map_or(0, |n| n.raised())
+    }
+
+    fn key_for(state: &Arc<AppState>, host: &str) -> String {
+        state
+            .snapshot()
+            .machines
+            .iter()
+            .find(|m| m.hostname.as_deref() == Some(host))
+            .expect("a fixture machine")
+            .key
+            .clone()
+    }
+
+    fn record(state: &Arc<AppState>, change: impl FnOnce(&Store)) {
+        let store = state.store.lock().expect("store lock");
+        change(&store);
+        state.publish_book(&store).expect("published");
+    }
+
+    fn mark(key: &str, state: TriageState, severity: analytics::Severity) -> Mark {
+        Mark {
+            machine_key: key.to_string(),
+            code: "disk_nearly_full".to_string(),
+            state,
+            severity,
+            until: None,
+            note: None,
+            by: "Test".to_string(),
+            by_subject: "test".to_string(),
+            at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    async fn metric_reaches(state: &Arc<AppState>, line: &str) {
+        for _ in 0..500 {
+            if get(state, "/metrics", None).await.body.contains(line) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "never saw {line:?} in:\n{}",
+            get(state, "/metrics", None).await.body
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_when_no_webhook_is_configured() {
+        let rx = receiver::start(&[], Duration::ZERO).await;
+        let dir = notify_folder("unset");
+        let state = notify_state(&dir, None, "", false);
+        assert!(
+            state.notifier.is_none(),
+            "nothing built, so nothing to connect with"
+        );
+        win_disk(&dir, "win-later.json", "2026-09-10T09:00:00Z", 3.0);
+        state.rescan().expect("scan");
+        assert_eq!(
+            state.snapshot().summary.critical,
+            1,
+            "there was something to send"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rx.seen().is_empty());
+        let metrics = get(&state, "/metrics", None).await.body;
+        assert!(
+            metrics.contains(
+                "loadbearer_fleet_notifications_total{event=\"findings.critical\",result=\"sent\"} 0"
+            ),
+            "{metrics}"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_new_live_critical_is_sent_once_with_its_payload() {
+        let rx = receiver::start(&[], Duration::ZERO).await;
+        let dir = notify_folder("new-critical");
+        let state = notify_state(&dir, Some(&rx.url), "hook-secret", false);
+        let key = key_for(&state, "FLEET-WIN-01");
+
+        win_disk(&dir, "win-later.json", "2026-09-10T09:00:00Z", 3.0);
+        state.rescan().expect("scan");
+        let got = rx.wait_for(1).await;
+        let req = &got[0];
+        assert_eq!(
+            req.header(notify::SIGNATURE_HEADER),
+            Some(notify::signature(b"hook-secret", &req.body)),
+            "signed over exactly the body that arrived"
+        );
+        let v = req.json();
+        assert_eq!(v["event"], "findings.critical");
+        assert_eq!(v["server"], "http://127.0.0.1:8787");
+        let findings = v["findings"].as_array().expect("findings");
+        assert_eq!(findings.len(), 1, "{v}");
+        let f = &findings[0];
+        assert_eq!(f["machine_key"], key.as_str());
+        assert_eq!(f["hostname"], "FLEET-WIN-01");
+        assert_eq!(f["code"], "disk_nearly_full");
+        assert_eq!(f["severity"], "critical");
+        assert!(
+            f["headline"].as_str().expect("a headline").contains("D:\\"),
+            "{f}"
+        );
+        assert_eq!(
+            f["url"].as_str().expect("a url"),
+            notify::machine_url("http://127.0.0.1:8787", &key)
+        );
+        assert!(
+            v["text"].as_str().expect("text").contains("FLEET-WIN-01"),
+            "{v}"
+        );
+
+        // The same finding at the next scan, and the one after, is not news.
+        state.rescan().expect("scan");
+        win_disk(&dir, "win-later-still.json", "2026-09-11T09:00:00Z", 2.0);
+        state.rescan().expect("scan");
+        assert_eq!(raised(&state), 1, "sent once, not once per scan");
+        metric_reaches(
+            &state,
+            "loadbearer_fleet_notifications_total{event=\"findings.critical\",result=\"sent\"} 1",
+        )
+        .await;
+        assert_eq!(rx.seen().len(), 1);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_new_critical_is_not_sent() {
+        let rx = receiver::start(&[], Duration::ZERO).await;
+        let dir = notify_folder("suppressed");
+        let state = notify_state(&dir, Some(&rx.url), "", false);
+        record(&state, |store| {
+            store
+                .add_suppression(&Suppression {
+                    id: 0,
+                    code: "disk_nearly_full".to_string(),
+                    machine_key: None,
+                    tags: None,
+                    note: None,
+                    by: "Test".to_string(),
+                    by_subject: "test".to_string(),
+                    at: "2026-11-12T00:00:00Z".to_string(),
+                })
+                .expect("suppressed");
+        });
+
+        win_disk(&dir, "win-later.json", "2026-09-10T09:00:00Z", 3.0);
+        state.rescan().expect("scan");
+        assert_eq!(
+            state.snapshot().summary.critical,
+            1,
+            "the finding is there, and quieted"
+        );
+        assert_eq!(raised(&state), 0);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Warning, acknowledged, then critical: the acknowledgement lapses
+    /// because the finding got worse, and the finding was not critical
+    /// before, so it is news.
+    #[tokio::test]
+    async fn a_warning_that_escalates_to_critical_is_sent() {
+        let rx = receiver::start(&[], Duration::ZERO).await;
+        let dir = notify_folder("escalates");
+        let state = notify_state(&dir, Some(&rx.url), "", false);
+        let key = key_for(&state, "FLEET-WIN-01");
+
+        win_disk(&dir, "win-warning.json", "2026-09-10T09:00:00Z", 8.0);
+        state.rescan().expect("scan");
+        assert_eq!(raised(&state), 0, "a warning is not a critical");
+        record(&state, |store| {
+            store
+                .put_mark(&mark(
+                    &key,
+                    TriageState::Acknowledged,
+                    analytics::Severity::Warning,
+                ))
+                .expect("acknowledged");
+        });
+
+        win_disk(&dir, "win-critical.json", "2026-09-11T09:00:00Z", 3.0);
+        state.rescan().expect("scan");
+        let v = rx.wait_for(1).await[0].json();
+        assert_eq!(v["findings"][0]["code"], "disk_nearly_full");
+        assert_eq!(v["findings"][0]["machine_key"], key.as_str());
+        assert_eq!(raised(&state), 1);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A finding that was critical all along and becomes live again — a
+    /// snooze running out, an acknowledgement cleared — is not new.
+    #[tokio::test]
+    async fn a_snooze_running_out_or_an_acknowledgement_cleared_is_not_news() {
+        let rx = receiver::start(&[], Duration::ZERO).await;
+        let dir = notify_folder("unquieted");
+        win_disk(&dir, "win-critical.json", "2026-09-10T09:00:00Z", 3.0);
+        let state = notify_state(&dir, Some(&rx.url), "", false);
+        let key = key_for(&state, "FLEET-WIN-01");
+        let live_critical = |state: &Arc<AppState>| {
+            state
+                .snapshot()
+                .filtered_with(
+                    &Filter::default(),
+                    &state.thresholds,
+                    &state.book(),
+                    OffsetDateTime::now_utc(),
+                )
+                .summary
+                .critical
+        };
+
+        // Snoozed until today: run out, so this rebuild spends it.
+        let mut snooze = mark(&key, TriageState::Snoozed, analytics::Severity::Critical);
+        snooze.until = Some(OffsetDateTime::now_utc().date());
+        record(&state, |store| store.put_mark(&snooze).expect("snoozed"));
+        state.rescan().expect("scan");
+        assert_eq!(live_critical(&state), 1, "live again");
+        assert_eq!(raised(&state), 0);
+
+        // Acknowledged, then cleared before the next scan.
+        record(&state, |store| {
+            store
+                .put_mark(&mark(
+                    &key,
+                    TriageState::Acknowledged,
+                    analytics::Severity::Critical,
+                ))
+                .expect("acknowledged");
+        });
+        assert_eq!(live_critical(&state), 0);
+        record(&state, |store| {
+            assert!(store.clear_mark(&key, "disk_nearly_full").expect("cleared"));
+        });
+        state.rescan().expect("scan");
+        assert_eq!(live_critical(&state), 1, "live again");
+        assert_eq!(raised(&state), 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(rx.seen().is_empty());
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first scan into an empty index would otherwise report every
+    /// critical finding in the estate as new.
+    #[tokio::test]
+    async fn an_empty_baseline_sends_nothing_and_then_becomes_the_baseline() {
+        let rx = receiver::start(&[], Duration::ZERO).await;
+        let dir = notify_folder("empty-baseline");
+        win_disk(&dir, "win-critical.json", "2026-09-10T09:00:00Z", 3.0);
+        let state = notify_state(&dir, Some(&rx.url), "", true);
+        assert_eq!(state.snapshot().summary.machines, 0);
+
+        state.rescan().expect("scan");
+        assert_eq!(state.snapshot().summary.critical, 1);
+        assert_eq!(raised(&state), 0, "the first scan is the baseline");
+
+        // From then on, news is news.
+        std::fs::write(
+            dir.join("low-end-later.json"),
+            later_run("low-end.json", "2026-09-10T10:00:00Z", 0, 2.0),
+        )
+        .expect("write a run");
+        state.rescan().expect("scan");
+        let v = rx.wait_for(1).await[0].json();
+        let findings = v["findings"].as_array().expect("findings");
+        assert_eq!(findings.len(), 1, "{v}");
+        assert_eq!(findings[0]["hostname"], "FLEET-LNX-02");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scan, and the request that asked for it, never wait on the
+    /// receiver: one that sits on every request for five seconds holds up
+    /// neither.
+    #[tokio::test]
+    async fn a_slow_receiver_holds_up_neither_a_scan_nor_the_request() {
+        let rx = receiver::start(&[], Duration::from_secs(5)).await;
+        let dir = notify_folder("slow");
+        let state = notify_state(&dir, Some(&rx.url), "", false);
+
+        win_disk(&dir, "win-critical.json", "2026-09-10T09:00:00Z", 3.0);
+        let started = std::time::Instant::now();
+        state.rescan().expect("scan");
+        rx.wait_for(1).await;
+        // The receiver is now sitting on that one, and the sender with it.
+        std::fs::write(
+            dir.join("low-end-later.json"),
+            later_run("low-end.json", "2026-09-10T10:00:00Z", 0, 2.0),
+        )
+        .expect("write a run");
+        let reply = request(&state, Method::POST, "/api/rescan", None).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "two scans took {:?} against a receiver that takes 5 s",
+            started.elapsed()
+        );
+        assert_eq!(raised(&state), 2);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing listening at all: the scan succeeds, and the failure is
+    /// counted rather than raised to whoever asked for the scan.
+    #[tokio::test]
+    async fn a_refused_notification_fails_the_notification_not_the_scan() {
+        let rx = receiver::start(&[400], Duration::ZERO).await;
+        let dir = notify_folder("refused");
+        let state = notify_state(&dir, Some(&rx.url), "", false);
+        win_disk(&dir, "win-critical.json", "2026-09-10T09:00:00Z", 3.0);
+        let reply = request(&state, Method::POST, "/api/rescan", None).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        metric_reaches(
+            &state,
+            "loadbearer_fleet_notifications_total{event=\"findings.critical\",result=\"failed\"} 1",
+        )
+        .await;
+        assert_eq!(rx.seen().len(), 1, "a 400 is not retried");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The digest is the Overview, unscoped: live counts, quieted ones
+    /// counted apart, the live criticals listed — and, weekly, the week's
+    /// changes from the timeline.
+    #[tokio::test]
+    async fn the_digest_is_what_an_unscoped_overview_shows() {
+        let rx = receiver::start(&[], Duration::ZERO).await;
+        let dir = notify_folder("digest");
+        win_disk(&dir, "win-critical.json", "2026-09-10T09:00:00Z", 3.0);
+        std::fs::write(
+            dir.join("low-end-later.json"),
+            later_run("low-end.json", "2026-09-10T10:00:00Z", 0, 2.0),
+        )
+        .expect("write a run");
+        let state = notify_state(&dir, Some(&rx.url), "", false);
+        let key = key_for(&state, "FLEET-WIN-01");
+        record(&state, |store| {
+            store
+                .put_mark(&mark(
+                    &key,
+                    TriageState::Acknowledged,
+                    analytics::Severity::Critical,
+                ))
+                .expect("acknowledged");
+        });
+
+        state.raise_digest(DigestSchedule::Weekly);
+        let v = rx.wait_for(1).await[0].json();
+        assert_eq!(v["event"], "digest");
+        let s = &v["summary"];
+        assert_eq!(s["period"], "weekly");
+        assert_eq!(s["machines"], 4);
+        assert_eq!(s["live"]["critical"], 1, "{v}");
+        assert_eq!(s["quieted"]["acknowledged"], 1, "{v}");
+        let findings = v["findings"].as_array().expect("findings");
+        assert_eq!(findings.len(), 1, "only the live one: {v}");
+        assert_eq!(findings[0]["hostname"], "FLEET-LNX-02");
+        assert_eq!(v["more"], 0);
+        let changes = &s["changes"];
+        let mut keys: Vec<&String> = changes
+            .as_object()
+            .expect("a week's changes")
+            .keys()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "eased",
+                "machines_added",
+                "new_findings",
+                "new_machine_findings",
+                "resolved",
+                "since",
+                "worsened"
+            ]
+        );
+        let week_ago = (OffsetDateTime::now_utc() - time::Duration::weeks(1))
+            .date()
+            .to_string();
+        assert_eq!(changes["since"], week_ago.as_str());
+
+        state.raise_digest(DigestSchedule::Daily);
+        let v = rx.wait_for(2).await[1].json();
+        assert_eq!(v["summary"]["period"], "daily");
+        assert!(v["summary"]["changes"].is_null());
+        metric_reaches(
+            &state,
+            "loadbearer_fleet_notifications_total{event=\"digest\",result=\"sent\"} 2",
+        )
+        .await;
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }

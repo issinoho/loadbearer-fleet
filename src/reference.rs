@@ -447,6 +447,13 @@ mod tests {
                     expires: Some("2027-06-30".parse().expect("literal")),
                 }],
             },
+            notify: crate::config::Notify {
+                webhook_url: Some("https://hooks.example/x".into()),
+                secret: "s".into(),
+                critical: true,
+                digest: crate::config::DigestSchedule::Weekly,
+                digest_at: "08:00".into(),
+            },
             log: crate::config::Log {
                 format: crate::config::LogFormat::Text,
                 level: "info".into(),
