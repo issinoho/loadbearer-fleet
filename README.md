@@ -227,6 +227,9 @@ a clean Windows install expect one of these:
   PDQ / Intune / Ansible          this
   runs loadbearer on each   ->   \\share\loadbearer\*.json   ->   index   ->   dashboard
   machine, writes --output          (source of truth)          (derived)
+                                                                  +
+                                                            state file   <-   who acknowledged,
+                                                            (not derived)     snoozed, suppressed
 ```
 
 Three decisions shape everything else:
@@ -355,6 +358,19 @@ renames the index rather than dropping it, why
 that history back into files, and why the collected copy is worth naming
 properly — next.
 
+**The state file is the one thing that is not derived.** What people have said
+about the findings — [acknowledged, snoozed,
+suppressed](#acknowledge-snooze-suppress) — is in no result document, so it
+cannot be rebuilt from the folder, and it is deliberately *not* kept in the
+index: that would make deleting the index lose it, and the promise above would
+quietly stop being true. It lives in a small SQLite file of its own beside the
+index, `fleet-index.state.db` by default (`[server] state` to put it
+elsewhere). It is small and changes only when somebody presses a button, but it
+is the one file besides the collection folder that has to be [backed
+up](#backup-restore-and-moving-to-another-server) — and on a version a release
+does not understand, the server refuses to start rather than set it aside and
+begin empty.
+
 ### Name the collected copy per run, not per machine
 
 The usual deployment recipe writes a fixed path on each machine and copies it
@@ -421,7 +437,7 @@ surfaced.
 loadbearer-fleet scan \\fileserver\loadbearer      # index a folder (or re-index it)
 loadbearer-fleet status                            # what's in the index
 loadbearer-fleet report                            # summary, cohorts and red flags
-loadbearer-fleet report --all                      # include informational flags
+loadbearer-fleet report --all                      # include informational and quieted findings
 loadbearer-fleet report --json                     # the whole snapshot, as the UI sees it
 loadbearer-fleet report --by tag:site              # per site: worst share needing attention first
 loadbearer-fleet report --changes 4                # what changed in the last 4 weeks (1, 4 or 13)
@@ -430,8 +446,8 @@ loadbearer-fleet serve \\fileserver\loadbearer     # the dashboard, on http://12
 loadbearer-fleet init-config > fleet.toml          # a starter config, placeholders included
 loadbearer-fleet serve --config fleet.toml         # with single sign-on
 loadbearer-fleet check-auth --config fleet.toml    # check the identity provider settings
-loadbearer-fleet backup fleet-2026-09-10.db        # consistent snapshot, safe while serving
-loadbearer-fleet forget PC-01                      # remove a decommissioned machine
+loadbearer-fleet backup fleet-2026-09-10.db        # consistent snapshot of the index and state file
+loadbearer-fleet forget PC-01                      # remove a decommissioned machine, and its triage
 ```
 
 Those are the ones worth knowing by heart. For the rest — every command, every
@@ -491,6 +507,9 @@ resets when they're reimaged" is something an estate owner should know.
       and the estate's figures week by week, reconstructed from the runs
       already indexed — see [What changed, and the fleet over
       time](#what-changed-and-the-fleet-over-time)
+- [x] Acknowledge, snooze and suppress findings, kept in a state file of its
+      own so the index stays disposable — see [Acknowledge, snooze,
+      suppress](#acknowledge-snooze-suppress)
 
 ## Analysis
 
@@ -538,6 +557,60 @@ Every threshold lives in one struct with its reasoning attached, so tuning the
 engine is a config change rather than a code read. Every rule, what fires
 each one and every threshold with its default are in
 [Findings](https://github.com/issinoho/loadbearer-fleet/wiki/Findings).
+
+### Acknowledge, snooze, suppress
+
+A finding nobody can mark as seen is a finding read every morning. So each one
+can be quieted, three ways:
+
+| | Means | Lasts until |
+| --- | --- | --- |
+| **Acknowledge** | Seen, in hand. Records who, when, the severity it had, and an optional note. | The finding goes away — then it is spent, so the same rule firing on the same machine months later is news again — or it gets *more severe* than it was when acknowledged. |
+| **Snooze** | Not now. The same, with a date: a week, a month or three months from the dashboard, any day up to a year over the API. | That day (UTC), by the clock — no rescan or restart needed — or the finding getting more severe, whichever is first. |
+| **Suppress** | Not news here, by rule: one finding code on one machine, on every machine carrying a set of tags, or across the whole fleet. Records who, when and a note. | Somebody removes the rule. It does not lapse when the finding gets worse — that is what makes it a rule rather than an acknowledgement. |
+
+If more than one applies, a suppression wins over a snooze, and a snooze over
+an acknowledgement (a finding has at most one of the last two — the latest word
+replaces the one before). A finding is "the same finding" if it is the same
+rule on the same machine, as everywhere else in this tool; the one rule that can
+raise more than one finding per machine, a weak component, is quieted as one,
+by the worst of them.
+
+**It is an attention layer, not a change to the rules.** A quieted finding is
+still computed, still in the snapshot and in `report --json` with what was
+said about it in its `triage` field, and still drives the
+[lifecycle](#what-to-do-about-each-machine) verdict; "What changed" and the
+history are judged by the rules and ignore it entirely. What changes is
+whether it *needs attention*: the headline, the critical and warning counts,
+each group's flagged count and the queue all leave it out, and say beside
+themselves how many were quieted — "3 acknowledged · 1 snoozed · 12
+suppressed". The queue hides snoozed and suppressed findings until asked,
+and shows acknowledged ones quieter, after the live ones; a machine's own page
+shows every finding with what was said about it. The `flag=` filter still
+finds a machine whether or not its finding is quieted, because "which machines
+have this" is a question about the machines.
+
+**Who may.** A viewer sees it. A contributor or admin may acknowledge, snooze
+or undo either on the machines in their scope. Only an admin may create or
+remove a suppression, because a rule by tag or across the fleet reaches past
+any one scope. On the dashboard, an admin suppresses for one machine or the
+whole fleet; a rule by tags is API-only in this release (`POST
+/api/suppressions` with `tags`). Every change is logged with who made it.
+
+**How an acknowledgement ends.** Each time the snapshot is rebuilt — after a
+scan, an upload or a change by another process — an acknowledgement or snooze
+whose finding is no longer raised on a machine that is still in the index is
+dropped, as is one whose finding has got worse or whose snooze has run out,
+and the log says which and why. A machine missing from the index altogether
+keeps its marks, so an index rebuilt by an upgrade, which is empty until its
+first scan, does not wipe them. The judgement is made at those rebuilds, so a
+finding resolved and back again between two of them was never seen resolved
+and its acknowledgement stands.
+
+It is all kept in the [state file](#how-it-fits-together), never the index.
+`report` reads it and shows what a running server would — live findings
+listed, quieted ones counted on a line, `--all` listing them with who said
+what — without writing to it.
 
 ### Head to head, when the estate view isn't the question
 
@@ -821,7 +894,18 @@ returns exactly what the dashboard draws, so any view can be scripted or
 diffed; `GET /api/groups?by=<dimension>` is the Groups tab, taking the same
 filter parameters; `GET /api/changes?window=1|4|13` and
 `GET /api/timeline?weeks=4…26` are the overview's "What changed" and its
-charts, taking the same filter parameters too; and `GET /api/machine/{key}` is the drilldown payload. The lifecycle
+charts, taking the same filter parameters too; and `GET /api/machine/{key}` is the drilldown payload.
+`POST /api/triage` (`{ machine_key, code, action: "acknowledge" | "snooze" |
+"clear", until?, note? }`) acknowledges, snoozes or clears one finding;
+`GET /api/suppressions` lists the suppression rules the caller may see, and an
+admin makes and removes them with `POST /api/suppressions` (`{ code,
+machine_key? | tags?, note? }`) and `DELETE /api/suppressions/{id}`. A
+scoped caller is shown only the rules that say nothing about machines outside
+their scope: fleet-wide rules, rules for machines they can see, and tag rules
+that pick out one of their machines or sit wholly within their scope. Each
+finding in every response carries `triage` — null while live — and the
+summary and groups carry `quieted` counts; there is no `triage=` filter,
+since the client already has each finding's state. The lifecycle
 verdicts ride in the snapshot and the drilldown — each machine's `lifecycle`
 and `age_estimate`, and the counts in `summary.lifecycle` — so there is no
 endpoint of its own; `lifecycle=replace|repair|investigate|watch|keep` is a
@@ -1120,6 +1204,7 @@ you move it.
 | --- | --- | --- |
 | The collection folder | **Yes** | The results themselves, and the source of truth. This tool only ever reads it — it has no code that writes there. |
 | The index | Rebuilt if it has to be, and the old one kept | Derived data. If a release changes its internal shape, the existing file is renamed to `…superseded-v1-<when>.db` and a fresh one is rebuilt from the folder — `serve` does that in its startup scan, so it is invisible, though a bare `report` straight afterwards would show an empty fleet until you `scan`. [What that means for history](#what-an-index-format-change-does-to-your-history). |
+| The state file | **Yes**, or the server will not start | Acknowledgements, snoozes and suppressions. Not derived, so never set aside: a release that cannot read the version it finds refuses to start and says so, rather than begin empty. A release that changes its shape will migrate it, and the CHANGELOG will say so. |
 | Your config file | **Yes** | New options arrive with defaults, so a file written for an older version keeps working untouched. |
 | Sessions | No | Held in memory, so everyone signs in again. Against an identity provider they are already signed in to, that is one redirect they will barely notice. |
 
@@ -1174,13 +1259,15 @@ are never read again.
 The short version: **the collection folder is the thing worth backing up, and
 it is almost certainly already on a share your backup system covers.** This
 tool only reads it. Everything else is either rebuildable or a config file
-that belongs in source control.
+that belongs in source control — except the state file, which is small and is
+the one thing that has to come along.
 
 | | Back it up? | Why |
 | --- | --- | --- |
 | The collection folder | **Yes** — you probably already do | The results themselves. Nothing here writes to it. |
 | `archive_dir`, if set | **Yes** | Immutable, content-addressed copies of every result indexed. Small files that never change, so incremental backups copy each one once. |
 | The index | Optional | Rebuildable at ~340 runs/second — 60,000 runs in about three minutes. Worth a snapshot only in the case below. |
+| The state file | **Yes** | What people have acknowledged, snoozed and suppressed. Nothing else holds it and nothing can rebuild it. Kilobytes; `backup` copies it. |
 | The config file | Yes, in source control | Forty lines of TOML. |
 | Sessions | No | In memory. A restart signs people out regardless. |
 
@@ -1206,8 +1293,16 @@ dashboard nightly for a backup agent. Point your agent at it:
 loadbearer-fleet --config fleet.toml backup D:\backups\fleet-2026-09-10.db
 ```
 
-It refuses to overwrite an existing file. Restore is: stop the service, put the
-snapshot where `index` points, delete any `-wal`/`-shm` beside it, start.
+It writes the state file's copy beside it, named the way the state file is
+named beside the index — `fleet-2026-09-10.db` and
+`fleet-2026-09-10.state.db` — and says how many acknowledgements, snoozes
+and rules it holds (or that there is no state file yet, if nothing has been
+triaged). It refuses to overwrite either file, and checks both before writing
+either. So even where the folder is the whole story, a nightly `backup` is the
+easy way to keep the state file. Restore is: stop the service, put the
+snapshot where `index` points and the `.state` copy where `state` points
+(by default the index's name with `.state` before the extension), delete any
+`-wal`/`-shm` beside the index, start.
 
 ### Removing a machine — deleting its file is not enough
 
@@ -1220,13 +1315,17 @@ direction.
 
 ```
 loadbearer-fleet forget PC-01 --dry-run   # say what would go
-loadbearer-fleet forget PC-01             # runs, and archived documents
+loadbearer-fleet forget PC-01             # runs, archived documents, and its triage
 ```
 
 It takes a hostname or the machine key the drilldown shows, removes that
 machine's runs and everything hanging off them, and deletes the documents it
-archived for them. If a hostname matches two machines — they get reissued — it
-lists both and asks you to pick by key rather than guessing.
+archived for them. It clears the machine's acknowledgements and snoozes from
+the state file too, and any suppression rule that names that machine alone;
+rules by tag or across the fleet are about more than one machine and stay. A
+running dashboard notices on its next request. If a hostname matches two
+machines — they get reissued — it lists both and asks you to pick by key rather
+than guessing.
 
 **It does not touch the collection folder.** Nothing in this tool writes there,
 and deleting an estate's authoritative results on the strength of a hostname
@@ -1246,7 +1345,8 @@ unless these go:
 So a decommissioned machine, or a removal request, is three rungs:
 
 1. Delete its result files from the collection folder.
-2. `loadbearer-fleet forget <machine>` — index rows and archived copies.
+2. `loadbearer-fleet forget <machine>` — index rows, archived copies and its
+   triage.
 3. Nothing else. Sessions hold no fleet data and metrics carry no machine
    labels.
 
@@ -1273,6 +1373,13 @@ anything the two instances both saw is stored and counted once.
 An index copied from another server is fine too, as long as both are the same
 release — it is a database of a particular internal format, not an interchange
 file, which is why the archive is the better answer for anything long-lived.
+
+**Bring the state file**, or start the new server without anybody's
+acknowledgements. It is keyed by machine key and rule code, so it applies to
+the same machines however they reached the new index; copy it (or the
+`.state` file a `backup` wrote) to where the new config's `state` points
+before the first start. Consolidating two servers' state files is not
+supported — pick one, and re-triage what the other held.
 
 ## Metrics
 

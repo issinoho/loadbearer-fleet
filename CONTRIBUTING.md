@@ -81,7 +81,8 @@ trade-off, not restate what the code already says.
 | `src/index.rs` | the SQLite index, ingest, the document archive, `backup`, `forget` |
 | `src/analytics.rs` | cohorts, the red-flag engine, the executive summary, the filter projection |
 | `src/analytics/timeline.rs` | the fleet over time, reconstructed from the runs already indexed, and what changed between two dates |
-| `src/web.rs` | the HTTP layer, the snapshot cache, authorization applied as part of the projection |
+| `src/web.rs` | the HTTP layer, the snapshot cache, authorization applied as part of the projection, the triage endpoints |
+| `src/state.rs` | the state file: acknowledgements, snoozes and suppressions, the one thing not derived from the folder; how they apply to a finding and when they lapse |
 | `src/auth.rs` | OIDC sign-in, sessions, roles and tag scopes |
 | `src/config.rs` | the config file, and the validation that refuses placeholders |
 | `src/service.rs` | Windows service integration, and the systemd unit generator |

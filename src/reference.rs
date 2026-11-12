@@ -412,6 +412,7 @@ mod tests {
                 public_url: "https://fleet.example".into(),
                 collection_dir: Some("collection".into()),
                 index: "i.db".into(),
+                state: Some("i.state.db".into()),
                 archive_dir: Some("archive".into()),
                 upload_dir: Some("collection/uploaded".into()),
                 upload_limit_per_minute: 120,

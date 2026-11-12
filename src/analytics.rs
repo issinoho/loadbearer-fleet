@@ -235,13 +235,64 @@ pub enum FlagKind {
 pub struct Flag {
     pub severity: Severity,
     pub kind: FlagKind,
-    /// Stable identifier for the rule — for filtering, and for the suppression
-    /// list an estate owner will eventually want.
+    /// Stable identifier for the rule — for filtering, and what a suppression
+    /// names. Always one of `RULES`.
     pub code: &'static str,
     pub machine_key: String,
     pub hostname: Option<String>,
     pub headline: String,
     pub detail: String,
+    /// What somebody has said about this finding — acknowledged, snoozed or
+    /// suppressed — or `None` while it is live. Never set by the rules: it is
+    /// attached where a snapshot is projected for a caller
+    /// (`Snapshot::filtered_with`), so the finding itself, the lifecycle
+    /// verdict and the history are the same whatever anybody has said.
+    pub triage: Option<crate::state::Triage>,
+}
+
+impl Flag {
+    /// Live: nobody has acknowledged, snoozed or suppressed it.
+    pub fn is_live(&self) -> bool {
+        self.triage.is_none()
+    }
+}
+
+/// Every rule `evaluate` can raise, by code — the one authoritative list.
+///
+/// A suppression names a rule before any machine need be raising it, so the
+/// set of codes is checked against something other than the current fleet;
+/// a typo there would otherwise be a rule that silently suppresses nothing.
+/// Two tests hold it to `evaluate`: one reads `evaluate`'s own source and
+/// fails on a code missing from here or listed here and never raised, and
+/// `push` asserts every code it is handed is in it.
+pub const RULES: [&str; 21] = [
+    "grade_low",
+    "cohort_outlier",
+    "regressed",
+    "component_weak",
+    "battery_worn",
+    "drive_failing",
+    "drive_media_errors",
+    "drive_worn",
+    "disk_nearly_full",
+    "firmware_behind_peers",
+    "firmware_old",
+    "thermal_limited",
+    "on_battery",
+    "power_limited",
+    "partial_run",
+    "ram_backed_disk",
+    "unstable_run",
+    "stale",
+    "weak_identity",
+    "reimage_resets_identity",
+    "no_peer_group",
+];
+
+/// The rule a code names, as the `'static` the flags carry, or `None` for a
+/// code no rule raises.
+pub fn rule(code: &str) -> Option<&'static str> {
+    RULES.iter().copied().find(|r| *r == code)
 }
 
 /// The configuration a run's numbers are only comparable within.
@@ -798,7 +849,7 @@ fn lifecycle(m: &MachineView, flags: &[&Flag], th: &Thresholds) -> Lifecycle {
 
 /// Machines per lifecycle verdict. Always adds up to the machines it was
 /// counted over.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct LifecycleCounts {
     pub replace: usize,
     pub repair: usize,
@@ -854,12 +905,17 @@ pub struct Summary {
     pub median_score: Option<f64>,
     pub p10_score: Option<f64>,
     pub p90_score: Option<f64>,
+    /// Live findings — nobody has acknowledged, snoozed or suppressed them —
+    /// by severity. Quieted ones are counted in `quieted` instead.
     pub critical: usize,
     pub warnings: usize,
     pub info: usize,
-    /// Machines carrying at least one critical or warning flag. Always smaller
-    /// than the flag count, and the more honest headline of the two.
+    /// Machines carrying at least one live critical or warning flag. Always
+    /// smaller than the flag count, and the more honest headline of the two.
     pub machines_flagged: usize,
+    /// Findings somebody has quieted, by how. Still findings, still in
+    /// `flags`, still behind every lifecycle verdict; only not news.
+    pub quieted: QuietCounts,
     pub stale: usize,
     pub partial: usize,
     pub thermally_limited: usize,
@@ -876,6 +932,33 @@ pub struct Summary {
     pub configurations: Vec<(String, usize)>,
     /// Machines per lifecycle verdict; adds up to `machines`.
     pub lifecycle: LifecycleCounts,
+}
+
+/// Quieted findings by how they were quieted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct QuietCounts {
+    pub acknowledged: usize,
+    pub snoozed: usize,
+    pub suppressed: usize,
+}
+
+impl QuietCounts {
+    fn of<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> Self {
+        use crate::state::TriageState;
+        let mut c = Self::default();
+        for t in flags.into_iter().filter_map(|f| f.triage.as_ref()) {
+            *match t.state {
+                TriageState::Acknowledged => &mut c.acknowledged,
+                TriageState::Snoozed => &mut c.snoozed,
+                TriageState::Suppressed => &mut c.suppressed,
+            } += 1;
+        }
+        c
+    }
+
+    pub fn total(&self) -> usize {
+        self.acknowledged + self.snoozed + self.suppressed
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1520,6 +1603,10 @@ fn evaluate(
                         code: &'static str,
                         headline: String,
                         detail: String| {
+            debug_assert!(
+                RULES.contains(&code),
+                "{code} is raised by evaluate but missing from RULES"
+            );
             flags.push(Flag {
                 severity,
                 kind,
@@ -1528,6 +1615,7 @@ fn evaluate(
                 hostname: m.hostname.clone(),
                 headline,
                 detail,
+                triage: None,
             });
         };
 
@@ -2085,17 +2173,19 @@ fn grade_histogram<'a>(grades: impl IntoIterator<Item = &'a str>) -> Vec<(String
     grades
 }
 
-/// The machines that need attention: those carrying at least one critical or
-/// warning flag.
+/// The machines that need attention: those carrying at least one live
+/// critical or warning flag.
 ///
 /// Info flags don't make a machine "flagged" — every machine in a small estate
 /// carries one, and a headline that says all of them need attention is a
-/// headline nobody reads twice. The one definition, so the overview's headline
-/// and a group's count cannot come to disagree about what "flagged" means.
+/// headline nobody reads twice. Nor does a finding somebody has acknowledged,
+/// snoozed or suppressed: that one is in hand, which is the whole of what
+/// triage is for. The one definition, so the overview's headline and a group's
+/// count cannot come to disagree about what "flagged" means.
 fn flagged_keys<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> HashSet<&'a str> {
     flags
         .into_iter()
-        .filter(|f| needs_attention(f.severity))
+        .filter(|f| f.is_live() && needs_attention(f.severity))
         .map(|f| f.machine_key.as_str())
         .collect()
 }
@@ -2132,6 +2222,12 @@ fn summarise(
     configurations.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let flagged = flagged_keys(flags);
+    let live = |sev: Severity| {
+        flags
+            .iter()
+            .filter(|f| f.is_live() && f.severity == sev)
+            .count()
+    };
 
     Summary {
         machines: machines.len(),
@@ -2140,19 +2236,11 @@ fn summarise(
         median_score: (!scores.is_empty()).then(|| median(&scores)),
         p10_score: (!scores.is_empty()).then(|| quantile(&scores, 0.10)),
         p90_score: (!scores.is_empty()).then(|| quantile(&scores, 0.90)),
-        critical: flags
-            .iter()
-            .filter(|f| f.severity == Severity::Critical)
-            .count(),
-        warnings: flags
-            .iter()
-            .filter(|f| f.severity == Severity::Warning)
-            .count(),
-        info: flags
-            .iter()
-            .filter(|f| f.severity == Severity::Info)
-            .count(),
+        critical: live(Severity::Critical),
+        warnings: live(Severity::Warning),
+        info: live(Severity::Info),
         machines_flagged: flagged.len(),
+        quieted: QuietCounts::of(flags),
         stale: machines.iter().filter(|m| is_stale(m, th)).count(),
         partial: machines.iter().filter(|m| m.partial).count(),
         thermally_limited: machines
@@ -2330,8 +2418,45 @@ impl Filter {
 
 impl Snapshot {
     /// Narrow a snapshot to the machines a viewer asked for, recomputing the
-    /// summary so the headline always agrees with the rows beneath it.
+    /// summary so the headline always agrees with the rows beneath it. Every
+    /// finding comes out live; see `filtered_with` for the view with triage.
+    /// Only the tests want a view without it.
+    #[cfg(test)]
     pub fn filtered(&self, f: &Filter, th: &Thresholds) -> Snapshot {
+        self.filtered_with(
+            f,
+            th,
+            &crate::state::Book::default(),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+    }
+
+    /// `filtered`, with what people have said about the findings attached.
+    ///
+    /// **This is where triage is applied, and the only place.** Every view a
+    /// caller can be shown — the snapshot, a machine's page, the groups,
+    /// `report` — is a projection through here, so they cannot disagree about
+    /// which findings are quieted, and the counts the summary re-derives below
+    /// see the same answer the findings carry. The snapshot cached between
+    /// scans is never touched: triage changes on a click, the analysis only on
+    /// a scan, and keeping them apart is what lets an acknowledgement show on
+    /// the very next request without rebuilding anything.
+    ///
+    /// `now` is the clock a snooze is judged against — a parameter, like
+    /// `snapshot`'s, so expiry is tested rather than waited for, and so a
+    /// snooze ends at midnight UTC without a rescan.
+    ///
+    /// The filter still matches on every finding, quieted or not: `flag=`
+    /// finds a machine whose battery is worn whether or not somebody has
+    /// acknowledged it, because "which machines have this" is a question about
+    /// the machines.
+    pub fn filtered_with(
+        &self,
+        f: &Filter,
+        th: &Thresholds,
+        book: &crate::state::Book,
+        now: OffsetDateTime,
+    ) -> Snapshot {
         let flagged: HashSet<&str> = match &f.flag {
             Some(code) => self
                 .flags
@@ -2347,12 +2472,31 @@ impl Snapshot {
             .filter(|m| f.matches(m, &flagged))
             .cloned()
             .collect();
-        let keys: HashSet<&str> = machines.iter().map(|m| m.key.as_str()).collect();
+        let tags_of: HashMap<&str, &BTreeMap<String, String>> =
+            machines.iter().map(|m| (m.key.as_str(), &m.tags)).collect();
+        // Over every finding rather than those in view, though the two agree
+        // for any machine in view: a machine's findings travel together.
+        let worst = if book.is_empty() {
+            HashMap::new()
+        } else {
+            crate::state::worst_by_finding(self)
+        };
+        let today = now.date();
         let flags: Vec<Flag> = self
             .flags
             .iter()
-            .filter(|fl| keys.contains(fl.machine_key.as_str()))
-            .cloned()
+            .filter_map(|fl| {
+                let tags = tags_of.get(fl.machine_key.as_str())?;
+                let mut fl = fl.clone();
+                if !book.is_empty() {
+                    let w = worst
+                        .get(&(fl.machine_key.as_str(), fl.code))
+                        .copied()
+                        .unwrap_or(fl.severity);
+                    fl.triage = book.triage_for(&fl.machine_key, fl.code, w, tags, today);
+                }
+                Some(fl)
+            })
             .collect();
 
         let mut in_view: HashMap<&str, usize> = HashMap::new();
@@ -2532,15 +2676,18 @@ pub struct Group {
     pub thin: bool,
     pub median_trend_pct: Option<f64>,
     pub with_trend: usize,
-    /// Members with at least one critical or warning finding, by the same rule
-    /// as `Summary::machines_flagged`.
+    /// Members with at least one live critical or warning finding, by the
+    /// same rule as `Summary::machines_flagged`.
     pub flagged: usize,
-    /// Members with at least one critical finding.
+    /// Members with at least one live critical finding.
     pub machines_critical: usize,
-    /// Findings, not machines.
+    /// Live findings, not machines. The queues and the top findings count
+    /// live ones too.
     pub critical: usize,
     pub warnings: usize,
     pub info: usize,
+    /// Findings somebody has quieted, as `Summary::quieted`.
+    pub quieted: QuietCounts,
     pub queues: QueueCounts,
     /// The commonest critical and warning findings among the members, most
     /// machines first and then by code, at most three.
@@ -2587,10 +2734,15 @@ pub fn groups(snap: &Snapshot, by: &GroupBy) -> Vec<Group> {
     let mut out: Vec<Group> = members
         .into_iter()
         .map(|(value, ms)| {
-            let flags: Vec<&Flag> = ms
+            let all: Vec<&Flag> = ms
                 .iter()
                 .flat_map(|m| flags_of.get(m.key.as_str()).into_iter().flatten().copied())
                 .collect();
+            // Live findings only, for every count below: a site whose owner
+            // has acknowledged its drives is not the site that needs looking
+            // at. What was quieted is counted on its own.
+            let quieted = QuietCounts::of(all.iter().copied());
+            let flags: Vec<&Flag> = all.into_iter().filter(|f| f.is_live()).collect();
             let count = |sev: Severity| flags.iter().filter(|f| f.severity == sev).count();
             let mut queues = QueueCounts::default();
             for f in &flags {
@@ -2650,6 +2802,7 @@ pub fn groups(snap: &Snapshot, by: &GroupBy) -> Vec<Group> {
                 critical: count(Severity::Critical),
                 warnings: count(Severity::Warning),
                 info: count(Severity::Info),
+                quieted,
                 queues,
                 top_flags,
                 stale: ms.iter().filter(|m| is_stale(m, th)).count(),
@@ -6210,5 +6363,457 @@ mod tests {
             "Replace".parse::<Verdict>().is_err(),
             "exact, like the JSON"
         );
+    }
+
+    // --- Triage ------------------------------------------------------------
+
+    /// `RULES` is the list a suppression is checked against, so it has to be
+    /// exactly what `evaluate` can raise. Read from `evaluate`'s own source
+    /// rather than from a fleet, because no fixture estate raises every rule
+    /// — and a code missing here is a rule nobody can suppress, while a code
+    /// listed and never raised is a suppression that silently does nothing.
+    #[test]
+    fn every_code_evaluate_can_raise_is_in_rules_and_nothing_else_is() {
+        let src = include_str!("analytics.rs");
+        let start = src
+            .find("\nfn evaluate(")
+            .expect("evaluate is in this file");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("evaluate ends")];
+
+        // Every call of the local `push` closure — not `flags.push` or
+        // `why.push` — names its rule as the first string literal it is
+        // handed; the severity and the queue before it are enum values.
+        let mut raised = std::collections::BTreeSet::new();
+        let mut rest = body;
+        while let Some(at) = rest.find("push(") {
+            let before = rest[..at].chars().last();
+            rest = &rest[at + "push(".len()..];
+            if before.is_some_and(|c| c == '.' || c == '_' || c.is_alphanumeric()) {
+                continue;
+            }
+            if rest.trim_start().starts_with("Flag {") {
+                continue;
+            }
+            let open = rest.find('"').expect("a code literal after push(");
+            let close = open + 1 + rest[open + 1..].find('"').expect("closed");
+            raised.insert(&rest[open + 1..close]);
+        }
+        let listed: std::collections::BTreeSet<&str> = RULES.iter().copied().collect();
+        assert_eq!(
+            raised, listed,
+            "evaluate raises exactly the codes in RULES — add a new rule there too"
+        );
+        assert_eq!(listed.len(), RULES.len(), "no code listed twice");
+        assert_eq!(rule("stale"), Some("stale"));
+        assert_eq!(rule("stail"), None);
+    }
+
+    /// A machine whose `D:` is `free_pct` free — a warning under 10%, critical
+    /// under 5%, nothing at 10 or more — tagged with a site, or untagged.
+    fn disk_at(free_pct: f64, site: Option<&str>) -> impl FnOnce(&mut Value) {
+        let site = site.map(str::to_string);
+        move |d: &mut Value| {
+            d["machine"]["disks"] =
+                json!([volume("C:\\", 100, 40.0), volume("D:\\", 100, free_pct)]);
+            d["tags"] = match site {
+                Some(s) => json!({ "site": s }),
+                None => json!({}),
+            };
+        }
+    }
+
+    fn book_of(
+        marks: &[crate::state::Mark],
+        rules: &[crate::state::Suppression],
+    ) -> crate::state::Book {
+        let store = crate::state::Store::open_in_memory().expect("store");
+        for m in marks {
+            store.put_mark(m).expect("mark");
+        }
+        for r in rules {
+            store.add_suppression(r).expect("rule");
+        }
+        store.load().expect("load")
+    }
+
+    fn mark_on(
+        key: &str,
+        code: &str,
+        state: crate::state::TriageState,
+        severity: Severity,
+        until: Option<time::Date>,
+    ) -> crate::state::Mark {
+        crate::state::Mark {
+            machine_key: key.to_string(),
+            code: code.to_string(),
+            state,
+            severity,
+            until,
+            note: Some("in hand".to_string()),
+            by: "Iain".to_string(),
+            by_subject: "sub-1".to_string(),
+            at: now(),
+        }
+    }
+
+    fn suppression(
+        code: &str,
+        machine_key: Option<&str>,
+        tags: Option<&[(&str, &str)]>,
+    ) -> crate::state::Suppression {
+        crate::state::Suppression {
+            id: 0,
+            code: code.to_string(),
+            machine_key: machine_key.map(str::to_string),
+            tags: tags.map(|t| {
+                t.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
+            }),
+            note: None,
+            by: "Iain".to_string(),
+            by_subject: "sub-1".to_string(),
+            at: "2026-09-09T12:00:00Z".to_string(),
+        }
+    }
+
+    fn triage_of(s: &Snapshot, host: &str) -> Option<crate::state::TriageState> {
+        flag_on(s, "disk_nearly_full", host)
+            .expect("the finding is still there, whatever its triage")
+            .triage
+            .as_ref()
+            .map(|t| t.state)
+    }
+
+    /// An acknowledgement quiets a finding and changes nothing else: the
+    /// finding is still in the snapshot, the lifecycle verdicts are the same,
+    /// and only the attention counts — summary and groups — move, into
+    /// `quieted`.
+    #[test]
+    fn a_quieted_finding_leaves_the_counts_that_need_attention_and_nothing_else() {
+        use crate::state::TriageState::Acknowledged;
+        let mut e = Estate::new();
+        e.add_with(
+            "FULL",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            disk_at(8.0, Some("glasgow")),
+        );
+        e.add_with(
+            "ALSO-FULL",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            disk_at(8.0, Some("glasgow")),
+        );
+        let raw = e.snap();
+        let key = machine(&raw, "FULL").key.clone();
+        let book = book_of(
+            &[mark_on(
+                &key,
+                "disk_nearly_full",
+                Acknowledged,
+                Severity::Warning,
+                None,
+            )],
+            &[],
+        );
+        let plain = raw.filtered_with(
+            &Filter::default(),
+            &Thresholds::default(),
+            &Default::default(),
+            now(),
+        );
+        let view = raw.filtered_with(&Filter::default(), &Thresholds::default(), &book, now());
+
+        assert_eq!(triage_of(&view, "FULL"), Some(Acknowledged));
+        assert_eq!(
+            triage_of(&view, "ALSO-FULL"),
+            None,
+            "another machine's is its own"
+        );
+        assert_eq!(
+            view.flags.len(),
+            plain.flags.len(),
+            "quieted is not removed"
+        );
+        assert_eq!(view.summary.warnings, plain.summary.warnings - 1);
+        assert_eq!(view.summary.quieted.acknowledged, 1);
+        assert_eq!(view.summary.quieted.total(), 1);
+        let others_need_attention = view
+            .flags
+            .iter()
+            .any(|f| f.machine_key == key && f.is_live() && needs_attention(f.severity));
+        assert_eq!(
+            view.summary.machines_flagged,
+            plain.summary.machines_flagged - usize::from(!others_need_attention)
+        );
+        for (a, b) in view.machines.iter().zip(&plain.machines) {
+            assert_eq!(
+                a.lifecycle.verdict, b.lifecycle.verdict,
+                "triage is attention, not a verdict"
+            );
+        }
+        assert_eq!(view.summary.lifecycle, plain.summary.lifecycle);
+
+        let site = GroupBy::Tag("site".into());
+        let (g, p) = (groups(&view, &site), groups(&plain, &site));
+        let (g, p) = (group(&g, Some("glasgow")), group(&p, Some("glasgow")));
+        assert_eq!(g.warnings, p.warnings - 1);
+        assert_eq!(g.quieted.acknowledged, 1);
+        assert_eq!(g.flagged, p.flagged - usize::from(!others_need_attention));
+
+        // `flag=` is a question about the machines, and still finds it.
+        let by_flag = raw.filtered_with(
+            &Filter {
+                flag: Some("disk_nearly_full".into()),
+                ..Filter::default()
+            },
+            &Thresholds::default(),
+            &book,
+            now(),
+        );
+        assert!(by_flag.machines.iter().any(|m| m.key == key));
+    }
+
+    /// A snooze ends by the clock the view is produced with — no rescan, no
+    /// restart — from the start of its `until` day, UTC.
+    #[test]
+    fn a_snooze_ends_by_the_clock_without_a_rescan() {
+        use crate::state::TriageState::Snoozed;
+        let mut e = Estate::new();
+        e.add_with("FULL", 1000.0, "2026-09-01T10:00:00Z", disk_at(8.0, None));
+        let raw = e.snap();
+        let key = machine(&raw, "FULL").key.clone();
+        let until = time::macros::date!(2026 - 09 - 12);
+        let book = book_of(
+            &[mark_on(
+                &key,
+                "disk_nearly_full",
+                Snoozed,
+                Severity::Warning,
+                Some(until),
+            )],
+            &[],
+        );
+        let at = |t: OffsetDateTime| {
+            raw.filtered_with(&Filter::default(), &Thresholds::default(), &book, t)
+        };
+
+        assert_eq!(triage_of(&at(now()), "FULL"), Some(Snoozed));
+        assert_eq!(
+            triage_of(&at(datetime!(2026-09-11 23:59:59 UTC)), "FULL"),
+            Some(Snoozed)
+        );
+        let back = at(datetime!(2026-09-12 00:00:00 UTC));
+        assert_eq!(triage_of(&back, "FULL"), None, "back on the day it ends");
+        assert_eq!(back.summary.quieted.total(), 0);
+        assert_eq!(
+            book.spent(&raw, until),
+            vec![(
+                key,
+                "disk_nearly_full".to_string(),
+                crate::state::Spent::Expired
+            )],
+            "and dropped at the next rebuild"
+        );
+    }
+
+    /// Worse than when somebody said they had seen it is news again; a
+    /// suppression is a standing rule and does not care.
+    #[test]
+    fn escalation_lapses_an_acknowledgement_and_a_snooze_but_not_a_suppression() {
+        use crate::state::TriageState::{Acknowledged, Snoozed, Suppressed};
+        let mut e = Estate::new();
+        for host in ["ACKED", "SNOOZED", "SUPPRESSED"] {
+            e.add_with(host, 1000.0, "2026-09-01T10:00:00Z", disk_at(8.0, None));
+        }
+        let before = e.snap();
+        let key = |h: &str| machine(&before, h).key.clone();
+        let book = book_of(
+            &[
+                mark_on(
+                    &key("ACKED"),
+                    "disk_nearly_full",
+                    Acknowledged,
+                    Severity::Warning,
+                    None,
+                ),
+                mark_on(
+                    &key("SNOOZED"),
+                    "disk_nearly_full",
+                    Snoozed,
+                    Severity::Warning,
+                    Some(time::macros::date!(2026 - 12 - 01)),
+                ),
+            ],
+            &[suppression(
+                "disk_nearly_full",
+                Some(&key("SUPPRESSED")),
+                None,
+            )],
+        );
+        let view = |s: &Snapshot| {
+            s.filtered_with(&Filter::default(), &Thresholds::default(), &book, now())
+        };
+        let v = view(&before);
+        assert_eq!(triage_of(&v, "ACKED"), Some(Acknowledged));
+        assert_eq!(triage_of(&v, "SNOOZED"), Some(Snoozed));
+        assert_eq!(triage_of(&v, "SUPPRESSED"), Some(Suppressed));
+
+        // Each disk fills to critical.
+        for host in ["ACKED", "SNOOZED", "SUPPRESSED"] {
+            e.add_with(host, 1000.0, "2026-09-05T10:00:00Z", disk_at(3.0, None));
+        }
+        let after = e.snap();
+        let v = view(&after);
+        assert_eq!(
+            flag_on(&v, "disk_nearly_full", "ACKED").unwrap().severity,
+            Severity::Critical
+        );
+        assert_eq!(triage_of(&v, "ACKED"), None);
+        assert_eq!(triage_of(&v, "SNOOZED"), None);
+        assert_eq!(triage_of(&v, "SUPPRESSED"), Some(Suppressed));
+        let spent = book.spent(&after, now().date());
+        assert_eq!(spent.len(), 2);
+        assert!(
+            spent
+                .iter()
+                .all(|(_, _, why)| *why == crate::state::Spent::Escalated)
+        );
+    }
+
+    /// An acknowledgement is of *this* occurrence. Resolved, it is spent; when
+    /// the same rule fires again on the same machine months later, that is
+    /// news, not something already in hand.
+    #[test]
+    fn an_acknowledgement_does_not_survive_resolve_then_recur() {
+        use crate::state::TriageState::Acknowledged;
+        let mut e = Estate::new();
+        e.add_with("FULL", 1000.0, "2026-09-01T10:00:00Z", disk_at(8.0, None));
+        e.add("ELSEWHERE", 1000.0, "2026-09-01T10:00:00Z");
+        let first = e.snap();
+        let key = machine(&first, "FULL").key.clone();
+        let book = book_of(
+            &[mark_on(
+                &key,
+                "disk_nearly_full",
+                Acknowledged,
+                Severity::Warning,
+                None,
+            )],
+            &[],
+        );
+
+        // Somebody clears the disk.
+        e.add_with("FULL", 1000.0, "2026-09-03T10:00:00Z", disk_at(40.0, None));
+        let resolved = e.snap();
+        let spent = book.spent(&resolved, now().date());
+        assert_eq!(
+            spent,
+            vec![(
+                key.clone(),
+                "disk_nearly_full".to_string(),
+                crate::state::Spent::Resolved
+            )]
+        );
+        let book = book.without(&spent);
+
+        // And it fills again.
+        e.add_with("FULL", 1000.0, "2026-09-07T10:00:00Z", disk_at(8.0, None));
+        let recurred =
+            e.snap()
+                .filtered_with(&Filter::default(), &Thresholds::default(), &book, now());
+        assert_eq!(triage_of(&recurred, "FULL"), None, "a recurrence is news");
+
+        // A machine missing altogether is not a finding resolved: an index
+        // superseded by an upgrade is empty until its first scan.
+        let book = book_of(
+            &[mark_on(
+                &key,
+                "disk_nearly_full",
+                Acknowledged,
+                Severity::Warning,
+                None,
+            )],
+            &[],
+        );
+        let empty = Estate::new().snap();
+        assert!(book.spent(&empty, now().date()).is_empty());
+    }
+
+    /// A suppression reaches one machine, the machines carrying a set of
+    /// tags, or the whole fleet — and wins over a snooze or acknowledgement.
+    #[test]
+    fn a_suppression_reaches_one_machine_some_tags_or_the_fleet() {
+        use crate::state::TriageState::{Acknowledged, Suppressed};
+        let mut e = Estate::new();
+        e.add_with(
+            "GLA",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            disk_at(8.0, Some("glasgow")),
+        );
+        e.add_with(
+            "EDI",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            disk_at(8.0, Some("edinburgh")),
+        );
+        e.add_with("NONE", 1000.0, "2026-09-01T10:00:00Z", disk_at(8.0, None));
+        let raw = e.snap();
+        let key = |h: &str| machine(&raw, h).key.clone();
+        let view = |book: &crate::state::Book| {
+            raw.filtered_with(&Filter::default(), &Thresholds::default(), book, now())
+        };
+        let states = |v: &Snapshot| ["GLA", "EDI", "NONE"].map(|h| triage_of(v, h));
+
+        let by_tags = view(&book_of(
+            &[],
+            &[suppression(
+                "disk_nearly_full",
+                None,
+                Some(&[("site", "glasgow")]),
+            )],
+        ));
+        assert_eq!(states(&by_tags), [Some(Suppressed), None, None]);
+
+        let by_machine = view(&book_of(
+            &[],
+            &[suppression("disk_nearly_full", Some(&key("EDI")), None)],
+        ));
+        assert_eq!(states(&by_machine), [None, Some(Suppressed), None]);
+
+        let fleet = view(&book_of(
+            &[],
+            &[suppression("disk_nearly_full", None, None)],
+        ));
+        assert_eq!(states(&fleet), [Some(Suppressed); 3]);
+        assert_eq!(fleet.summary.quieted.suppressed, 3);
+
+        let other_rule = view(&book_of(&[], &[suppression("stale", None, None)]));
+        assert_eq!(
+            states(&other_rule),
+            [None; 3],
+            "a rule is about its own code"
+        );
+
+        let both = view(&book_of(
+            &[mark_on(
+                &key("GLA"),
+                "disk_nearly_full",
+                Acknowledged,
+                Severity::Warning,
+                None,
+            )],
+            &[suppression("disk_nearly_full", Some(&key("GLA")), None)],
+        ));
+        let t = flag_on(&both, "disk_nearly_full", "GLA")
+            .unwrap()
+            .triage
+            .as_ref()
+            .unwrap();
+        assert_eq!(t.state, Suppressed, "suppress over acknowledge");
+        assert_eq!(t.reach, Some(crate::state::Reach::Machine));
     }
 }

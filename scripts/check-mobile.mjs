@@ -327,6 +327,30 @@ const longestCpu = snapshot.machines.map((m) => m.cpu_model)
   .reduce((a, b) => (b.length > a.length ? b : a), '');
 check('fixtures', snapshot.machines.length > 0, 'the fixtures produced no machines');
 
+// Two findings quieted through the API, as a person would quiet them, so the
+// quieted line — who, when, a long note, Undo — is laid out at every size as
+// well as the live controls. The drilldown machine's own findings first, so
+// its page carries one.
+{
+  const warnings = snapshot.flags.filter((f) => f.severity !== 'info')
+    .sort((a, b) => Number(b.machine_key === machineKey) - Number(a.machine_key === machineKey));
+  const until = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+  const said = [
+    { action: 'acknowledge', note: 'Fan replacement ordered under the warranty; re-measure once it is fitted and the heatsink cleaned.' },
+    { action: 'snooze', until },
+  ];
+  for (const [i, extra] of said.entries()) {
+    const f = warnings[i];
+    if (!f) continue;
+    const r = await fetch(`${origin}/api/triage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ machine_key: f.machine_key, code: f.code, ...extra }),
+    });
+    check('triage', r.ok, `could not ${extra.action} ${f.code}: ${await r.text()}`);
+  }
+}
+
 /* ----------------------------------------------------------------- the runs */
 
 const profile = join(work, 'chrome');

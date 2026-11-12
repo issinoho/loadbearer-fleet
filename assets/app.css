@@ -282,10 +282,10 @@ main.loading { opacity: 0.55; transition: opacity 120ms ease-out; }
   min-width: 0;
 }
 
-.card-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+.card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin-bottom: 4px; }
 .card-head h3 { font-size: 14px; }
 .card-sub { color: var(--text-secondary); font-size: 12px; margin: 0 0 12px; }
-.card-actions { margin-left: auto; display: flex; gap: 6px; }
+.card-actions { margin-left: auto; display: flex; flex-wrap: wrap; gap: 6px; }
 
 .card-note {
   color: var(--text-muted);
@@ -430,6 +430,37 @@ table.data td.wrap { white-space: normal; min-width: 16em; }
 .finding-who { font-weight: 600; }
 .finding-detail { color: var(--text-secondary); margin: 4px 0 0; }
 .finding-queue { color: var(--text-muted); font-size: 12px; }
+
+/* Triage. A quieted finding is still a finding, so it keeps its place and its
+   words; it is drawn quieter, the way a done item is, rather than hidden. */
+.finding-quieted .finding-head,
+.finding-quieted .finding-detail { opacity: 0.6; }
+
+.triage { margin-top: 6px; }
+.triage-quiet,
+.triage-actions,
+.triage-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.triage-actions .btn { padding-left: 6px; padding-right: 6px; }
+.triage-state { color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.triage-panel { margin-top: 6px; }
+.triage-panel[hidden] { display: none; }
+.triage-note {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  flex: 1 1 160px;
+  min-width: 0;
+}
 
 /* "What changed" lists one kind of change after another inside one card, so
    each heading needs the room a card's own top edge would have given it. */
@@ -624,7 +655,7 @@ table.data td.wrap { white-space: normal; min-width: 16em; }
   }
 
   .btn-square { min-width: 40px; }
-  .field select, .field input { min-height: 40px; }
+  .field select, .field input, .triage-note { min-height: 40px; }
 }
 
 /* ---------- compare ---------- */

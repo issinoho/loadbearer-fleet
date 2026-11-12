@@ -2,9 +2,14 @@
 //! results.
 //!
 //! The design follows from one decision: the collection folder is the source of
-//! truth and this process holds nothing that can't be rebuilt from it. The
-//! index is derived, the analytics are computed from the index, and deleting
-//! the database costs a rescan and nothing else.
+//! truth and this process holds nothing about the machines that can't be
+//! rebuilt from it. The index is derived, the analytics are computed from the
+//! index, and deleting the database costs a rescan and nothing else.
+//!
+//! The one exception is what people have said about the findings —
+//! acknowledged, snoozed, suppressed — which no result document records. That
+//! lives in its own small state file (`state.rs`), never in the index, so the
+//! index's promise stays true; it is the one file `backup` has to carry.
 //!
 //! It reads the `loadbearer.result/1` schema rather than linking loadbearer's
 //! internals, because that schema is loadbearer's documented stability contract
@@ -22,6 +27,7 @@ mod reference;
 mod report;
 mod schema;
 mod service;
+mod state;
 mod web;
 
 use std::net::SocketAddr;
@@ -83,9 +89,11 @@ enum Command {
         /// consume, so what the dashboard shows can be diffed and scripted.
         #[arg(long)]
         json: bool,
-        /// Show informational flags too. Off by default: on a small or varied
-        /// estate almost every machine carries one, and burying two critical
-        /// findings under forty notices is how a dashboard stops being read.
+        /// Show informational flags too, and the findings somebody has
+        /// acknowledged, snoozed or suppressed, each with what was said. Off by
+        /// default: on a small or varied estate almost every machine carries an
+        /// informational flag, and burying two critical findings under forty
+        /// notices is how a dashboard stops being read.
         #[arg(long)]
         all: bool,
         /// Group the machines instead: `model`, `cpu`, `os`, or `tag:<key>`
@@ -148,11 +156,14 @@ enum Command {
         #[arg(long)]
         no_scan: bool,
     },
-    /// Remove a machine from the index, and the documents archived for it.
+    /// Remove a machine from the index, the documents archived for it, and
+    /// what has been recorded about its findings.
     ///
     /// For a decommissioned machine, or a removal request. Deleting its result
     /// file from the collection folder is not enough on its own: a scan only
-    /// ever adds, so the run stays indexed until something removes it.
+    /// ever adds, so the run stays indexed until something removes it. Its
+    /// acknowledgements, snoozes and the suppressions naming it alone go from
+    /// the state file too; rules by tag or across the fleet stay.
     Forget {
         /// Hostname, or the machine key shown in the dashboard.
         #[arg(value_name = "MACHINE")]
@@ -180,13 +191,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Take a consistent copy of the index, safe to run while it is serving.
+    /// Take a consistent copy of the index and the state file, safe to run
+    /// while it is serving.
     ///
     /// For a backup agent to call. The collection folder is the thing actually
     /// worth backing up — this covers the run history the index holds that the
-    /// folder may not, when a collector overwrites one file per machine.
+    /// folder may not, when a collector overwrites one file per machine, and
+    /// the acknowledgements, snoozes and suppressions, which nothing else
+    /// holds. The state file's copy is written beside FILE with `.state`
+    /// before its extension: `fleet.db` and `fleet.state.db`.
     Backup {
-        /// Where to write the snapshot. Must not already exist.
+        /// Where to write the snapshot. Neither it nor its `.state` sibling
+        /// may already exist.
         #[arg(value_name = "FILE")]
         file: PathBuf,
     },
@@ -562,10 +578,21 @@ fn main() -> Result<()> {
                 }
             };
 
+            // Opened before anything is removed, so a state file this build
+            // cannot read stops the command with the index untouched rather
+            // than half-way through. Absent is fine: nothing has ever been
+            // triaged, and there is nothing to clear.
+            let triage = state::Store::open_existing(&config.server.state_path())?;
+
             let plan = if *dry_run {
                 idx.forget_plan(&target.key)?
             } else {
                 idx.forget(&target.key)?
+            };
+            let cleared = match &triage {
+                Some(store) if *dry_run => store.forget_plan(&target.key)?,
+                Some(store) => store.forget(&target.key)?,
+                None => state::ForgetTriage::default(),
             };
 
             let verb = if *dry_run { "would remove" } else { "removed" };
@@ -577,6 +604,19 @@ fn main() -> Result<()> {
             );
             if !plan.archived.is_empty() {
                 println!("{verb} {} archived document(s)", plan.archived.len());
+            }
+            if cleared.marks > 0 {
+                println!(
+                    "{verb} {} acknowledgement(s) or snooze(s) on its findings",
+                    cleared.marks
+                );
+            }
+            if cleared.suppressions > 0 {
+                println!(
+                    "{verb} {} suppression rule(s) naming this machine alone (rules by tag or \
+                     across the fleet stay)",
+                    cleared.suppressions
+                );
             }
             if !plan.sources_still_present.is_empty() {
                 println!(
@@ -602,6 +642,18 @@ fn main() -> Result<()> {
         }
         Command::Backup { file } => {
             let idx = index::Index::open_existing(&config.server.index)?;
+            // Both refusals before either copy is written, so a backup is
+            // never left as an index snapshot without its state beside it.
+            let triage = state::Store::open_read_only(&config.server.state_path())?;
+            let state_copy = state::sibling(file);
+            if triage.is_some() && state_copy.exists() {
+                anyhow::bail!(
+                    "{} already exists; the state file's copy goes there, beside {}. Move it \
+                     aside or pick another name",
+                    state_copy.display(),
+                    file.display()
+                );
+            }
             let bytes = idx.backup_to(file)?;
             println!(
                 "wrote {} ({:.1} MB) from {} run(s)",
@@ -609,6 +661,25 @@ fn main() -> Result<()> {
                 bytes as f64 / (1024.0 * 1024.0),
                 idx.run_count()?
             );
+            match &triage {
+                Some(store) => {
+                    let (marks, rules) = store.counts()?;
+                    store.backup_to(&state_copy)?;
+                    println!(
+                        "wrote {} with {marks} acknowledgement(s) or snooze(s) and {rules} \
+                         suppression rule(s) — restore it beside the index as {}",
+                        state_copy.display(),
+                        config.server.state_path().display()
+                    );
+                }
+                // Said, because "where is the state backup?" deserves an
+                // answer rather than an absence.
+                None => println!(
+                    "no state file at {}: nothing has been acknowledged, snoozed or suppressed \
+                     yet, so there is nothing else to copy",
+                    config.server.state_path().display()
+                ),
+            }
             if config.server.archive_dir.is_none() {
                 println!(
                     "note: no archive_dir is set, so this snapshot is the only copy of any \
@@ -641,6 +712,20 @@ fn main() -> Result<()> {
             let th = Thresholds::default();
             let now = OffsetDateTime::now_utc();
             let snap = analytics::snapshot(idx.conn(), &th, now)?;
+            // What people have said about the findings, applied exactly as the
+            // server applies it — including dropping what a server would have
+            // found spent against this snapshot — so the report and the
+            // dashboard agree. Read-only: `report` changes nothing, and a
+            // missing state file is simply nothing said yet.
+            let book = match state::Store::open_read_only(&config.server.state_path())? {
+                Some(store) => {
+                    let book = store.load()?;
+                    let spent = book.spent(&snap, now.date());
+                    book.without(&spent)
+                }
+                None => state::Book::default(),
+            };
+            let snap = snap.filtered_with(&analytics::Filter::default(), &th, &book, now);
             if *lifecycle {
                 let report = analytics::lifecycle_report(&snap);
                 if *json {
@@ -735,7 +820,12 @@ fn main() -> Result<()> {
             }
             let idx = index::Index::open(&config.server.index)?
                 .with_archive(config.server.archive_dir.as_deref())?;
-            let state = web::AppState::new(idx, &config, Thresholds::default())?;
+            // The state file after the index, and fatal if it will not open:
+            // it refuses a version it does not understand rather than starting
+            // empty, and serving with every acknowledgement silently gone is
+            // worse than not serving. service.rs opens both the same way.
+            let store = state::Store::open(&config.server.state_path())?;
+            let state = web::AppState::new(idx, store, &config, Thresholds::default())?;
             if config.server.collection_dir.is_some() && !*no_scan {
                 // Through the same path the timer and the button use, so the
                 // startup scan is counted and stamped like any other. It used
@@ -861,7 +951,7 @@ fn short(label: &str) -> String {
     }
 }
 
-fn print_report(snap: &analytics::Snapshot, show_info: bool) {
+fn print_report(snap: &analytics::Snapshot, show_all: bool) {
     let s = &snap.summary;
     println!("Fleet: {} machine(s), {} run(s)", s.machines, s.runs);
     if let (Some(med), Some(p10), Some(p90)) = (s.median_score, s.p10_score, s.p90_score) {
@@ -908,39 +998,95 @@ fn print_report(snap: &analytics::Snapshot, show_info: bool) {
         );
     }
 
+    // `--all` is "everything the rules found": informational flags, and the
+    // findings somebody has quieted, each saying what was said about it.
+    // Without it, the list is what needs attention — live, at or above
+    // warning — and the rest is counted underneath.
     let shown: Vec<&analytics::Flag> = snap
         .flags
         .iter()
-        .filter(|f| show_info || f.severity != Severity::Info)
+        .filter(|f| show_all || (f.is_live() && f.severity != Severity::Info))
         .collect();
+    let q = &s.quieted;
+    let quieted = if q.total() > 0 {
+        format!(
+            "{} finding(s) quieted — {} acknowledged, {} snoozed, {} suppressed",
+            q.total(),
+            q.acknowledged,
+            q.snoozed,
+            q.suppressed
+        )
+    } else {
+        String::new()
+    };
     if shown.is_empty() {
-        println!("\nNo flags at or above warning.");
-        return;
+        println!("\nNo live flags at or above warning.");
+    } else {
+        println!("\nFlags");
     }
-    println!("\nFlags");
     for f in shown {
         let who = f.hostname.as_deref().unwrap_or(&f.machine_key);
         println!(
             "  [{:<8}] {:<11} {who}  {}",
-            match f.severity {
-                Severity::Critical => "critical",
-                Severity::Warning => "warning",
-                Severity::Info => "info",
-            },
-            match f.kind {
-                FlagKind::Machine => "machine",
-                FlagKind::Measurement => "measurement",
-                FlagKind::Coverage => "coverage",
-            },
+            severity_word(f.severity),
+            queue_word(f.kind),
             f.headline
         );
+        if let Some(t) = &f.triage {
+            println!("      {}", triage_line(t));
+        }
     }
-    if !show_info && s.info > 0 {
-        println!(
-            "\n{} informational flag(s) hidden — pass --all to see them.",
-            s.info
-        );
+    if !show_all {
+        if s.info > 0 {
+            println!(
+                "\n{} informational flag(s) hidden — pass --all to see them.",
+                s.info
+            );
+        }
+        if !quieted.is_empty() {
+            println!("{quieted} — pass --all to list them.");
+        }
+    } else if !quieted.is_empty() {
+        println!("\n{quieted}.");
     }
+}
+
+/// "acknowledged by Iain on 2026-09-09: in hand" — what was said about a
+/// quieted finding, on the line under it.
+fn triage_line(t: &state::Triage) -> String {
+    let day = t.at.get(..10).unwrap_or(&t.at);
+    let mut line = match t.state {
+        state::TriageState::Acknowledged => format!("acknowledged by {} on {day}", t.by),
+        state::TriageState::Snoozed => format!(
+            "snoozed by {} on {day} until {}",
+            t.by,
+            t.until.as_deref().unwrap_or("?")
+        ),
+        state::TriageState::Suppressed => format!(
+            "suppressed by {} on {day} (rule {}, {})",
+            t.by,
+            t.rule.unwrap_or_default(),
+            match t.reach {
+                Some(state::Reach::Machine) => "this machine".to_string(),
+                Some(state::Reach::Tags) => t
+                    .tags
+                    .as_ref()
+                    .map(|tags| {
+                        tags.iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default(),
+                _ => "fleet-wide".to_string(),
+            }
+        ),
+    };
+    if let Some(note) = t.note.as_deref().filter(|n| !n.is_empty()) {
+        line.push_str(": ");
+        line.push_str(note);
+    }
+    line
 }
 
 /// `--changes`'s parser: 1, 4 or 13, refused by clap otherwise.
