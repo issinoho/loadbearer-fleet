@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::analytics::Snapshot;
+use crate::analytics::{Snapshot, Summary};
 
 /// What one scan did, kept so a scrape can report on collection health.
 #[derive(Debug, Clone, Copy)]
@@ -146,7 +146,19 @@ fn age_seconds(timestamp: Option<&String>, now: OffsetDateTime) -> Option<f64> {
 
 /// Render the whole exposition. `now` is a parameter so the age gauges are
 /// testable, for the same reason the analytics take a clock.
-pub fn render(snapshot: &Snapshot, runtime: &Runtime, now: OffsetDateTime) -> String {
+///
+/// `live` is the summary of the same fleet with triage applied — what is
+/// left once acknowledged, snoozed and suppressed findings are taken out. The
+/// families that predate triage (`findings`, `machines_flagged`) keep
+/// counting every finding, so an alert written against them means what it
+/// meant when it was written; the live counts are families of their own, for
+/// the alert that should go quiet when somebody says "in hand".
+pub fn render(
+    snapshot: &Snapshot,
+    live: &Summary,
+    runtime: &Runtime,
+    now: OffsetDateTime,
+) -> String {
     let s = &snapshot.summary;
     let mut out = Text(String::with_capacity(4096));
 
@@ -179,6 +191,12 @@ pub fn render(snapshot: &Snapshot, runtime: &Runtime, now: OffsetDateTime) -> St
          findings, because one machine can raise several.",
         s.machines_flagged as f64,
     );
+    out.gauge(
+        "machines_flagged_live",
+        "Machines carrying at least one warning or critical finding that nobody has acknowledged, \
+         snoozed or suppressed.",
+        live.machines_flagged as f64,
+    );
 
     let grades: Vec<(Vec<(&str, &str)>, f64)> = s
         .grades
@@ -200,7 +218,42 @@ pub fn render(snapshot: &Snapshot, runtime: &Runtime, now: OffsetDateTime) -> St
     .iter()
     .map(|(n, severity)| (vec![("severity", *severity)], *n as f64))
     .collect::<Vec<_>>();
-    out.family("findings", "Open findings by severity.", "gauge", &findings);
+    out.family(
+        "findings",
+        "Open findings by severity, whether or not they have been acknowledged, snoozed or \
+         suppressed.",
+        "gauge",
+        &findings,
+    );
+    let live_findings = [
+        (live.critical, "critical"),
+        (live.warnings, "warning"),
+        (live.info, "info"),
+    ]
+    .iter()
+    .map(|(n, severity)| (vec![("severity", *severity)], *n as f64))
+    .collect::<Vec<_>>();
+    out.family(
+        "findings_live",
+        "Open findings by severity that nobody has acknowledged, snoozed or suppressed. The one \
+         to alert on if an acknowledgement should silence the alert.",
+        "gauge",
+        &live_findings,
+    );
+    let quieted = [
+        (live.quieted.acknowledged, "acknowledged"),
+        (live.quieted.snoozed, "snoozed"),
+        (live.quieted.suppressed, "suppressed"),
+    ]
+    .iter()
+    .map(|(n, state)| (vec![("state", *state)], *n as f64))
+    .collect::<Vec<_>>();
+    out.family(
+        "findings_quieted",
+        "Open findings somebody has acknowledged, snoozed or suppressed, by which.",
+        "gauge",
+        &quieted,
+    );
 
     let quantiles: Vec<(Vec<(&str, &str)>, f64)> = [
         ("0.1", s.p10_score),
@@ -352,6 +405,11 @@ mod tests {
         datetime!(2026-09-09 12:00:00 UTC)
     }
 
+    /// The exposition with nothing quieted: the live view is the snapshot.
+    fn render_all(snap: &Snapshot, rt: &Runtime, now: OffsetDateTime) -> String {
+        render(snap, &snap.summary, rt, now)
+    }
+
     fn snapshot() -> Snapshot {
         let mut index = Index::open_in_memory().unwrap();
         for f in ["win-modern.json", "linux-throttled.json", "low-end.json"] {
@@ -398,7 +456,7 @@ mod tests {
 
     #[test]
     fn the_exposition_is_well_formed() {
-        let text = render(&snapshot(), &runtime(), now());
+        let text = render_all(&snapshot(), &runtime(), now());
         // Every metric line must have a HELP and a TYPE ahead of it, which is
         // what a scraper needs to accept the family.
         let mut declared = std::collections::HashSet::new();
@@ -428,7 +486,7 @@ mod tests {
     #[test]
     fn the_fleet_counts_come_from_the_snapshot() {
         let snap = snapshot();
-        let text = render(&snap, &runtime(), now());
+        let text = render_all(&snap, &runtime(), now());
         assert_eq!(
             value_of(&text, "loadbearer_fleet_machines "),
             snap.summary.machines.to_string()
@@ -459,7 +517,7 @@ mod tests {
     /// The metric an operator should page on.
     #[test]
     fn collection_health_is_reported_in_seconds_not_prose() {
-        let text = render(&snapshot(), &runtime(), now());
+        let text = render_all(&snapshot(), &runtime(), now());
         let stamp = value_of(
             &text,
             "loadbearer_fleet_scan_last_success_timestamp_seconds ",
@@ -481,7 +539,7 @@ mod tests {
     fn a_scan_that_has_not_happened_yet_reports_nothing_rather_than_zero() {
         let mut rt = runtime();
         rt.last_scan = None;
-        let text = render(&snapshot(), &rt, now());
+        let text = render_all(&snapshot(), &rt, now());
         assert!(!text.contains("scan_last_success_timestamp_seconds"));
         assert!(!text.contains("scan_files_seen"));
         // The counters still exist, so "no scan has ever succeeded" is visible.
@@ -492,7 +550,7 @@ mod tests {
     fn an_empty_fleet_renders_without_pretending_to_have_a_median() {
         let index = Index::open_in_memory().unwrap();
         let snap = crate::analytics::snapshot(index.conn(), &Thresholds::default(), now()).unwrap();
-        let text = render(&snap, &runtime(), now());
+        let text = render_all(&snap, &runtime(), now());
         assert_eq!(value_of(&text, "loadbearer_fleet_machines "), "0");
         assert!(
             text.contains("loadbearer_fleet_score{quantile=\"0.5\"} NaN"),
@@ -515,7 +573,7 @@ mod tests {
             &Thresholds::default(),
         );
         assert_eq!(narrowed.summary.machines, 0);
-        let text = render(&snap, &runtime(), now());
+        let text = render_all(&snap, &runtime(), now());
         assert_eq!(
             value_of(&text, "loadbearer_fleet_machines "),
             snap.summary.machines.to_string()
