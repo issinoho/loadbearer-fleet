@@ -27,7 +27,7 @@ Unlike [loadbearer](https://github.com/issinoho/loadbearer), which is a local
 command-line tool, this is a **long-running HTTP server that holds an inventory
 of an entire estate** — hostnames, firmware serials, asset tags, CPU models,
 disk models and capacities, for every machine that has ever reported. Treat the
-index and the archive as you would any other asset database.
+index, the archive and the state file as you would any other asset database.
 
 It:
 
@@ -39,8 +39,25 @@ It:
 - **reads** the collection folder, and never writes to it **unless
   `[server] upload_dir` is set** — which is off by default, and which has to
   name a directory *inside* the collection folder. It also **writes** the
-  index, and the document archive if `archive_dir` is set. Nothing here ever
-  deletes from the collection folder;
+  index, the document archive if `archive_dir` is set, and the **state
+  file** — the acknowledgements, snoozes and suppressions people record
+  against findings, with who recorded each and an optional note. Nothing here
+  ever deletes from the collection folder;
+- **lets people quiet findings, and records who did.** `POST /api/triage`
+  (acknowledge, snooze, clear) needs a `contributor` or `admin` session and a
+  machine inside the caller's scope — one outside it is a 404, as it is
+  everywhere else. Suppression rules (`POST` and `DELETE
+  /api/suppressions`) are `admin` only, because a rule by tag or across the
+  fleet reaches past any one scope; a scoped caller listing them is shown only
+  rules that say nothing about machines outside their scope. The POSTs require
+  `application/json`, as the upload does; the DELETE has no body, and relies on
+  the session cookie being `SameSite=Lax` (not sent on a cross-site DELETE)
+  and on a cross-origin DELETE being preflighted, which fails because the
+  server answers no CORS. Ingest tokens are not accepted on any of them. Each
+  change is logged with the caller's subject. Quieting a finding changes what
+  counts as needing attention — the rules, the lifecycle verdict and the
+  history are untouched — so the worst a misused grant does here is hide a
+  finding from the queue, visibly and attributably;
 - **accepts submitted results only through one route.** `POST /api/upload`,
   from a signed-in `contributor` or an ingest token. Five things are checked
   before a byte is kept, and the first two — who the caller is, and whether
@@ -152,7 +169,9 @@ without anyone having to remember.
   never reach the limiter, because they are refused before there is a
   principal to count them against.
 - **Result documents embed a machine inventory**, so the collection folder, the
-  index, the archive and a `backup` snapshot are all machine fingerprints. See
+  index, the archive and a `backup` snapshot are all machine fingerprints, and
+  the state file carries the names of the people who triaged findings and their
+  notes. See
   [Removing a machine](README.md#removing-a-machine--deleting-its-file-is-not-enough):
   deleting a result file is *not* enough to remove it from the dashboard.
 
@@ -171,6 +190,11 @@ been audited":
   indistinguishable from one that doesn't exist, that both halves of the
   sign-in CSRF defence are required, that the post-sign-in redirect cannot
   leave the site, and that sessions expire and are stored only as hashes.
+  On triage: that a viewer may not acknowledge or snooze, that a machine
+  outside a contributor's scope is a 404 indistinguishable from one that does
+  not exist, that a non-JSON body is refused, that only an admin may create or
+  remove a suppression, and that a scoped caller is not shown rules about
+  machines outside their scope.
   On the write path: that uploading is refused with no `upload_dir`, for the
   wrong role, for the wrong content type and for a document outside the
   caller's scope; that an unknown ingest token is refused *without* falling

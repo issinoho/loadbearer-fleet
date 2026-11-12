@@ -5,6 +5,11 @@
 //! schema changes here cheap and why a change to `INDEX_VERSION` rebuilds
 //! rather than migrating.
 //!
+//! That is also why nothing an operator *says* is kept here. Acknowledgements,
+//! snoozes and suppressions are in no result document, so a rebuild could not
+//! bring them back; they live in the state file (`state.rs`) instead, and this
+//! file stays safe to delete.
+//!
 //! Ingest is **idempotent by content**. A collection share gets rescanned
 //! constantly — on a timer, after a sweep, when someone hits refresh — and the
 //! same file must not become two runs. Every row carries the SHA-256 of the

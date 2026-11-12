@@ -150,6 +150,16 @@ pub struct Server {
     pub collection_dir: Option<PathBuf>,
     /// Where the derived index lives. Safe to delete.
     pub index: PathBuf,
+    /// Where acknowledgements, snoozes and suppressions are kept: the state
+    /// file. Absent means beside the index, named after it —
+    /// `fleet-index.db` keeps its state in `fleet-index.state.db`.
+    ///
+    /// **Not derived, and not safe to delete.** Everything else this tool
+    /// holds can be rebuilt from the collection folder; what people have said
+    /// about the findings cannot, which is exactly why it is not in the index.
+    /// `backup` copies it alongside the index snapshot.
+    #[serde(default)]
+    pub state: Option<PathBuf>,
     /// Keep a copy of every result document this indexes, content-addressed.
     ///
     /// Unset by default, because it is only worth its disk when the collection
@@ -289,6 +299,22 @@ impl Log {
     }
 }
 
+impl Server {
+    /// The state file this configuration means: `state` if set, otherwise
+    /// beside the index with `.state` before its extension.
+    ///
+    /// Worked out from the index path *as finally resolved* — after
+    /// `--index` has overridden the file — rather than defaulted when the
+    /// config is read, so `--index dev.db` keeps its state in `dev.state.db`
+    /// and never in somebody else's.
+    pub fn state_path(&self) -> PathBuf {
+        match &self.state {
+            Some(p) => p.clone(),
+            None => crate::state::sibling(&self.index),
+        }
+    }
+}
+
 impl Default for Server {
     fn default() -> Self {
         Self {
@@ -296,6 +322,7 @@ impl Default for Server {
             public_url: "http://127.0.0.1:8787".to_string(),
             collection_dir: None,
             index: PathBuf::from("fleet-index.db"),
+            state: None,
             archive_dir: None,
             upload_dir: None,
             upload_limit_per_minute: upload_limit_per_minute(),
@@ -423,9 +450,10 @@ pub struct Grant {
 pub enum Role {
     /// Read the dashboard.
     Viewer,
-    /// Read the dashboard, and submit results to it.
+    /// Read the dashboard, submit results to it, and acknowledge or snooze
+    /// findings on the machines in scope.
     Contributor,
-    /// Read the dashboard, submit results, and trigger a rescan.
+    /// All of that, trigger a rescan, and create or remove suppression rules.
     Admin,
 }
 
@@ -497,6 +525,7 @@ impl Config {
     /// Resolving against the config file makes the answer the same either way.
     fn resolve_paths_against(&mut self, base: &Path) {
         self.server.index = beside(base, &self.server.index);
+        self.server.state = self.server.state.as_deref().map(|p| beside(base, p));
         // A UNC share is already absolute, so the usual case is untouched.
         self.server.collection_dir = self
             .server
@@ -544,6 +573,17 @@ impl Config {
         )?;
         check_placeholder_path("server.archive_dir", self.server.archive_dir.as_deref())?;
         check_placeholder_path("server.upload_dir", self.server.upload_dir.as_deref())?;
+        check_placeholder_path("server.state", self.server.state.as_deref())?;
+        // The state file opens the index and refuses it anyway, but by then
+        // the message is about a database; here it can be about the setting.
+        if self.server.state.as_deref() == Some(self.server.index.as_path()) {
+            bail!(
+                "server.state and server.index are the same file ({}). The index is derived and \
+                 may be rebuilt; the state file holds what people have recorded and must not be, \
+                 so the two cannot share a file.",
+                self.server.index.display()
+            );
+        }
         check_placeholder_path("log.file", self.log.file.as_deref())?;
         check_placeholder_path("auth.ca_bundle", self.auth.ca_bundle.as_deref())?;
 
@@ -763,6 +803,18 @@ collection_dir = 'PUT-THE-PATH-TO-YOUR-RESULTS-SHARE-HERE'
 # your collector keeps a file per run.
 index = "fleet-index.db"
 
+# Optional. Where acknowledgements, snoozes and suppressions of findings are
+# kept. Unset, it sits beside the index, named after it: fleet-index.db keeps
+# its state in fleet-index.state.db.
+#
+# Unlike the index this is NOT derived and NOT safe to delete: it is what
+# people have recorded about the findings, and nothing in the collection
+# folder can bring it back. `backup` copies it beside the index snapshot; back
+# it up with whatever backs up this server. A version this release does not
+# understand is refused at startup rather than set aside or recreated.
+#
+# state = 'PUT-THE-PATH-FOR-THE-STATE-FILE-HERE'
+
 # Optional. Keeps a gzipped copy of every result document this indexes, named
 # by its SHA-256, at about 8 KB per run.
 #
@@ -906,15 +958,16 @@ token = ""
 
 [[auth.grants]]
 group = "PUT-THE-GROUP-YOUR-FLEET-ADMINS-ARE-IN-HERE"
-role = "admin"    # read the dashboard, and trigger a rescan
+role = "admin"    # read the dashboard, trigger a rescan, suppress findings
 
 [[auth.grants]]
 group = "PUT-THE-GROUP-YOUR-FLEET-VIEWERS-ARE-IN-HERE"
 role = "viewer"   # read the dashboard
 
 # The three roles nest: a contributor does everything a viewer does and may
-# also submit results; an admin does everything a contributor does and may also
-# trigger a rescan.
+# also submit results and acknowledge or snooze findings on the machines in
+# its scope; an admin does everything a contributor does and may also trigger
+# a rescan and create or remove suppression rules.
 #
 # [[auth.grants]]
 # group = "PUT-THE-GROUP-THAT-MAY-SUBMIT-RESULTS-HERE"

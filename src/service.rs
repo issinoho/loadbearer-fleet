@@ -55,6 +55,10 @@ pub fn systemd_unit(exe: &Path, config_path: &Path, config: &Config, user: &str)
         }
     };
     want(config.server.index.parent());
+    // The state file's directory rather than the file: SQLite writes its
+    // journal beside it. Usually the index's directory, and named once then.
+    let state = config.server.state_path();
+    want(state.parent());
     want(config.log.file.as_ref().and_then(|f| f.parent()));
     // The archive is a directory in its own right, not a file in one.
     want(config.server.archive_dir.as_deref());
@@ -161,6 +165,7 @@ fn unreachable_under_protect_home(config: &Config) -> Vec<(&'static str, String)
     };
 
     check("server.index", Some(&config.server.index));
+    check("server.state", Some(&config.server.state_path()));
     check(
         "server.collection_dir",
         config.server.collection_dir.as_deref(),
@@ -250,6 +255,9 @@ pub fn service_preflight(config_path: Option<&Path>, config: &Config, user: &str
     let mut writable: Vec<(std::path::PathBuf, &'static str)> = Vec::new();
     if let Some(d) = config.server.index.parent() {
         writable.push((d.to_path_buf(), "index"));
+    }
+    if let Some(d) = config.server.state_path().parent() {
+        writable.push((d.to_path_buf(), "state"));
     }
     if let Some(d) = config.log.file.as_ref().and_then(|f| f.parent()) {
         writable.push((d.to_path_buf(), "[log] file"));
@@ -608,10 +616,17 @@ mod windows_impl {
         // before one is built — which also means Running is not reported until
         // the folder has actually been read once.
         let result = (|| -> Result<()> {
+            // Opened exactly as `serve` opens them in main.rs: the index, then
+            // the state file, which refuses a version it does not know.
             let index = crate::index::Index::open(&config.server.index)?
                 .with_archive(config.server.archive_dir.as_deref())?;
-            let state =
-                crate::web::AppState::new(index, config, crate::analytics::Thresholds::default())?;
+            let triage = crate::state::Store::open(&config.server.state_path())?;
+            let state = crate::web::AppState::new(
+                index,
+                triage,
+                config,
+                crate::analytics::Thresholds::default(),
+            )?;
             if config.server.collection_dir.is_some() {
                 crate::web::report_startup_scan(&state);
             }
@@ -871,11 +886,12 @@ mod tests {
             !shown.contains("chown"),
             "never advise making the config directory writable:\n{shown}"
         );
-        // Both settings, in one failure: fixing one and being told about the
-        // other on the next run is two rounds where one would do.
+        // Every setting, in one failure: fixing one and being told about the
+        // next on the next run is two rounds where one would do. The state
+        // file follows the index there when it is not set on its own.
         assert!(
-            shown.contains("[log] file and index"),
-            "both settings should be named:\n{shown}"
+            shown.contains("[log] file, index and state"),
+            "every setting should be named:\n{shown}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

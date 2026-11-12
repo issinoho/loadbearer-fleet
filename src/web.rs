@@ -23,6 +23,12 @@
 //! **It refuses to put the estate on the wire in the clear.** A non-loopback
 //! bind is declined unless either sign-in is configured and `public_url` is
 //! https, or the operator has said `--allow-remote` in as many words.
+//!
+//! Beside the cached analysis sits the one thing here that is not derived:
+//! what people have said about the findings (`state`). It is held in memory
+//! and applied in the same projection as the scope, so an acknowledgement is
+//! on the next response without a rescan — and written through to the state
+//! file on every change, so a restart loses nothing.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -50,6 +56,7 @@ use crate::config::{AuthMode, Config, Metrics as MetricsConfig};
 use crate::index::{Index, ScanReport};
 use crate::metrics::{self, Runtime, ScanStamp};
 use crate::ratelimit::Limiter;
+use crate::state::{self as triage, Book, Mark, Reach, Store, Suppression, Triage, TriageState};
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
@@ -112,13 +119,33 @@ pub struct AppState {
     metrics_config: MetricsConfig,
     /// Counters that outlive any one snapshot, for the metrics endpoint.
     runtime: Mutex<Runtime>,
+    /// The state file. Every change is written here before it is shown.
+    store: Mutex<Store>,
+    /// What the state file holds, for applying to a view without a query.
+    /// Replaced wholesale after every change, as the analysis is.
+    book: RwLock<Arc<Book>>,
+    /// The state file's `data_version` when `book` was read, so a `forget`
+    /// from a terminal — which clears a machine's triage in the file — is
+    /// noticed on the next request rather than at the next restart.
+    book_version: Mutex<i64>,
 }
 
 impl AppState {
-    pub fn new(index: Index, config: &Config, thresholds: Thresholds) -> Result<Arc<Self>> {
+    pub fn new(
+        index: Index,
+        store: Store,
+        config: &Config,
+        thresholds: Thresholds,
+    ) -> Result<Arc<Self>> {
         let analysis = Analysis::compute(&index, &thresholds)?;
         let version = index.data_version().unwrap_or(0);
+        spend_marks(&store, &analysis.snapshot)?;
+        let book = store.load()?;
+        let book_version = store.data_version().unwrap_or(0);
         Ok(Arc::new(Self {
+            store: Mutex::new(store),
+            book: RwLock::new(Arc::new(book)),
+            book_version: Mutex::new(book_version),
             index: Mutex::new(index),
             cache: RwLock::new(Arc::new(analysis)),
             data_version: Mutex::new(version),
@@ -248,8 +275,53 @@ impl AppState {
         // Taken *before* publishing, so a commit that lands during the analysis
         // is noticed next time rather than being taken as already included.
         let version = idx.data_version().unwrap_or(0);
+        // Against the new snapshot, before it is published: a mark spent by
+        // this scan must not be shown applying to it even once. Always the
+        // index lock, then the store's, and nothing takes them the other way
+        // round.
+        //
+        // Not fatal if the state file cannot be written: a scan that cannot
+        // tidy the triage must still be published, or one locked file would
+        // freeze the dashboard on the last scan. Nothing is wrongly quieted
+        // meanwhile — `Book::triage_for` already ignores a mark that is
+        // escalated or run out, and a resolved finding has nothing to quiet.
+        {
+            let store = self.store.lock().expect("store lock");
+            if let Err(e) =
+                spend_marks(&store, &analysis.snapshot).and_then(|()| self.publish_book(&store))
+            {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    "could not tidy the state file after a scan"
+                );
+            }
+        }
         *self.cache.write().expect("cache lock") = Arc::new(analysis);
         *self.data_version.lock().expect("data version lock") = version;
+        Ok(())
+    }
+
+    /// What the state file holds, re-read first if another process has
+    /// changed it.
+    fn book(&self) -> Arc<Book> {
+        if let Ok(store) = self.store.try_lock() {
+            let changed = store.data_version().is_ok_and(|v| {
+                let mut seen = self.book_version.lock().expect("book version lock");
+                std::mem::replace(&mut *seen, v) != v
+            });
+            if changed && let Err(e) = self.publish_book(&store) {
+                // The copy in memory is still a true answer, just an older one.
+                tracing::warn!(error = %e, "could not re-read the state file after an external change");
+            }
+        }
+        Arc::clone(&self.book.read().expect("book lock"))
+    }
+
+    /// Re-read the state file into memory. Called with the store locked, after
+    /// every write, so the next request sees exactly what was written.
+    fn publish_book(&self, store: &Store) -> Result<()> {
+        let book = store.load()?;
+        *self.book.write().expect("book lock") = Arc::new(book);
         Ok(())
     }
 
@@ -293,6 +365,28 @@ impl AppState {
         });
         Ok(report)
     }
+}
+
+/// Drop the acknowledgements and snoozes that the freshly computed, unscoped
+/// snapshot shows have stopped applying — resolved, worse than when they were
+/// recorded, or run out — and say so in the log, which is the audit trail.
+/// See `Book::spent` for why a machine that is missing altogether keeps its.
+fn spend_marks(store: &Store, snap: &Snapshot) -> Result<()> {
+    let today = OffsetDateTime::now_utc().date();
+    let spent = store.load()?.spent(snap, today);
+    if spent.is_empty() {
+        return Ok(());
+    }
+    store.spend(&spent)?;
+    for (machine, code, why) in &spent {
+        tracing::info!(
+            machine = %loggable(machine),
+            code = %code,
+            why = why.as_str(),
+            "triage lapsed"
+        );
+    }
+    Ok(())
 }
 
 /// Anything that goes wrong serving a request. The full chain goes to the log;
@@ -432,7 +526,14 @@ fn visible_in(
 ) -> Snapshot {
     let mut filter = params.into_filter();
     filter.scopes = caller.0.scopes.clone();
-    snap.filtered(&filter, &state.thresholds)
+    // Triage in the same pass as the scope, against the clock now: one
+    // projection decides both what a caller sees and what of it is quieted.
+    snap.filtered_with(
+        &filter,
+        &state.thresholds,
+        &state.book(),
+        OffsetDateTime::now_utc(),
+    )
 }
 
 async fn get_snapshot(
@@ -614,11 +715,7 @@ async fn post_upload(
             "submitting a result needs a grant with role = \"contributor\" or \"admin\"",
         ));
     }
-    let json = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("application/json"));
-    if !json {
+    if !sent_as_json(&headers) {
         return Err(AppError::bad_request(
             "send the document as application/json",
         ));
@@ -813,6 +910,448 @@ async fn post_rescan(
     }))
 }
 
+/// Whether a request body was sent as JSON — the CSRF defence of every route
+/// that takes one. See `post_upload`: no cross-origin form can send
+/// `application/json`, and a cross-origin `fetch` that does is preflighted,
+/// which fails here because nothing answers CORS.
+fn sent_as_json(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"))
+}
+
+/// A note as it is kept: trimmed, absent when empty, and refused when it is
+/// longer than a sentence of context or carries a control character — it is
+/// shown to the next person and written to the log, and neither is the place
+/// for a line break somebody else's text can forge.
+fn clean_note(note: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(note) = note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) else {
+        return Ok(None);
+    };
+    if note.chars().count() > triage::MAX_NOTE_CHARS {
+        return Err(AppError::bad_request(format!(
+            "a note is at most {} characters — a sentence of context for the next person, not \
+             a ticket",
+            triage::MAX_NOTE_CHARS
+        )));
+    }
+    if note.chars().any(char::is_control) {
+        return Err(AppError::bad_request("a note is one line of plain text"));
+    }
+    Ok(Some(note))
+}
+
+/// `POST /api/triage`.
+#[derive(Debug, Deserialize)]
+struct TriageRequest {
+    machine_key: String,
+    code: String,
+    /// `acknowledge`, `snooze` or `clear`.
+    action: String,
+    /// Snoozes only: `YYYY-MM-DD`, UTC, the day the finding comes back.
+    until: Option<String>,
+    note: Option<String>,
+}
+
+/// What a finding's triage is after a change: `triage` is null when it is
+/// live — which after a `clear` it is, unless a suppression still holds it.
+#[derive(Debug, Serialize)]
+struct TriageOutcome {
+    machine_key: String,
+    code: &'static str,
+    triage: Option<Triage>,
+}
+
+/// Acknowledge, snooze or clear one finding on one machine.
+///
+/// Checked in the order the upload is, cheapest and least revealing first:
+/// the role, then that the body is JSON (the CSRF defence, as there), then the
+/// machine in the caller's own view — out of scope is 404, the same answer as
+/// a machine that does not exist, exactly as `get_machine` gives — and only
+/// then whether the rule is one and is raised on it. "You cannot acknowledge
+/// what isn't there" is a 400: an acknowledgement of a finding that is absent
+/// would apply, unannounced, to whenever it next appears, which is the thing
+/// `Book::spent` exists to prevent.
+async fn post_triage(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<Json<TriageOutcome>, AppError> {
+    let who = &caller.0;
+    if !who.may_triage() {
+        return Err(AppError::forbidden(
+            "acknowledging or snoozing a finding needs the contributor or admin role",
+        ));
+    }
+    if !sent_as_json(&headers) {
+        return Err(AppError::bad_request(
+            "send the request as application/json",
+        ));
+    }
+    let req: TriageRequest =
+        serde_json::from_str(&body).map_err(|e| AppError::bad_request(format!("{e}")))?;
+
+    let now = OffsetDateTime::now_utc();
+    let snap = visible(&state, &caller, FilterParams::default());
+    let Some(machine) = snap.machines.iter().find(|m| m.key == req.machine_key) else {
+        return Err(AppError::not_found(format!(
+            "no machine keyed {:?} in the index",
+            req.machine_key
+        )));
+    };
+    let Some(code) = analytics::rule(&req.code) else {
+        return Err(AppError::bad_request(format!(
+            "{:?} is not a rule this server raises",
+            req.code
+        )));
+    };
+    // The worst of them: a rule that raises more than one finding on a
+    // machine (`component_weak`) is triaged as one, by its worst.
+    let worst = snap
+        .flags
+        .iter()
+        .filter(|f| f.machine_key == machine.key && f.code == code)
+        .map(|f| f.severity)
+        .min();
+
+    let action = req.action.trim();
+    let mark = match action {
+        "acknowledge" | "snooze" => {
+            let Some(severity) = worst else {
+                return Err(AppError::bad_request(format!(
+                    "{code} is not currently raised on this machine, so there is nothing to {action}"
+                )));
+            };
+            let until = match (action, req.until.as_deref()) {
+                ("snooze", Some(s)) => {
+                    let Some(day) = triage::parse_date(s) else {
+                        return Err(AppError::bad_request(format!(
+                            "until {s:?} wants a date, as in 2026-12-01"
+                        )));
+                    };
+                    let today = now.date();
+                    let latest = today + time::Duration::days(triage::MAX_SNOOZE_DAYS);
+                    if day <= today || day > latest {
+                        return Err(AppError::bad_request(format!(
+                            "a snooze runs until a day after today and at most {} days out \
+                             ({latest}); longer than that is a suppression",
+                            triage::MAX_SNOOZE_DAYS
+                        )));
+                    }
+                    Some(day)
+                }
+                ("snooze", None) => {
+                    return Err(AppError::bad_request(
+                        "a snooze needs until, the day the finding comes back",
+                    ));
+                }
+                (_, Some(_)) => {
+                    return Err(AppError::bad_request(
+                        "until is for a snooze; an acknowledgement lasts until the finding is \
+                         resolved or gets worse",
+                    ));
+                }
+                (_, None) => None,
+            };
+            Some(Mark {
+                machine_key: machine.key.clone(),
+                code: code.to_string(),
+                state: if action == "snooze" {
+                    TriageState::Snoozed
+                } else {
+                    TriageState::Acknowledged
+                },
+                severity,
+                until,
+                note: clean_note(req.note)?,
+                by: who.name.clone(),
+                by_subject: who.subject.clone(),
+                at: now,
+            })
+        }
+        "clear" => None,
+        other => {
+            return Err(AppError::bad_request(format!(
+                "{other:?} is not an action: acknowledge, snooze or clear"
+            )));
+        }
+    };
+
+    {
+        let store = state.store.lock().expect("store lock");
+        match &mark {
+            Some(m) => store.put_mark(m)?,
+            None => {
+                store.clear_mark(&machine.key, code)?;
+            }
+        }
+        state.publish_book(&store)?;
+    }
+    // The audit trail, for now: who said what about which finding.
+    tracing::info!(
+        by = %loggable(&who.subject),
+        machine = %loggable(&machine.key),
+        code,
+        action,
+        until = ?mark.as_ref().and_then(|m| m.until).map(|d| d.to_string()),
+        "finding triaged"
+    );
+
+    // Read back through the same projection every view uses, so the answer is
+    // what the next snapshot will say — a suppression still holds a cleared
+    // finding, and says so here.
+    let after = visible(&state, &caller, FilterParams::default());
+    let triage = after
+        .flags
+        .iter()
+        .find(|f| f.machine_key == machine.key && f.code == code)
+        .and_then(|f| f.triage.clone());
+    Ok(Json(TriageOutcome {
+        machine_key: machine.key.clone(),
+        code,
+        triage,
+    }))
+}
+
+/// A suppression rule as the API shows it: the rule, how far it reaches, and
+/// the hostname of the machine a machine rule names.
+#[derive(Debug, Serialize)]
+struct SuppressionView {
+    #[serde(flatten)]
+    rule: Suppression,
+    reach: Reach,
+    hostname: Option<String>,
+}
+
+/// Which suppression rules a caller may see, in a view they may already see.
+///
+/// A rule can name a machine and tag values, so listing every rule to a scoped
+/// caller would tell them about machines outside their scope. The rule here
+/// is that a rule is listed only if it says nothing they could not already
+/// learn: a fleet-wide rule (it names only a rule code); a machine rule for a
+/// machine in their view; a tag rule that picks out one of the machines in
+/// their view, or whose tags are all within one of their scopes — so it is
+/// about their machines whether or not any of them carries the finding yet.
+/// An unscoped caller sees every rule.
+fn suppressions_visible(book: &Book, view: &Snapshot, caller: &Caller) -> Vec<SuppressionView> {
+    let scopes = &caller.0.scopes;
+    book.suppressions()
+        .iter()
+        .filter(|s| {
+            if scopes.is_empty() {
+                return true;
+            }
+            match s.reach() {
+                Reach::Fleet => true,
+                Reach::Machine => view
+                    .machines
+                    .iter()
+                    .any(|m| Some(&m.key) == s.machine_key.as_ref()),
+                Reach::Tags => {
+                    let tags = s.tags.as_ref().expect("a tag rule has tags");
+                    scopes
+                        .iter()
+                        .any(|scope| tags.iter().all(|(k, v)| scope.get(k) == Some(v)))
+                        || view.machines.iter().any(|m| s.reaches(&m.key, &m.tags))
+                }
+            }
+        })
+        .map(|s| SuppressionView {
+            reach: s.reach(),
+            hostname: s.machine_key.as_ref().and_then(|k| {
+                view.machines
+                    .iter()
+                    .find(|m| &m.key == k)
+                    .and_then(|m| m.hostname.clone())
+            }),
+            rule: s.clone(),
+        })
+        .collect()
+}
+
+/// Every suppression rule the caller may see. See `suppressions_visible`.
+async fn get_suppressions(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+) -> Json<Vec<SuppressionView>> {
+    let view = visible(&state, &caller, FilterParams::default());
+    Json(suppressions_visible(&state.book(), &view, &caller))
+}
+
+/// `POST /api/suppressions`: exactly one of `machine_key` and `tags`, or
+/// neither for the whole fleet.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuppressionRequest {
+    code: String,
+    machine_key: Option<String>,
+    tags: Option<std::collections::BTreeMap<String, String>>,
+    note: Option<String>,
+}
+
+/// Make a suppression rule. Admin only: a rule by tag or across the fleet
+/// reaches past any one scope, and stops a finding being news wherever it
+/// applies until somebody removes it. A machine rule still has to name a
+/// machine in the caller's own view — a scoped admin is not told about the
+/// others by being allowed to name them.
+async fn post_suppression(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<(StatusCode, Json<SuppressionView>), AppError> {
+    let who = &caller.0;
+    if !who.may_suppress() {
+        return Err(AppError::forbidden(
+            "creating a suppression rule needs the admin role",
+        ));
+    }
+    if !sent_as_json(&headers) {
+        return Err(AppError::bad_request(
+            "send the request as application/json",
+        ));
+    }
+    let req: SuppressionRequest =
+        serde_json::from_str(&body).map_err(|e| AppError::bad_request(format!("{e}")))?;
+    let Some(code) = analytics::rule(&req.code) else {
+        return Err(AppError::bad_request(format!(
+            "{:?} is not a rule this server raises, so a suppression of it would suppress nothing",
+            req.code
+        )));
+    };
+    let machine_key = req
+        .machine_key
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
+    let tags = match req.tags {
+        None => None,
+        Some(t) if t.is_empty() => {
+            return Err(AppError::bad_request(
+                "tags is empty; leave it out for a fleet-wide rule, so the rule says so",
+            ));
+        }
+        Some(t) => {
+            let mut clean = std::collections::BTreeMap::new();
+            for (k, v) in t {
+                let (k, v) = (k.trim().to_string(), v.trim().to_string());
+                if k.is_empty() || v.is_empty() {
+                    return Err(AppError::bad_request("a tag needs a key and a value"));
+                }
+                clean.insert(k, v);
+            }
+            Some(clean)
+        }
+    };
+    if machine_key.is_some() && tags.is_some() {
+        return Err(AppError::bad_request(
+            "a suppression names one machine, or a set of tags, or neither for the whole fleet \
+             — not both",
+        ));
+    }
+    let note = clean_note(req.note)?;
+    let view = visible(&state, &caller, FilterParams::default());
+    if let Some(k) = &machine_key
+        && !view.machines.iter().any(|m| &m.key == k)
+    {
+        return Err(AppError::not_found(format!(
+            "no machine keyed {k:?} in the index"
+        )));
+    }
+    let candidate = Suppression {
+        id: 0,
+        code: code.to_string(),
+        machine_key,
+        tags,
+        note,
+        by: who.name.clone(),
+        by_subject: who.subject.clone(),
+        at: OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    };
+
+    let made = {
+        let store = state.store.lock().expect("store lock");
+        // The same rule twice would need removing twice; say which one there
+        // already is instead.
+        if let Some(same) = state.book().suppressions().iter().find(|s| {
+            s.code == candidate.code
+                && s.machine_key == candidate.machine_key
+                && s.tags == candidate.tags
+        }) {
+            return Err(AppError::at(
+                StatusCode::CONFLICT,
+                format!("suppression rule {} already says this", same.id),
+            ));
+        }
+        let made = store.add_suppression(&candidate)?;
+        state.publish_book(&store)?;
+        made
+    };
+    tracing::info!(
+        by = %loggable(&who.subject),
+        rule = made.id,
+        code,
+        machine = made.machine_key.as_deref().map(loggable),
+        tags = made.tags.as_ref().map(|t| loggable(&format!("{t:?}"))),
+        "suppression created"
+    );
+    let hostname = made.machine_key.as_ref().and_then(|k| {
+        view.machines
+            .iter()
+            .find(|m| &m.key == k)
+            .and_then(|m| m.hostname.clone())
+    });
+    Ok((
+        StatusCode::CREATED,
+        Json(SuppressionView {
+            reach: made.reach(),
+            hostname,
+            rule: made,
+        }),
+    ))
+}
+
+/// Remove a suppression rule. Admin only, like making one.
+///
+/// No body, so the `application/json` defence the other writes use has
+/// nothing to hold on to. It does not need it: the session cookie is
+/// `SameSite=Lax`, which a browser sends cross-site only on a top-level
+/// navigation — never a DELETE, which no form or link can make — and a
+/// cross-origin `fetch` with method DELETE is preflighted, and the preflight
+/// fails because this server answers no CORS request. The ingest token, the
+/// one credential not carried by a cookie, is not accepted here at all. A rule
+/// the caller could not see in the list is 404, as if it did not exist.
+async fn delete_suppression(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, AppError> {
+    let who = &caller.0;
+    if !who.may_suppress() {
+        return Err(AppError::forbidden(
+            "removing a suppression rule needs the admin role",
+        ));
+    }
+    let view = visible(&state, &caller, FilterParams::default());
+    let seen = suppressions_visible(&state.book(), &view, &caller)
+        .iter()
+        .any(|s| s.rule.id == id);
+    let removed = seen && {
+        let store = state.store.lock().expect("store lock");
+        let removed = store.delete_suppression(id)?;
+        state.publish_book(&store)?;
+        removed
+    };
+    if !removed {
+        return Err(AppError::not_found(format!("no suppression rule {id}")));
+    }
+    tracing::info!(by = %loggable(&who.subject), rule = id, "suppression removed");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn asset(body: &'static str, content_type: &'static str) -> Response {
     (
         [
@@ -917,6 +1456,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/machine/{key}", get(get_machine))
         .route("/api/compare", get(get_compare))
         .route("/api/rescan", post(post_rescan))
+        .route("/api/triage", post(post_triage))
+        .route(
+            "/api/suppressions",
+            get(get_suppressions).post(post_suppression),
+        )
+        .route(
+            "/api/suppressions/{id}",
+            axum::routing::delete(delete_suppression),
+        )
         // The cap belongs on this route rather than globally: every other
         // endpoint takes a query string, and axum's 2 MB default would refuse
         // a legitimate result from a long soak run.
@@ -1195,7 +1743,13 @@ mod tests {
         }
         let mut config = config.clone();
         config.server.collection_dir = Some(fixtures());
-        AppState::new(index, &config, Thresholds::default()).expect("state")
+        AppState::new(
+            index,
+            Store::open_in_memory().expect("state file"),
+            &config,
+            Thresholds::default(),
+        )
+        .expect("state")
     }
 
     struct Reply {
@@ -1506,7 +2060,13 @@ mod tests {
         // No collection folder: nothing here may quietly rescan and mask the
         // mechanism under test.
         config.server.collection_dir = None;
-        let state = AppState::new(index, &config, Thresholds::default()).expect("state");
+        let state = AppState::new(
+            index,
+            Store::open_in_memory().expect("state file"),
+            &config,
+            Thresholds::default(),
+        )
+        .expect("state");
 
         let cookie = session(&state, Role::Admin, &[]);
         let before = get(&state, "/api/snapshot", Some(&cookie)).await.json();
@@ -2861,7 +3421,13 @@ mod tests {
         index
             .ingest_file(&fixtures().join("win-modern.json"))
             .expect("fixture");
-        let state = AppState::new(index, &config, Thresholds::default()).expect("state");
+        let state = AppState::new(
+            index,
+            Store::open_in_memory().expect("state file"),
+            &config,
+            Thresholds::default(),
+        )
+        .expect("state");
 
         assert_eq!(
             request(&state, Method::POST, "/api/rescan", None)
@@ -2970,5 +3536,470 @@ mod tests {
         assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
         assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
         assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+    }
+
+    // --- Triage ------------------------------------------------------------
+
+    /// The key of a fixture machine, by hostname.
+    async fn key_of(state: &Arc<AppState>, host: &str) -> String {
+        let cookie = session(state, Role::Admin, &[]);
+        let snap = get(state, "/api/snapshot", Some(&cookie)).await.json();
+        snap["machines"]
+            .as_array()
+            .expect("machines")
+            .iter()
+            .find(|m| m["hostname"] == host)
+            .and_then(|m| m["key"].as_str())
+            .expect("a fixture machine")
+            .to_string()
+    }
+
+    async fn triage(state: &Arc<AppState>, cookie: &str, body: serde_json::Value) -> Reply {
+        post_body(
+            state,
+            "/api/triage",
+            "application/json",
+            &body.to_string(),
+            Some(cookie),
+        )
+        .await
+    }
+
+    /// The triage of one finding as `/api/snapshot` shows it.
+    async fn triage_in_snapshot(
+        state: &Arc<AppState>,
+        cookie: &str,
+        key: &str,
+        code: &str,
+    ) -> serde_json::Value {
+        let snap = get(state, "/api/snapshot", Some(cookie)).await.json();
+        snap["flags"]
+            .as_array()
+            .expect("flags")
+            .iter()
+            .find(|f| f["machine_key"] == key && f["code"] == code)
+            .expect("the finding is still there")["triage"]
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn me_says_who_may_triage_and_who_may_suppress() {
+        let state = state_for(&oidc_config());
+        for (role, triage, suppress) in [
+            (Role::Viewer, false, false),
+            (Role::Contributor, true, false),
+            (Role::Admin, true, true),
+        ] {
+            let cookie = session(&state, role, &[]);
+            let me = get(&state, "/api/me", Some(&cookie)).await.json();
+            assert_eq!(me["may_triage"], triage, "{role:?}");
+            assert_eq!(me["may_suppress"], suppress, "{role:?}");
+        }
+    }
+
+    /// Acknowledge, snooze and clear, end to end — and each on the very next
+    /// snapshot, with no rescan in between.
+    #[tokio::test]
+    async fn a_contributor_acknowledges_snoozes_and_clears_and_the_next_snapshot_shows_it() {
+        let mut config = oidc_config();
+        // Nothing may rescan behind the test's back and mask the mechanism.
+        config.server.collection_dir = None;
+        let state = state_for(&config);
+        let key = key_of(&state, "FLEET-LNX-01").await;
+        let cookie = session(&state, Role::Contributor, &[]);
+        let before = get(&state, "/api/snapshot", Some(&cookie)).await.json();
+
+        let ack = triage(
+            &state,
+            &cookie,
+            serde_json::json!({
+                "machine_key": key, "code": "thermal_limited",
+                "action": "acknowledge", "note": "  fan replaced on order  "
+            }),
+        )
+        .await;
+        assert_eq!(ack.status, StatusCode::OK, "{}", ack.body);
+        assert_eq!(ack.json()["triage"]["state"], "acknowledged");
+        assert_eq!(ack.json()["triage"]["note"], "fan replaced on order");
+        assert_eq!(ack.json()["triage"]["by"], "test-subject");
+
+        let shown = triage_in_snapshot(&state, &cookie, &key, "thermal_limited").await;
+        assert_eq!(shown["state"], "acknowledged");
+        assert_eq!(shown["severity"], "warning");
+        let after = get(&state, "/api/snapshot", Some(&cookie)).await.json();
+        assert_eq!(after["summary"]["quieted"]["acknowledged"], 1);
+        assert_eq!(
+            after["summary"]["warnings"].as_u64().unwrap() + 1,
+            before["summary"]["warnings"].as_u64().unwrap()
+        );
+        // The machine's page agrees with the snapshot: one projection.
+        let page = get(&state, &format!("/api/machine/{key}"), Some(&cookie))
+            .await
+            .json();
+        let on_page = page["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["code"] == "thermal_limited")
+            .unwrap()
+            .clone();
+        assert_eq!(on_page["triage"]["state"], "acknowledged");
+
+        let until = (OffsetDateTime::now_utc().date() + time::Duration::days(7)).to_string();
+        let snooze = triage(
+            &state,
+            &cookie,
+            serde_json::json!({
+                "machine_key": key, "code": "thermal_limited", "action": "snooze", "until": until
+            }),
+        )
+        .await;
+        assert_eq!(snooze.status, StatusCode::OK, "{}", snooze.body);
+        let shown = triage_in_snapshot(&state, &cookie, &key, "thermal_limited").await;
+        assert_eq!(
+            shown["state"], "snoozed",
+            "the latest word replaces the last"
+        );
+        assert_eq!(shown["until"], until.as_str());
+
+        let clear = triage(
+            &state,
+            &cookie,
+            serde_json::json!({ "machine_key": key, "code": "thermal_limited", "action": "clear" }),
+        )
+        .await;
+        assert_eq!(clear.status, StatusCode::OK, "{}", clear.body);
+        assert!(clear.json()["triage"].is_null());
+        assert!(
+            triage_in_snapshot(&state, &cookie, &key, "thermal_limited")
+                .await
+                .is_null()
+        );
+    }
+
+    #[tokio::test]
+    async fn triage_is_refused_by_role_scope_content_type_and_what_is_actually_there() {
+        let state = state_for(&oidc_config());
+        let key = key_of(&state, "FLEET-LNX-01").await;
+        let ack = serde_json::json!({
+            "machine_key": key, "code": "thermal_limited", "action": "acknowledge"
+        });
+
+        let viewer = session(&state, Role::Viewer, &[]);
+        assert_eq!(
+            triage(&state, &viewer, ack.clone()).await.status,
+            StatusCode::FORBIDDEN
+        );
+
+        // LNX-01 is in Edinburgh: to a Glasgow contributor it does not exist.
+        let glasgow = session(&state, Role::Contributor, &[&[("site", "glasgow")]]);
+        let out_of_scope = triage(&state, &glasgow, ack.clone()).await;
+        assert_eq!(out_of_scope.status, StatusCode::NOT_FOUND);
+        let unknown = triage(
+            &state,
+            &glasgow,
+            serde_json::json!({ "machine_key": "NO-SUCH", "code": "stale", "action": "acknowledge" }),
+        )
+        .await;
+        assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            out_of_scope.body.replace(&key, "K"),
+            unknown.body.replace("NO-SUCH", "K"),
+            "indistinguishable from a machine that does not exist"
+        );
+
+        let contributor = session(&state, Role::Contributor, &[]);
+        let as_form = post_body(
+            &state,
+            "/api/triage",
+            "application/x-www-form-urlencoded",
+            &ack.to_string(),
+            Some(&contributor),
+        )
+        .await;
+        assert_eq!(
+            as_form.status,
+            StatusCode::BAD_REQUEST,
+            "the CSRF defence: only JSON"
+        );
+
+        let today = OffsetDateTime::now_utc().date();
+        for (body, why) in [
+            (
+                serde_json::json!({ "machine_key": key, "code": "not_a_rule", "action": "acknowledge" }),
+                "unknown code",
+            ),
+            (
+                serde_json::json!({ "machine_key": key, "code": "battery_worn", "action": "acknowledge" }),
+                "a finding this machine does not have",
+            ),
+            (
+                serde_json::json!({ "machine_key": key, "code": "thermal_limited", "action": "snooze" }),
+                "a snooze without until",
+            ),
+            (
+                serde_json::json!({ "machine_key": key, "code": "thermal_limited", "action": "snooze", "until": "next week" }),
+                "until not a date",
+            ),
+            (
+                serde_json::json!({ "machine_key": key, "code": "thermal_limited", "action": "snooze", "until": today.to_string() }),
+                "until not in the future",
+            ),
+            (
+                serde_json::json!({ "machine_key": key, "code": "thermal_limited", "action": "snooze",
+                    "until": (today + time::Duration::days(366)).to_string() }),
+                "until more than a year out",
+            ),
+            (
+                serde_json::json!({ "machine_key": key, "code": "thermal_limited", "action": "acknowledge",
+                    "note": "x".repeat(501) }),
+                "an over-long note",
+            ),
+            (
+                serde_json::json!({ "machine_key": key, "code": "thermal_limited", "action": "acknowledge",
+                    "note": "fine\nINFO forged line" }),
+                "a note with a line break",
+            ),
+            (
+                serde_json::json!({ "machine_key": key, "code": "thermal_limited", "action": "ignore" }),
+                "an unknown action",
+            ),
+        ] {
+            let r = triage(&state, &contributor, body).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{why}: {}", r.body);
+        }
+        let year = triage(
+            &state,
+            &contributor,
+            serde_json::json!({ "machine_key": key, "code": "thermal_limited", "action": "snooze",
+                "until": (today + time::Duration::days(365)).to_string() }),
+        )
+        .await;
+        assert_eq!(
+            year.status,
+            StatusCode::OK,
+            "a year is allowed: {}",
+            year.body
+        );
+    }
+
+    async fn suppress(state: &Arc<AppState>, cookie: &str, body: serde_json::Value) -> Reply {
+        post_body(
+            state,
+            "/api/suppressions",
+            "application/json",
+            &body.to_string(),
+            Some(cookie),
+        )
+        .await
+    }
+
+    /// Suppression rules: admin-only to make and remove, visible to a scoped
+    /// caller only where they say nothing about machines outside the scope.
+    #[tokio::test]
+    async fn suppressions_are_admin_only_and_scoped_callers_see_only_their_own() {
+        let state = state_for(&oidc_config());
+        let lnx = key_of(&state, "FLEET-LNX-01").await;
+        let admin = session(&state, Role::Admin, &[]);
+        let contributor = session(&state, Role::Contributor, &[]);
+
+        assert_eq!(
+            suppress(
+                &state,
+                &contributor,
+                serde_json::json!({ "code": "partial_run" })
+            )
+            .await
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        let as_text = post_body(
+            &state,
+            "/api/suppressions",
+            "text/plain",
+            r#"{"code":"partial_run"}"#,
+            Some(&admin),
+        )
+        .await;
+        assert_eq!(as_text.status, StatusCode::BAD_REQUEST);
+        for (body, want) in [
+            (
+                serde_json::json!({ "code": "nope" }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({ "code": "partial_run", "machine_key": lnx, "tags": { "site": "x" } }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({ "code": "partial_run", "tags": {} }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({ "code": "partial_run", "machine_key": "NO-SUCH" }),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let r = suppress(&state, &admin, body.clone()).await;
+            assert_eq!(r.status, want, "{body}: {}", r.body);
+        }
+
+        let fleet = suppress(
+            &state,
+            &admin,
+            serde_json::json!({ "code": "partial_run", "note": "known collector quirk" }),
+        )
+        .await;
+        assert_eq!(fleet.status, StatusCode::CREATED, "{}", fleet.body);
+        assert_eq!(fleet.json()["reach"], "fleet");
+        assert_eq!(
+            suppress(&state, &admin, serde_json::json!({ "code": "partial_run" }))
+                .await
+                .status,
+            StatusCode::CONFLICT,
+            "the same rule twice"
+        );
+        let machine = suppress(
+            &state,
+            &admin,
+            serde_json::json!({ "code": "thermal_limited", "machine_key": lnx }),
+        )
+        .await;
+        assert_eq!(machine.status, StatusCode::CREATED, "{}", machine.body);
+        assert_eq!(machine.json()["hostname"], "FLEET-LNX-01");
+        let tags = suppress(
+            &state,
+            &admin,
+            serde_json::json!({ "code": "weak_identity", "tags": { "site": "edinburgh" } }),
+        )
+        .await;
+        assert_eq!(tags.status, StatusCode::CREATED, "{}", tags.body);
+
+        // Applied on the next snapshot, everywhere it reaches.
+        let snap = get(&state, "/api/snapshot", Some(&admin)).await.json();
+        let partial: Vec<_> = snap["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["code"] == "partial_run")
+            .collect();
+        assert!(!partial.is_empty());
+        assert!(partial.iter().all(|f| f["triage"]["state"] == "suppressed"));
+        assert_eq!(
+            triage_in_snapshot(&state, &admin, &lnx, "thermal_limited").await["state"],
+            "suppressed"
+        );
+
+        let ids = |r: &Reply| -> Vec<i64> {
+            r.json()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["id"].as_i64().unwrap())
+                .collect()
+        };
+        let (fleet_id, machine_id, tags_id) = (
+            fleet.json()["id"].as_i64().unwrap(),
+            machine.json()["id"].as_i64().unwrap(),
+            tags.json()["id"].as_i64().unwrap(),
+        );
+        let everyone = session(&state, Role::Viewer, &[]);
+        assert_eq!(
+            ids(&get(&state, "/api/suppressions", Some(&everyone)).await),
+            vec![fleet_id, machine_id, tags_id]
+        );
+        // Glasgow sees the fleet rule; not the Edinburgh machine's, and not
+        // the rule whose tags only Edinburgh carries.
+        let glasgow = session(&state, Role::Viewer, &[&[("site", "glasgow")]]);
+        let seen = get(&state, "/api/suppressions", Some(&glasgow)).await;
+        assert_eq!(seen.status, StatusCode::OK);
+        assert_eq!(ids(&seen), vec![fleet_id]);
+        assert!(!seen.body.contains(&lnx) && !seen.body.contains("edinburgh"));
+        let edinburgh = session(&state, Role::Viewer, &[&[("site", "edinburgh")]]);
+        assert_eq!(
+            ids(&get(&state, "/api/suppressions", Some(&edinburgh)).await),
+            vec![fleet_id, machine_id, tags_id]
+        );
+
+        // Removing: admin only, and a rule a scoped admin cannot see is one
+        // that does not exist.
+        let uri = format!("/api/suppressions/{machine_id}");
+        assert_eq!(
+            request(&state, Method::DELETE, &uri, Some(&contributor))
+                .await
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        let glasgow_admin = session(&state, Role::Admin, &[&[("site", "glasgow")]]);
+        assert_eq!(
+            request(&state, Method::DELETE, &uri, Some(&glasgow_admin))
+                .await
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(&state, Method::DELETE, &uri, Some(&admin))
+                .await
+                .status,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            request(&state, Method::DELETE, &uri, Some(&admin))
+                .await
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            triage_in_snapshot(&state, &admin, &lnx, "thermal_limited")
+                .await
+                .is_null(),
+            "live again the moment its rule is gone"
+        );
+    }
+
+    /// `forget` in a terminal clears a machine's triage in the state file;
+    /// the server notices on the next request, as it does for the index.
+    #[tokio::test]
+    async fn a_change_to_the_state_file_by_another_process_is_noticed() {
+        let dir = std::env::temp_dir().join(format!("lbf-ext-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("i.state.db");
+
+        let mut index = Index::open_in_memory().expect("index");
+        index
+            .ingest_file(&fixtures().join("linux-throttled.json"))
+            .expect("fixture");
+        let mut config = oidc_config();
+        config.server.collection_dir = None;
+        let state = AppState::new(
+            index,
+            Store::open(&path).expect("state file"),
+            &config,
+            Thresholds::default(),
+        )
+        .expect("state");
+        let key = key_of(&state, "FLEET-LNX-01").await;
+        let cookie = session(&state, Role::Contributor, &[]);
+        let ack = triage(
+            &state,
+            &cookie,
+            serde_json::json!({ "machine_key": key, "code": "thermal_limited", "action": "acknowledge" }),
+        )
+        .await;
+        assert_eq!(ack.status, StatusCode::OK, "{}", ack.body);
+
+        let other = Store::open(&path).expect("second connection");
+        assert_eq!(other.forget(&key).expect("forget").marks, 1);
+        drop(other);
+
+        assert!(
+            triage_in_snapshot(&state, &cookie, &key, "thermal_limited")
+                .await
+                .is_null(),
+            "the dashboard should have noticed the external change"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
