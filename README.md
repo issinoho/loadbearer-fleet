@@ -1401,6 +1401,12 @@ Three of them are worth alerting on:
 | `newest_run_age_seconds` | The *machines* have stopped reporting — a different fault from this service having stopped reading. |
 | `scan_files_rejected` | Something is writing files this can't parse. One is a truncated upload; a hundred is a broken collector. |
 
+`findings` and `machines_flagged` count every finding, whether or not somebody
+has [acknowledged, snoozed or suppressed](#acknowledge-snooze-suppress) it, so
+an alert written on them means what it always did. `findings_live` and
+`machines_flagged_live` leave the quieted ones out — alert on those if "in
+hand" should silence the alert — and `findings_quieted` counts them by state.
+
 A scan of a folder that can't be read fails loudly and increments
 `scan_failures_total` rather than reporting an empty folder, because "no
 machines need attention" is how an unreachable share would otherwise look.

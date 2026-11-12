@@ -1397,7 +1397,16 @@ async fn get_metrics(
     // scrape must not depend on whose session happened to trigger it.
     let snapshot = state.snapshot();
     let runtime = state.runtime.lock().expect("runtime lock").clone();
-    let body = metrics::render(&snapshot, &runtime, OffsetDateTime::now_utc());
+    let now = OffsetDateTime::now_utc();
+    // The same projection every view goes through, with no filter and no
+    // scope, so the live counts are the ones an unscoped Overview shows.
+    let live = snapshot.filtered_with(
+        &analytics::Filter::default(),
+        &state.thresholds,
+        &state.book(),
+        now,
+    );
+    let body = metrics::render(&snapshot, &live.summary, &runtime, now);
     Ok((
         [(
             header::CONTENT_TYPE,
@@ -3344,6 +3353,61 @@ mod tests {
         // Nothing per-machine: a metrics store is usually less protected than
         // this service is.
         assert!(!reply.body.contains("SN-"), "a serial reached the metrics");
+    }
+
+    /// An alert written on `findings` before triage existed must mean what it
+    /// meant then, so the totals do not move; the live families are the ones
+    /// an acknowledgement quiets.
+    #[tokio::test]
+    async fn an_acknowledgement_lowers_the_live_metrics_and_leaves_the_totals() {
+        let mut config = oidc_config();
+        config.server.collection_dir = None;
+        config.metrics = MetricsConfig {
+            enabled: true,
+            token: String::new(),
+        };
+        let state = state_for(&config);
+        let key = key_of(&state, "FLEET-LNX-01").await;
+        let cookie = session(&state, Role::Contributor, &[]);
+        let warnings = |body: &str, family: &str| -> u64 {
+            let prefix = format!("loadbearer_fleet_{family}{{severity=\"warning\"}} ");
+            body.lines()
+                .find_map(|l| l.strip_prefix(&prefix))
+                .unwrap_or_else(|| panic!("no {family} line in:\n{body}"))
+                .parse()
+                .expect("a count")
+        };
+
+        let before = get(&state, "/metrics", None).await.body;
+        assert_eq!(
+            warnings(&before, "findings"),
+            warnings(&before, "findings_live"),
+            "nothing is quieted yet"
+        );
+        assert!(before.contains("loadbearer_fleet_findings_quieted{state=\"acknowledged\"} 0"));
+
+        let ack = triage(
+            &state,
+            &cookie,
+            serde_json::json!({
+                "machine_key": key, "code": "thermal_limited", "action": "acknowledge"
+            }),
+        )
+        .await;
+        assert_eq!(ack.status, StatusCode::OK, "{}", ack.body);
+
+        let after = get(&state, "/metrics", None).await.body;
+        assert_eq!(
+            warnings(&after, "findings"),
+            warnings(&before, "findings"),
+            "the total still counts it"
+        );
+        assert_eq!(
+            warnings(&after, "findings_live") + 1,
+            warnings(&before, "findings_live")
+        );
+        assert!(after.contains("loadbearer_fleet_findings_quieted{state=\"acknowledged\"} 1"));
+        assert!(after.contains("# TYPE loadbearer_fleet_machines_flagged_live gauge"));
     }
 
     /// A scrape has no session and cannot get one, so the token is the whole
