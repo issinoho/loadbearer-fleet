@@ -146,6 +146,22 @@ impl Principal {
     pub fn may_upload(&self) -> bool {
         self.role >= Role::Contributor
     }
+
+    /// Acknowledging or snoozing a finding — and clearing either — on a
+    /// machine within the caller's scope. A judgement about one finding on a
+    /// machine they can already see, so it sits with submitting results
+    /// rather than with administering the server; `>=` for the same reason
+    /// as `may_upload`.
+    pub fn may_triage(&self) -> bool {
+        self.role >= Role::Contributor
+    }
+
+    /// Creating and removing suppression rules. Admin only, because a rule
+    /// by tag or across the fleet reaches machines outside any one scope —
+    /// and stops a finding being news everywhere it applies, indefinitely.
+    pub fn may_suppress(&self) -> bool {
+        self.role == Role::Admin
+    }
 }
 
 struct Session {
@@ -1242,12 +1258,18 @@ pub struct Me {
     sign_in_enabled: bool,
     may_rescan: bool,
     may_upload: bool,
+    /// Acknowledge and snooze findings, on machines in scope.
+    may_triage: bool,
+    /// Create and remove suppression rules.
+    may_suppress: bool,
 }
 
 pub async fn me(State(app): State<Arc<AppState>>, Caller(principal): Caller) -> axum::Json<Me> {
     axum::Json(Me {
         may_rescan: principal.may_rescan(),
         may_upload: principal.may_upload(),
+        may_triage: principal.may_triage(),
+        may_suppress: principal.may_suppress(),
         sign_in_enabled: app.auth().enabled(),
         principal,
     })

@@ -1240,6 +1240,152 @@ async function renderGroupsWith(name, grouping) {
   }
 }
 
+// Triage. The fixtures carry none, so the snapshot is given one finding in
+// each state, and the overview's queue and a machine's Findings card are
+// rendered as a viewer, a contributor and an admin would see them. What has to
+// hold: the controls appear only for the caller who may use them, a quieted
+// finding says what was said and by whom, and the queue hides snoozed and
+// suppressed findings until asked while still showing acknowledged ones.
+{
+  const flags = snapshot.flags.filter((f) => f.severity !== 'info');
+  check('triage', flags.length >= 4, `the fixtures have ${flags.length} warning(s); four are needed`);
+  const [live, acked, snoozed, suppressed] = flags;
+  const at = '2026-09-09T12:00:00Z';
+  const said = new Map([
+    [acked, { state: 'acknowledged', by: 'Iain', at, note: 'fan on order', severity: acked.severity }],
+    [snoozed, { state: 'snoozed', by: 'Iain', at, note: null, until: '2026-12-01', severity: snoozed.severity }],
+    [suppressed, {
+      state: 'suppressed', by: 'Admin', at, note: 'collector quirk', rule: 7, reach: 'tags', tags: { site: 'edinburgh' },
+    }],
+  ]);
+  // Distinct headlines, so each finding can be told apart in the text.
+  const tagged = snapshot.flags.map((f) => (said.has(f)
+    ? { ...f, triage: said.get(f), headline: `${f.headline} [${said.get(f).state}]` }
+    : { ...f, headline: f === live ? `${f.headline} [live]` : f.headline }));
+  const triaged = {
+    ...snapshot,
+    flags: tagged,
+    summary: { ...snapshot.summary, quieted: { acknowledged: 1, snoozed: 1, suppressed: 1 } },
+  };
+  const buttons = (h) => {
+    const out = [];
+    walk(h, (n) => { if (n.tagName === 'button') out.push(n.textContent); });
+    return out;
+  };
+  const roles = [
+    ['viewer', { may_triage: false, may_suppress: false }],
+    ['contributor', { may_triage: true, may_suppress: false }],
+    ['admin', { may_triage: true, may_suppress: true }],
+  ];
+  mod.state.snap = triaged;
+  // The overview fetches its history cards; here they simply fail, as they
+  // may, and the rest of the page must not care.
+  globalThis.fetch = () => Promise.reject(new Error('no network in the geometry check'));
+  for (const [role, me] of roles) {
+    for (const showQuiet of [false, true]) {
+      const name = `triage/overview/${role}${showQuiet ? '/all' : ''}`;
+      mod.state.me = { role, ...me };
+      mod.state.showQuiet = showQuiet;
+      const h = host(1200);
+      try {
+        mod.renderOverview(h);
+      } catch (err) {
+        failures.push(`${name}: threw ${err.message}`);
+        continue;
+      }
+      const text = textOf(h);
+      const b = buttons(h);
+      check(name, !text.includes('undefined') && !text.includes('NaN'), 'undefined or NaN reached the page');
+      check(name, text.includes('[live]') && text.includes('[acknowledged]'),
+        'the queue must show live and acknowledged findings');
+      check(name, text.includes('[snoozed]') === showQuiet && text.includes('[suppressed]') === showQuiet,
+        `snoozed and suppressed findings should be ${showQuiet ? 'shown' : 'hidden'}`);
+      check(name, text.includes('1 acknowledged · 1 snoozed · 1 suppressed'), 'the quieted counts are not said');
+      check(name, text.includes('Acknowledged by Iain') && text.includes('fan on order'),
+        'an acknowledged finding does not say who, or the note');
+      check(name, b.includes('Show 2 snoozed or suppressed') !== showQuiet,
+        `the toggle does not offer the hidden count: ${b.join(' | ')}`);
+      check(name, b.includes('Acknowledge') === me.may_triage && b.includes('Snooze') === me.may_triage,
+        `acknowledge and snooze shown ${b.includes('Acknowledge')} for may_triage ${me.may_triage}`);
+      check(name, b.includes('Undo') === me.may_triage, 'undo follows may_triage');
+      check(name, b.includes('Suppress') === me.may_suppress, 'suppress follows may_suppress');
+      check(name, b.includes('Remove rule') === (me.may_suppress && showQuiet),
+        'removing a rule is for an admin, on a suppressed finding in view');
+      if (showQuiet) {
+        check(name, text.includes('Snoozed until 2026-12-01') && text.includes('Suppressed where site=edinburgh'),
+          'a snoozed or suppressed finding does not say so');
+      }
+    }
+  }
+
+  // A machine's own Findings card: every finding, whatever its triage.
+  for (const [role, me] of roles) {
+    const name = `triage/machine/${role}`;
+    mod.state.me = { role, ...me };
+    const m = triaged.machines.find((x) => x.key === suppressed.machine_key);
+    const payload = {
+      machine: m,
+      flags: tagged.filter((f) => f.machine_key === m.key),
+      cohort: null,
+      history: [],
+      subtests: [],
+    };
+    globalThis.fetch = () => Promise.resolve({
+      ok: true, json: () => Promise.resolve(payload), text: () => Promise.resolve(''),
+    });
+    const h = host(1200);
+    try {
+      await mod.renderMachine(h, m.key);
+      const text = textOf(h);
+      check(name, !text.includes('undefined') && !text.includes('NaN'), 'undefined or NaN reached the page');
+      check(name, text.includes('[suppressed]') && text.includes('Suppressed where site=edinburgh'),
+        'the machine page hides or mislabels a suppressed finding');
+      check(name, buttons(h).includes('Remove rule') === me.may_suppress, 'remove rule follows may_suppress');
+    } catch (err) {
+      failures.push(`${name}: threw ${err.message}`);
+    }
+  }
+  mod.state.me = null;
+  mod.state.showQuiet = false;
+  mod.state.snap = snapshot;
+
+  // The request each control sends: JSON — the server's CSRF defence — and
+  // a failure reported in the footer rather than swallowed. A removal is a
+  // body-less DELETE whose 204 is success.
+  const footer = new FakeNode('p');
+  globalThis.document.querySelector = (sel) => (sel === '#footer-note' ? footer : null);
+  const seen = [];
+  let answer = { ok: true, json: () => Promise.resolve({ triage: null }), text: () => Promise.resolve('') };
+  globalThis.fetch = (url, opts) => {
+    seen.push({ url: String(url), method: opts?.method, type: opts?.headers?.['Content-Type'], body: opts?.body });
+    return Promise.resolve(answer);
+  };
+  try {
+    const body = { machine_key: live.machine_key, code: live.code, action: 'acknowledge', note: 'in hand' };
+    const ok = await mod.sendTriage('/api/triage', { body, done: 'Acknowledged it.' });
+    check('triage/send', ok && footer.textContent === 'Acknowledged it.', `reported ${footer.textContent}`);
+    check('triage/send', seen[0]?.method === 'POST' && seen[0]?.type === 'application/json',
+      `sent ${seen[0]?.method} as ${seen[0]?.type}`);
+    check('triage/send', JSON.parse(seen[0]?.body || '{}').note === 'in hand', 'the note was not sent');
+
+    answer = { ok: false, text: () => Promise.resolve('a snooze runs until a day after today') };
+    const refused = await mod.sendTriage('/api/triage', { body, done: 'no' });
+    check('triage/send', !refused && footer.textContent.includes('a snooze runs until'),
+      `a refusal has to be reported as itself: ${footer.textContent}`);
+
+    answer = {
+      ok: true, json: () => Promise.reject(new SyntaxError('no body')), text: () => Promise.resolve(''),
+    };
+    const removed = await mod.sendTriage('/api/suppressions/7', { method: 'DELETE', done: 'Removed.' });
+    check('triage/send', removed && footer.textContent === 'Removed.', `a 204 read as ${footer.textContent}`);
+    check('triage/send', seen[2]?.method === 'DELETE' && seen[2]?.body === undefined, 'the DELETE carried a body');
+    notes.push(`triage: ${seen.length} request(s) checked, 3 roles x 2 queue states, machine page x 3`);
+  } catch (err) {
+    failures.push(`triage/send: threw ${err.message}`);
+  }
+  globalThis.document.querySelector = () => null;
+}
+
 // Submitting results: one request per file, and each answer reported as
 // itself. A single bad file must not swallow the others, which is the whole
 // reason it is one request each rather than a batch.

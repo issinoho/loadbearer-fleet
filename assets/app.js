@@ -1005,6 +1005,9 @@ function lifecycleFact(m) {
 // standing between a typo in here and a blank panel in production.
 export const state = {
   snap: null, me: null, view: 'overview', key: null, filter: {}, showInfo: false,
+  /// Whether the queue shows snoozed and suppressed findings too. Acknowledged
+  /// ones are always shown, drawn quieter: in hand is still worth seeing.
+  showQuiet: false,
   /// The run ids being compared, in the order they were chosen: the first is
   /// the one everything else is measured against.
   runs: [],
@@ -1401,9 +1404,173 @@ function deltaCell(v) {
   return el('span', { class: v < -0.05 ? 'delta-down' : v > 0.05 ? 'delta-up' : '', text: signed(v, 1) });
 }
 
+/* ------------------------------------------------------------------ triage */
+
+/*
+ * Acknowledge, snooze, suppress. Triage is an attention layer over the
+ * findings, not a change to them: the server still computes every finding,
+ * the lifecycle verdict and the history ignore it, and what changes is
+ * whether a finding counts as needing attention. Each finding carries its own
+ * `triage` (null while live), so the page only ever lays out what the server
+ * already decided.
+ *
+ * The controls are hidden from a caller who may not use them, as Rescan is —
+ * a courtesy; the server refuses regardless.
+ */
+
+const SNOOZES = [['1 week', 7], ['1 month', 30], ['3 months', 91]];
+
+/** The day, UTC, `days` from today — a snooze's `until`. */
+function daysFromNow(days) {
+  return new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+}
+
+const codeWords = (code) => code.replace(/_/g, ' ');
+
+/**
+ * Send one triage change, then refetch and redraw, and say what happened in
+ * the footer — the same place Rescan reports. Exported, like `uploadAll`, so
+ * `check-ui.mjs` can check the request it makes without a page around it.
+ */
+export async function sendTriage(url, { method = 'POST', body, done } = {}) {
+  const note = $('#footer-note');
+  try {
+    await fetchJson(url, body === undefined ? { method } : {
+      method,
+      // The server's CSRF defence: only JSON is accepted.
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch((err) => {
+      // A DELETE answers 204 with no body, which `res.json()` cannot parse;
+      // that is success, not a failure to report.
+      if (method === 'DELETE' && err instanceof SyntaxError) return null;
+      throw err;
+    });
+    if (note) note.textContent = done;
+    if ($('#main')) await route();
+    return true;
+  } catch (err) {
+    if (note) note.textContent = `Could not change that finding: ${err.message}`;
+    return false;
+  }
+}
+
+/** "Acknowledged by Iain · 9 Sep 2026 · fan on order", for a quieted finding. */
+function triageWords(t) {
+  const by = `by ${t.by} · ${day(t.at)}`;
+  let what;
+  if (t.state === 'acknowledged') what = `Acknowledged ${by}`;
+  else if (t.state === 'snoozed') what = `Snoozed until ${t.until} ${by}`;
+  else {
+    const reach = t.reach === 'machine' ? 'on this machine'
+      : t.reach === 'tags' ? `where ${Object.entries(t.tags || {}).map(([k, v]) => `${k}=${v}`).join(', ')}`
+        : 'across the fleet';
+    what = `Suppressed ${reach} ${by}`;
+  }
+  return t.note ? `${what} · ${t.note}` : what;
+}
+
+/**
+ * What a finding says about its triage, and the controls to change it — the
+ * one helper both the overview's queue and a machine's Findings card use.
+ *
+ * Quieted: the state, who, when, any note, and Undo for a caller who may undo
+ * it (a suppression is undone by removing its rule, which is an admin's). Live:
+ * Acknowledge, Snooze and, for an admin, Suppress. Each opens a small inline
+ * panel with an optional note and the choices, rather than a dialog.
+ */
+function triageControls(f) {
+  const me = state.me || {};
+  const t = f.triage;
+  const which = `${codeWords(f.code)} on ${f.hostname || f.machine_key}`;
+  if (t) {
+    const undo = t.state === 'suppressed'
+      ? me.may_suppress && el('button', {
+        type: 'button', class: 'btn btn-quiet', text: 'Remove rule',
+        'aria-label': `Remove the rule suppressing ${which}`,
+        onclick: () => sendTriage(`/api/suppressions/${t.rule}`, {
+          method: 'DELETE', done: `Removed the rule suppressing ${which}.`,
+        }),
+      })
+      : me.may_triage && el('button', {
+        type: 'button', class: 'btn btn-quiet', text: 'Undo',
+        'aria-label': `Undo: make ${which} live again`,
+        onclick: () => sendTriage('/api/triage', {
+          body: { machine_key: f.machine_key, code: f.code, action: 'clear' },
+          done: `${codeWords(f.code)} on ${f.hostname || f.machine_key} is live again.`,
+        }),
+      });
+    return el('div', { class: 'triage triage-quiet' }, [
+      el('span', { class: 'triage-state', text: triageWords(t) }),
+      undo || null,
+    ]);
+  }
+  if (!me.may_triage) return null;
+
+  // The panel each action opens: the note first, so it is there to fill in
+  // before the choice that sends it.
+  const panel = el('div', { class: 'triage-panel', role: 'group' });
+  panel.hidden = true;
+  const open = (label, choices) => {
+    const input = el('input', {
+      type: 'text', class: 'triage-note', maxlength: '500',
+      placeholder: 'Note (optional)', 'aria-label': `Note for ${which}`,
+    });
+    panel.setAttribute('aria-label', `${label} ${which}`);
+    panel.replaceChildren(
+      input,
+      ...choices.map(([text, send]) => el('button', {
+        type: 'button', class: 'btn', text,
+        onclick: () => send(input.value.trim() || undefined),
+      })),
+      el('button', {
+        type: 'button', class: 'btn btn-quiet', text: 'Cancel',
+        onclick: () => { panel.hidden = true; panel.replaceChildren(); },
+      }),
+    );
+    panel.hidden = false;
+  };
+  const mark = (action, until, label) => (note) => sendTriage('/api/triage', {
+    body: { machine_key: f.machine_key, code: f.code, action, until, note },
+    done: `${label} ${which}.`,
+  });
+  const actions = [
+    el('button', {
+      type: 'button', class: 'btn btn-quiet', text: 'Acknowledge',
+      'aria-label': `Acknowledge ${which}`,
+      onclick: () => open('Acknowledge', [['Acknowledge', mark('acknowledge', undefined, 'Acknowledged')]]),
+    }),
+    el('button', {
+      type: 'button', class: 'btn btn-quiet', text: 'Snooze',
+      'aria-label': `Snooze ${which}`,
+      onclick: () => open('Snooze', SNOOZES.map(([text, days]) => [
+        text, mark('snooze', daysFromNow(days), `Snoozed for ${text}:`),
+      ])),
+    }),
+    me.may_suppress ? el('button', {
+      type: 'button', class: 'btn btn-quiet', text: 'Suppress',
+      'aria-label': `Suppress ${codeWords(f.code)}`,
+      onclick: () => open('Suppress', [
+        ['This machine', (note) => sendTriage('/api/suppressions', {
+          body: { code: f.code, machine_key: f.machine_key, note },
+          done: `Suppressed ${which}.`,
+        })],
+        ['Fleet-wide', (note) => sendTriage('/api/suppressions', {
+          body: { code: f.code, note },
+          done: `Suppressed ${codeWords(f.code)} across the fleet.`,
+        })],
+      ]),
+    }) : null,
+  ];
+  return el('div', { class: 'triage' }, [el('div', { class: 'triage-actions' }, actions), panel]);
+}
+
+/** Quieted-but-visible findings are drawn quieter: in hand, not news. */
+const findingClass = (f) => (f.triage ? 'finding finding-quieted' : 'finding');
+
 function findingRow(f, machinesByKey) {
   const m = machinesByKey.get(f.machine_key);
-  return el('div', { class: 'finding-list' }, [el('div', { class: 'finding' }, [
+  return el('div', { class: 'finding-list' }, [el('div', { class: findingClass(f) }, [
     el('div', {}, [
       el('div', { class: 'finding-head' }, [
         severityChip(f.severity),
@@ -1412,8 +1579,17 @@ function findingRow(f, machinesByKey) {
         el('span', { class: 'finding-queue', text: QUEUES[f.kind] || f.kind }),
       ]),
       el('p', { class: 'finding-detail', text: f.detail }),
+      triageControls(f),
     ]),
   ])]);
+}
+
+/** "3 acknowledged · 1 snoozed · 12 suppressed", or null when none are. */
+function quietedWords(q) {
+  if (!q) return null;
+  const parts = [['acknowledged', q.acknowledged], ['snoozed', q.snoozed], ['suppressed', q.suppressed]]
+    .filter(([, n]) => n > 0).map(([w, n]) => `${n} ${w}`);
+  return parts.length ? parts.join(' · ') : null;
 }
 
 /* ------------------------------------------------------------------- views */
@@ -1431,6 +1607,11 @@ export async function renderOverview(main) {
         ? `Nothing at warning or above across ${nf0.format(s.machines)} machine(s) in view.`
         : `of ${nf0.format(s.machines)} in view · ${s.critical} critical, ${s.warnings} warning`,
     }),
+    // Said beside the headline, because a number that went down when nobody
+    // fixed anything should say why.
+    quietedWords(s.quieted)
+      ? el('div', { class: 'hero-sub', text: `Not counted: ${quietedWords(s.quieted)}` })
+      : null,
   ])]);
 
   const tile = (label, value, sub) => el('div', { class: 'card' }, [
@@ -1470,7 +1651,8 @@ export async function renderOverview(main) {
   const byQueue = Object.keys(QUEUES).map((k) => ({
     label: QUEUES[k],
     values: Object.fromEntries(SEVERITIES.map((sev) => [
-      sev.key, state.snap.flags.filter((f) => f.kind === k && f.severity === sev.key).length,
+      // Live findings, as the headline counts them.
+      sev.key, state.snap.flags.filter((f) => !f.triage && f.kind === k && f.severity === sev.key).length,
     ])),
   }));
   const findingsCard = chartCard({
@@ -1513,7 +1695,16 @@ export async function renderOverview(main) {
     }),
   });
 
-  const shown = state.snap.flags.filter((f) => state.showInfo || f.severity !== 'info');
+  // The queue: live findings, and acknowledged ones drawn quieter after them;
+  // snoozed and suppressed ones only when asked for. Live first, keeping the
+  // server's most-severe-first order within each.
+  const q = s.quieted || { acknowledged: 0, snoozed: 0, suppressed: 0 };
+  const hiddenQuiet = q.snoozed + q.suppressed;
+  const inQueue = (f) => !f.triage || f.triage.state === 'acknowledged' || state.showQuiet;
+  const shown = state.snap.flags
+    .filter((f) => (state.showInfo || f.severity !== 'info') && inQueue(f))
+    .sort((a, b) => Number(!!a.triage) - Number(!!b.triage));
+  const quieted = quietedWords(q);
   const list = el('div', { class: 'card col-6' }, [
     el('div', { class: 'card-head' }, [
       el('h3', { text: 'What to look at' }),
@@ -1523,9 +1714,19 @@ export async function renderOverview(main) {
           text: state.showInfo ? 'Hide informational' : `Show ${s.info} informational`,
           onclick: () => { state.showInfo = !state.showInfo; render(); },
         }),
+        hiddenQuiet ? el('button', {
+          type: 'button', class: 'btn btn-quiet',
+          text: state.showQuiet ? 'Hide snoozed and suppressed' : `Show ${hiddenQuiet} snoozed or suppressed`,
+          'aria-pressed': state.showQuiet ? 'true' : 'false',
+          onclick: () => { state.showQuiet = !state.showQuiet; render(); },
+        }) : null,
       ]),
     ]),
-    el('p', { class: 'card-sub', text: 'Most severe first. Every finding says what it is evidence of and what usually causes it.' }),
+    el('p', {
+      class: 'card-sub',
+      text: 'Most severe first. Every finding says what it is evidence of and what usually causes it.'
+        + (quieted ? ` Quieted: ${quieted}.` : ''),
+    }),
     shown.length
       ? el('div', {}, shown.slice(0, 14).map((f) => findingRow(f, machinesByKey)))
       : el('div', { class: 'empty', text: 'Nothing to report in this view.' }),
@@ -2386,7 +2587,8 @@ function gradeSort(g) {
 export function renderMachines(main) {
   const flagCount = new Map();
   for (const f of state.snap.flags) {
-    if (f.severity === 'info') continue;
+    // Live ones only, as "needs attention" counts them everywhere else.
+    if (f.severity === 'info' || f.triage) continue;
     flagCount.set(f.machine_key, (flagCount.get(f.machine_key) || 0) + 1);
   }
   // One column per tag key rather than one column holding all of them joined.
@@ -2583,11 +2785,14 @@ export async function renderMachine(main, key) {
     flags.length
       ? el('div', {}, grouped.filter(([, fs]) => fs.length).flatMap(([q, fs]) => [
         el('p', { class: 'card-sub', text: QUEUES[q] }),
-        ...fs.map((f) => el('div', { class: 'finding' }, [el('div', {}, [
+        // Every finding, quieted or not: this is the machine's whole record,
+        // not a queue. What was said about each is on it.
+        ...fs.map((f) => el('div', { class: findingClass(f) }, [el('div', {}, [
           el('div', { class: 'finding-head' }, [
             severityChip(f.severity), el('span', { class: 'finding-who', text: f.headline }),
           ]),
           el('p', { class: 'finding-detail', text: f.detail }),
+          triageControls(f),
         ])])),
       ]))
       : el('div', { class: 'empty', text: 'Nothing flagged on this machine.' }),
