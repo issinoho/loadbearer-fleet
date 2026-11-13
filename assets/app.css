@@ -490,6 +490,44 @@ table.data td.wrap { white-space: normal; min-width: 16em; }
 .lifecycle-rule { margin: 12px 0 0; }
 
 .decision-cell { display: inline-flex; align-items: center; gap: 6px; }
+
+/* ---------- components ---------- */
+
+/* The measure picker holds whole subtest names, so like the comparison's it
+   is allowed to shrink inside the card rather than set the card's width. */
+.components-pickers { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; }
+.components-field { flex: 1 1 220px; min-width: 0; max-width: 100%; }
+.components-field select { max-width: 100%; min-width: 0; text-overflow: ellipsis; }
+
+/* The heatmap's steps. No new colours: the validated diverging poles, mixed
+   into the surface in equal steps either side of a neutral middle, so each
+   mode's steps follow from that mode's own poles and surface. The middle is
+   the de-emphasis gray, faint — "about the same as its peers" is a value,
+   and it must not look like "no value". Text stays in the ink tokens on every
+   step, and every cell carries its figure as text, so no step is read from
+   colour alone. */
+table.heatmap td.heat { text-align: right; min-width: 64px; }
+.heat-down-3 { background: color-mix(in srgb, var(--diverge-down) 70%, var(--surface-1)); }
+.heat-down-2 { background: color-mix(in srgb, var(--diverge-down) 45%, var(--surface-1)); }
+.heat-down-1 { background: color-mix(in srgb, var(--diverge-down) 22%, var(--surface-1)); }
+.heat-mid { background: color-mix(in srgb, var(--deemph) 14%, var(--surface-1)); }
+.heat-up-1 { background: color-mix(in srgb, var(--diverge-up) 22%, var(--surface-1)); }
+.heat-up-2 { background: color-mix(in srgb, var(--diverge-up) 45%, var(--surface-1)); }
+.heat-up-3 { background: color-mix(in srgb, var(--diverge-up) 70%, var(--surface-1)); }
+
+/* No peer group, and not measured: no fill at all, the words in muted ink —
+   visibly not a middling value. */
+.heat-none, .heat-absent { color: var(--text-muted); font-style: italic; }
+
+/* A weak component, in either encoding: a ring in the primary ink and the
+   word, so it reads without colour and in the grade view too. */
+td.heat-weak { box-shadow: inset 0 0 0 2px var(--text-primary); font-weight: 600; }
+.heat-weak-mark { margin-left: 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+.heat-key { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); font-size: 9px; }
+.heat-key.heat-weak { box-shadow: inset 0 0 0 2px var(--text-primary); }
+.heat-name { font-weight: 600; }
+.heat-capped { margin-top: 0; padding-top: 0; border-top: 0; margin-bottom: 10px; }
 .legend-mark { display: block; flex: none; }
 
 .link-button {

@@ -5,6 +5,21 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## Unreleased
+
+### Added
+
+- **Components**: a tab with two views of the fleet by component. A
+  distribution of one measure — the overall score, a component, or a single
+  subtest in its own unit — across the machines in view, drawn from one
+  configuration at a time, with p10, median and p90, the machines left out
+  counted with the reason, a split by any group dimension, and every bin a
+  click from its machines. And a grid of every machine against every graded
+  component, each cell against the same component on identical machines (or
+  its grade), the weak components marked, sortable, at most 200 rows.
+  `GET /api/distribution`, `GET /api/heatmap`, `report --distribution` and
+  `report --heatmap`.
+
 ## 0.10.0 - Fri, 13 Nov 2026
 
 **The fleet over time, a decision for every machine, and a way to say "in

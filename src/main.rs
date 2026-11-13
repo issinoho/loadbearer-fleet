@@ -135,6 +135,30 @@ enum Command {
         /// "keep", with the counts.
         #[arg(long, conflicts_with_all = ["by", "changes"])]
         lifecycle: bool,
+        /// How one measure is spread across the fleet: `overall`, a
+        /// component (`disk`), or a component and one of its subtests
+        /// (`disk/seq_read`).
+        ///
+        /// Drawn from one configuration — the one with the most machines —
+        /// because a number is only comparable with another measured the same
+        /// way; the machines left out are counted, with the reason, and the
+        /// other configurations listed. A subtest is its raw value in its own
+        /// unit. With `--json`, the same document `/api/distribution` sends.
+        #[arg(
+            long,
+            value_name = "MEASURE",
+            value_parser = parse_measure,
+            conflicts_with_all = ["by", "changes", "lifecycle"]
+        )]
+        distribution: Option<analytics::Measure>,
+        /// Every machine against every graded component: each component
+        /// against the same component on identical machines, weakest machine
+        /// first, with the weak components marked.
+        ///
+        /// With `--json`, the same document `/api/heatmap` sends, which holds
+        /// at most 200 machines and says how many there were.
+        #[arg(long, conflicts_with_all = ["by", "changes", "lifecycle", "distribution"])]
+        heatmap: bool,
     },
     /// Serve the web dashboard.
     Serve {
@@ -725,6 +749,8 @@ fn main() -> Result<()> {
             by,
             changes,
             lifecycle,
+            distribution,
+            heatmap,
         } => {
             let idx = index::Index::open_existing(&config.server.index)?;
             // From the config, exactly as the server builds it, so a report
@@ -746,6 +772,33 @@ fn main() -> Result<()> {
                 None => state::Book::default(),
             };
             let snap = snap.filtered_with(&analytics::Filter::default(), &book, now);
+            if let Some(measure) = distribution {
+                let measures = analytics::Measures::load(idx.conn(), &snap)?;
+                let d = analytics::distribution(&snap, &measures, measure, None, None)
+                    .map_err(anyhow::Error::msg)?;
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&d)?);
+                } else {
+                    print_distribution(&d);
+                }
+                return Ok(());
+            }
+            if *heatmap {
+                let h = analytics::heatmap(
+                    &snap,
+                    analytics::Encoding::Cohort,
+                    &analytics::HeatSort::Overall,
+                    false,
+                    analytics::HEATMAP_ROWS,
+                )
+                .map_err(anyhow::Error::msg)?;
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&h)?);
+                } else {
+                    print_heatmap(&h);
+                }
+                return Ok(());
+            }
             if *lifecycle {
                 let report = analytics::lifecycle_report(&snap);
                 if *json {
@@ -1375,6 +1428,140 @@ fn print_lifecycle(r: &analytics::LifecycleReport, show_watch: bool) {
 /// the reason, before any index is opened.
 fn parse_group_by(s: &str) -> Result<analytics::GroupBy, String> {
     s.parse()
+}
+
+fn parse_measure(s: &str) -> Result<analytics::Measure, String> {
+    s.parse()
+}
+
+/// A figure for a distribution: whole numbers for scores and large values,
+/// a few significant digits for small ones like a latency in nanoseconds.
+fn measured(v: f64) -> String {
+    if v.abs() >= 100.0 || v.fract() == 0.0 {
+        format!("{v:.0}")
+    } else if v.abs() >= 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// `report --distribution`: what was drawn and from which configuration,
+/// the quantiles, one line per bin, and what was left out and why.
+fn print_distribution(d: &analytics::Distribution) {
+    println!(
+        "{} ({}){}",
+        d.label,
+        d.unit,
+        match d.direction.as_deref() {
+            Some("higher_is_better") => ", higher is better",
+            Some("lower_is_better") => ", lower is better",
+            _ => "",
+        }
+    );
+    match &d.config_label {
+        Some(c) => println!(
+            "  {} of {} machine(s), measured with {c}",
+            d.included, d.machines
+        ),
+        None => println!("  No machine in view has this measure."),
+    }
+    if let Some(note) = &d.direction_note {
+        println!("  {note}");
+    }
+    if let (Some(p10), Some(med), Some(p90)) = (d.p10, d.median, d.p90) {
+        println!(
+            "  p10 {}   median {}   p90 {}",
+            measured(p10),
+            measured(med),
+            measured(p90)
+        );
+        println!();
+        for b in &d.bins {
+            println!(
+                "  {:>10} – {:<10} {:>5}",
+                measured(b.lo),
+                measured(b.hi),
+                b.machines
+            );
+        }
+    }
+    if !d.left_out.is_empty() {
+        println!();
+        for l in &d.left_out {
+            println!("  Left out: {}", l.detail);
+        }
+    }
+    if d.configurations.len() > 1 {
+        println!(
+            "
+Other configurations with this measure:"
+        );
+        for c in d.configurations.iter().skip(1) {
+            println!("  {}  {} machine(s)", c.label, c.machines);
+        }
+    }
+}
+
+/// `report --heatmap`: one line per machine, weakest against identical
+/// machines first, each component's difference from its cohort's, `weak`
+/// beside a component carrying the finding.
+fn print_heatmap(h: &analytics::Heatmap) {
+    println!(
+        "Against identical machines, by component: {} of {} machine(s), weakest first",
+        h.shown, h.machines
+    );
+    println!(
+        "  Each figure is the difference from the median of the same component on machines\n  \
+         with the same CPU, measured the same way. \"no peers\" means fewer than {} of them;\n  \
+         \"weak\" marks the component_weak finding.",
+        h.min_cohort
+    );
+    let mut head = format!(
+        "
+  {:<28} {:>9}",
+        "machine", "overall"
+    );
+    for c in &h.components {
+        head.push_str(&format!(" {c:>15}"));
+    }
+    println!("{head}");
+    let cell = |delta: Option<f64>, measured: bool, weak: bool| {
+        let v = match (measured, delta) {
+            (false, _) => "—".to_string(),
+            (true, None) => "no peers".to_string(),
+            (true, Some(d)) => format!("{d:+.1}%"),
+        };
+        if weak { format!("{v} weak") } else { v }
+    };
+    for r in &h.rows {
+        let name: String = r
+            .hostname
+            .as_deref()
+            .unwrap_or(&r.key)
+            .chars()
+            .take(28)
+            .collect();
+        let mut line = format!(
+            "  {name:<28} {:>9}",
+            cell(r.cohort_delta_pct, r.score.is_some(), false)
+        );
+        for c in &r.cells {
+            line.push_str(&format!(
+                " {:>15}",
+                cell(c.cohort_delta_pct, c.measured, c.weak)
+            ));
+        }
+        println!("{line}");
+    }
+    if h.shown < h.machines {
+        println!(
+            "
+  {} more not shown — the JSON and the dashboard hold the first {} too.",
+            h.machines - h.shown,
+            h.cap
+        );
+    }
 }
 
 /// `report --by`: one line per group, in the server's order — worst share

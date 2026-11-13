@@ -63,12 +63,18 @@ const SIZES = [
 //
 // `lifecycle` is the sixth tab, the one that made the strip scroll on a phone,
 // and `lifecycle-keep` the same view with a tile chosen.
-const VIEWS = ['overview', 'overview-quarter', 'cohorts', 'groups', 'lifecycle', 'lifecycle-keep', 'machines',
-  'drilled', 'machine', 'compare'];
+//
+// `components` is the seventh: a histogram, a measure picker holding whole
+// subtest names, and the machine-by-component grid, which is a table as wide
+// as the fleet has components. `components-split` is the same view with a
+// subtest chosen, split by site, a bin listed and the grid in grades — every
+// card it can show at once.
+const VIEWS = ['overview', 'overview-quarter', 'cohorts', 'groups', 'components', 'components-split',
+  'lifecycle', 'lifecycle-keep', 'machines', 'drilled', 'machine', 'compare'];
 
 /** The tab each view should mark as current. */
 const TAB_OF = {
-  'overview-quarter': 'overview', 'lifecycle-keep': 'lifecycle', drilled: 'machines', machine: 'machines',
+  'overview-quarter': 'overview', 'lifecycle-keep': 'lifecycle', 'components-split': 'components', drilled: 'machines', machine: 'machines',
 };
 
 // A control smaller than this is a control you miss. 40px is the floor here
@@ -392,6 +398,9 @@ try {
       if (view === 'drilled') hash = `machines?cpu=${encodeURIComponent(longestCpu)}`;
       if (view === 'overview-quarter') hash = 'overview?changes=13';
       if (view === 'lifecycle-keep') hash = 'lifecycle?decision=keep';
+      if (view === 'components-split') {
+        hash = 'components?measure=disk%2Fseq_read&split=tag%3Asite&bin=0&encoding=grade&sort=disk&dir=desc';
+      }
       const where = `${size.name}/${view}`;
       // A fresh navigation rather than a hash change, so each measurement is of
       // a page that laid itself out at this size from the start.

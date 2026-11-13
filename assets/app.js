@@ -870,6 +870,193 @@ export function scatterChart(host, {
   host.append(root);
 }
 
+/**
+ * A histogram over a continuous axis: one column per bin, the bins' own edges
+ * on the axis, and reference lines for the quantiles in `marks`.
+ *
+ * Columns rather than touching bars, because the 24px cap holds here as it
+ * does everywhere — each sits in the middle of its bin, and the hit target is
+ * the whole bin. The mark labels each get a line of their own above the plot,
+ * so p10, median and p90 can never print over each other however close they
+ * fall. A distribution of identical values is one bin of no width, drawn as a
+ * single column in the middle rather than divided by a zero range.
+ */
+export function histogramChart(host, {
+  bins, marks = [], format = (v) => num(v), selected = null, onSelect, caption = '',
+}) {
+  if (!bins.length) {
+    host.append(el('div', { class: 'empty', text: 'Nothing to draw.' }));
+    return;
+  }
+  const width = Math.max(320, host.clientWidth || 520);
+  const m = { top: 10 + 13 * marks.length, right: 26, bottom: caption ? 50 : 34, left: 46 };
+  const plotH = 170;
+  const height = plotH + m.top + m.bottom;
+  const plotW = width - m.left - m.right;
+  const lo = bins[0].lo;
+  const hi = bins[bins.length - 1].hi;
+  const span = hi - lo;
+  const bandW = span > 0 ? plotW / bins.length : plotW / 3;
+  const x = (v) => (span > 0 ? m.left + ((v - lo) / span) * plotW : m.left + plotW / 2);
+  const bandX = (i) => (span > 0 ? x(bins[i].lo) : m.left + plotW / 3);
+  const { max, ticks } = niceTicks(Math.max(...bins.map((b) => b.machines), 0), 4, 1);
+  const y = (v) => m.top + plotH - (v / max) * plotH;
+  const root = svg('svg', { class: 'chart', viewBox: `0 0 ${width} ${height}`, width, height, role: 'img' });
+
+  for (const t of ticks) {
+    root.append(svg('line', {
+      x1: m.left, x2: m.left + plotW, y1: y(t), y2: y(t),
+      stroke: t === 0 ? ink('--axis') : ink('--grid'), 'stroke-width': 1,
+    }));
+    root.append(svg('text', {
+      x: m.left - 8, y: y(t) + 4, 'text-anchor': 'end',
+      fill: ink('--text-muted'), 'font-size': 11, 'font-variant-numeric': 'tabular-nums',
+    }, [document.createTextNode(nf0.format(t))]));
+  }
+
+  // A label is kept inside the chart's own box: centred on its point where
+  // there is room, pulled in at either edge where there is not.
+  const placed = (at, text, px) => {
+    const half = textWidth(text, px) / 2;
+    return Math.min(Math.max(at, half + 2), width - half - 2);
+  };
+
+  const barW = Math.min(24, Math.max(4, bandW - 6));
+  bins.forEach((b, i) => {
+    const cx = bandX(i) + bandW / 2;
+    const h = (b.machines / max) * plotH;
+    // The chosen bin keeps the series colour and the rest step back: the
+    // emphasis pattern, not a second hue.
+    const colour = selected === null || selected === i ? ink('--series-1') : ink('--deemph');
+    if (h > 0) {
+      root.append(svg('path', { d: barPath(cx - barW / 2, y(b.machines), barW, h, 4, 'up'), fill: colour }));
+      if (bandW >= textWidth(nf0.format(b.machines), 11) + 4) {
+        root.append(svg('text', {
+          x: cx, y: y(b.machines) - 6, 'text-anchor': 'middle',
+          fill: ink('--text-secondary'), 'font-size': 11, 'font-variant-numeric': 'tabular-nums',
+        }, [document.createTextNode(nf0.format(b.machines))]));
+      }
+    }
+    const range = span > 0 ? `${format(b.lo)} to ${format(b.hi)}` : format(b.lo);
+    const hit = hoverable(svg('rect', {
+      x: bandX(i), y: m.top, width: bandW, height: plotH, fill: 'transparent', role: 'img',
+      'aria-label': `${range}: ${b.machines} machine(s)${onSelect ? '. Enter lists them' : ''}`,
+    }), () => tipBlock(range, [['machines', nf0.format(b.machines), colour]]));
+    if (onSelect) {
+      hit.addEventListener('click', () => onSelect(i));
+      hit.addEventListener('keydown', (e) => { if (e.key === 'Enter') onSelect(i); });
+      hit.setAttribute('cursor', 'pointer');
+    }
+    root.append(hit);
+  });
+
+  // The edges, as many as fit without touching their neighbours.
+  const edges = span > 0 ? [...bins.map((b) => b.lo), hi] : [lo];
+  const widest = Math.max(...edges.map((e) => textWidth(format(e), 11)));
+  const stride = span > 0 ? Math.max(1, Math.ceil((widest + 8) / bandW)) : 1;
+  edges.forEach((e, k) => {
+    if (k % stride !== 0) return;
+    const text = format(e);
+    root.append(svg('text', {
+      x: placed(x(e), text, 11), y: m.top + plotH + 16, 'text-anchor': 'middle',
+      fill: ink('--text-muted'), 'font-size': 11, 'font-variant-numeric': 'tabular-nums',
+    }, [document.createTextNode(text)]));
+  });
+
+  // The quantiles: thresholds rather than data, so solid hairlines in the
+  // muted ink, each named on a line of its own.
+  marks.forEach((mk, i) => {
+    const mx = x(mk.value);
+    root.append(svg('line', {
+      x1: mx, x2: mx, y1: m.top - 2, y2: m.top + plotH, stroke: ink('--text-muted'), 'stroke-width': 1,
+    }));
+    const text = `${mk.label} ${format(mk.value)}`;
+    root.append(svg('text', {
+      x: placed(mx, text, 11), y: 11 + 13 * i, 'text-anchor': 'middle',
+      fill: ink('--text-secondary'), 'font-size': 11, 'font-variant-numeric': 'tabular-nums',
+    }, [document.createTextNode(text)]));
+  });
+
+  root.append(svg('line', {
+    x1: m.left, x2: m.left + plotW, y1: m.top + plotH, y2: m.top + plotH, stroke: ink('--axis'), 'stroke-width': 1,
+  }));
+  if (caption) {
+    root.append(svg('text', {
+      x: m.left + plotW / 2, y: height - 8, 'text-anchor': 'middle', fill: ink('--text-secondary'), 'font-size': 11,
+    }, [document.createTextNode(caption)]));
+  }
+  host.append(root);
+}
+
+/**
+ * One row per group: a line from p10 to p90 and a mark at the median, all on
+ * one shared axis — the overlaid quantile rows a split distribution is drawn
+ * as. A row is `{ label, p10, median, p90, machines }`.
+ */
+export function rangeChart(host, { rows, format = (v) => num(v), onSelect }) {
+  if (!rows.length) {
+    host.append(el('div', { class: 'empty', text: 'Nothing to draw.' }));
+    return;
+  }
+  const width = Math.max(320, host.clientWidth || 520);
+  const gutter = Math.min(170, Math.max(80, ...rows.map((r) => textWidth(r.label, 12) + 12)));
+  const m = { top: 8, right: 26, bottom: 26, left: gutter };
+  const rowH = 28;
+  const plotH = rowH * rows.length;
+  const height = plotH + m.top + m.bottom;
+  const plotW = width - m.left - m.right;
+  let lo = Math.min(...rows.map((r) => r.p10));
+  let hi = Math.max(...rows.map((r) => r.p90));
+  if (!(hi > lo)) {
+    const pad = Math.abs(lo) * 0.05 || 1;
+    lo -= pad;
+    hi += pad;
+  }
+  const x = (v) => m.left + ((v - lo) / (hi - lo)) * plotW;
+  const root = svg('svg', { class: 'chart', viewBox: `0 0 ${width} ${height}`, width, height });
+
+  for (const [i, t] of [lo, (lo + hi) / 2, hi].entries()) {
+    root.append(svg('line', {
+      x1: x(t), x2: x(t), y1: m.top, y2: m.top + plotH, stroke: ink('--grid'), 'stroke-width': 1,
+    }));
+    const text = format(t);
+    root.append(svg('text', {
+      x: x(t), y: height - 8, 'text-anchor': ['start', 'middle', 'end'][i],
+      fill: ink('--text-muted'), 'font-size': 10, 'font-variant-numeric': 'tabular-nums',
+    }, [document.createTextNode(text)]));
+  }
+
+  rows.forEach((r, i) => {
+    const cy = m.top + rowH * i + rowH / 2;
+    root.append(svg('text', {
+      x: m.left - 10, y: cy + 4, 'text-anchor': 'end', fill: ink('--text-primary'), 'font-size': 12,
+    }, [document.createTextNode(r.label)]));
+    root.append(svg('line', {
+      x1: x(r.p10), x2: x(r.p90), y1: cy, y2: cy, stroke: ink('--series-1'), 'stroke-width': 2,
+      'stroke-linecap': 'round',
+    }));
+    root.append(svg('circle', {
+      cx: x(r.median), cy, r: 4.5, fill: ink('--series-1'), stroke: ink('--surface-1'), 'stroke-width': 2,
+    }));
+    const hit = hoverable(svg('rect', {
+      x: 0, y: m.top + rowH * i, width, height: rowH, fill: 'transparent', role: 'img',
+      'aria-label': `${r.label}: median ${format(r.median)}, p10 ${format(r.p10)}, p90 ${format(r.p90)}, `
+        + `${r.machines} machine(s)`,
+    }), () => tipBlock(r.label, [
+      ['median', format(r.median), ink('--series-1')],
+      ['p10 to p90', `${format(r.p10)} – ${format(r.p90)}`],
+      ['machines', nf0.format(r.machines)],
+    ]));
+    if (onSelect) {
+      hit.addEventListener('click', () => onSelect(r));
+      hit.addEventListener('keydown', (e) => { if (e.key === 'Enter') onSelect(r); });
+      hit.setAttribute('cursor', 'pointer');
+    }
+    root.append(hit);
+  });
+  host.append(root);
+}
+
 /* ------------------------------------------------------------ chart cards */
 
 const redraws = [];
@@ -1053,6 +1240,17 @@ export const state = {
   /// The decision the Lifecycle view's table is showing, or null for every
   /// one but keep.
   decision: null,
+  /// The Components view's settings, each null for the server's default:
+  /// the measure, its configuration, a dimension to split it by, the bin
+  /// whose machines are listed, and the heatmap's encoding and sort. Kept in
+  /// the hash so a view can be linked, and across a trip to another tab.
+  measure: null,
+  config: null,
+  split: null,
+  bin: null,
+  encoding: null,
+  hsort: null,
+  hdir: null,
 };
 
 /** The filter fields the URL carries, all sent to the server as they are. */
@@ -1068,7 +1266,7 @@ function parseHash() {
     const v = params.get(k);
     if (v) filter[k] = v;
   }
-  const named = ['overview', 'cohorts', 'groups', 'lifecycle', 'machines', 'compare'];
+  const named = ['overview', 'cohorts', 'groups', 'components', 'lifecycle', 'machines', 'compare'];
   const view = parts[0] === 'machine'
     ? 'machine'
     : (named.includes(parts[0]) ? parts[0] : 'overview');
@@ -1091,6 +1289,16 @@ function parseHash() {
     // `lifecycle` filter: that narrows the whole fleet, the tiles' own counts
     // included, so choosing a tile through it would zero every other tile.
     decision: params.get('decision') || null,
+    // The Components view's own settings, beside the filter for the same
+    // reason `by` is. Passed to the server as they are, so a hand-edited
+    // measure or sort is refused there, with its reason.
+    measure: params.get('measure') || null,
+    config: params.get('config') || null,
+    split: params.get('split') || null,
+    bin: /^\d+$/.test(params.get('bin') || '') ? Number(params.get('bin')) : null,
+    encoding: params.get('encoding') || null,
+    hsort: params.get('sort') || null,
+    hdir: params.get('dir') || null,
     filter,
   };
 }
@@ -1103,6 +1311,12 @@ function writeHash({
   if (view === 'groups' && by) params.set('by', by);
   if (view === 'lifecycle' && decision) params.set('decision', decision);
   if (view === 'overview' && weeks && weeks !== 1) params.set('changes', String(weeks));
+  if (view === 'components') {
+    for (const [k, v] of [['measure', state.measure], ['config', state.config], ['split', state.split],
+      ['bin', state.bin], ['encoding', state.encoding], ['sort', state.hsort], ['dir', state.hdir]]) {
+      if (v !== null && v !== undefined) params.set(k, String(v));
+    }
+  }
   const q = params.toString();
   let path = view;
   if (view === 'machine') path = `machine/${encodeURIComponent(key)}`;
@@ -1368,6 +1582,13 @@ function wireFilters() {
   });
   $('#tabs').addEventListener('scroll', () => syncTabStrip(false), { passive: true });
   window.addEventListener('resize', debounce(() => syncTabStrip(true), 150));
+  // The strip also narrows without the window resizing: a desktop page that
+  // grows long enough for a scrollbar loses its width after the view has
+  // drawn, and with seven tabs at 740px that was enough to push the last one
+  // out from under a strip that had already decided nothing was hidden.
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(() => syncTabStrip(true)).observe($('#tabs'));
+  }
 
   $('#rescan').addEventListener('click', async () => {
     const btn = $('#rescan');
@@ -2438,6 +2659,435 @@ export async function renderGroups(main) {
     : [intro, el('div', { class: 'card col-12' }, [el('div', { class: 'empty', text: 'No machines in view to group.' })])]));
 }
 
+/* -------------------------------------------------------------- components */
+
+/*
+ * The fleet by component: how one measure is spread across the machines in
+ * view, and every machine against every graded component. Both are the
+ * server's to compute — what may share an axis, and what a cell says, are
+ * decisions with reasons (see `analytics::components`) — so this lays out what
+ * it is given and says what was left out.
+ */
+
+/** The distribution and the heatmap, each through the filter, each with the
+ *  view's own settings from the hash. */
+async function fetchDistribution() {
+  const params = new URLSearchParams(state.filter);
+  if (state.measure) params.set('measure', state.measure);
+  if (state.config) params.set('config', state.config);
+  if (state.split) params.set('split', state.split);
+  return fetchJson(`/api/distribution?${params}`);
+}
+
+async function fetchHeatmap() {
+  const params = new URLSearchParams(state.filter);
+  if (state.encoding) params.set('encoding', state.encoding);
+  if (state.hsort) params.set('sort', state.hsort);
+  if (state.hdir) params.set('dir', state.hdir);
+  return fetchJson(`/api/heatmap?${params}`);
+}
+
+/** Change one of this view's settings, keeping the rest. A new measure or
+ *  configuration has new bins, so the chosen bin is let go. */
+function setComponents(patch) {
+  const next = {
+    measure: state.measure, config: state.config, split: state.split, bin: state.bin,
+    encoding: state.encoding, hsort: state.hsort, hdir: state.hdir, ...patch,
+  };
+  if ('measure' in patch || 'config' in patch) next.bin = null;
+  if ('measure' in patch) next.config = null;
+  Object.assign(state, next);
+  writeHash({ view: 'components' });
+}
+
+const DIRECTION_WORDS = {
+  higher_is_better: 'higher is better',
+  lower_is_better: 'lower is better',
+};
+
+/*
+ * The heatmap's steps against identical machines. Equal steps on each side of
+ * a neutral middle, as the diverging rule asks, and placed where the findings
+ * already draw lines: within 5% is run-to-run noise, 15% is about where a
+ * cohort outlier starts to be named, and 25% is where it becomes critical.
+ * The fills are the validated diverging poles mixed into the surface in
+ * app.css, not new colours.
+ */
+const HEAT_STEPS = [
+  { cls: 'heat-down-3', label: '25% or more below', test: (d) => d <= -25 },
+  { cls: 'heat-down-2', label: '15–25% below', test: (d) => d <= -15 },
+  { cls: 'heat-down-1', label: '5–15% below', test: (d) => d <= -5 },
+  { cls: 'heat-mid', label: 'within 5%', test: (d) => d < 5 },
+  { cls: 'heat-up-1', label: '5–15% above', test: (d) => d < 15 },
+  { cls: 'heat-up-2', label: '15–25% above', test: (d) => d < 25 },
+  { cls: 'heat-up-3', label: '25% or more above', test: () => true },
+];
+
+const heatStep = (d) => HEAT_STEPS.find((s) => s.test(d));
+
+/** One heatmap cell: the figure as text, the step as a class, and a label a
+ *  screen reader can read whole. Colour never says anything alone. */
+function heatCell({ measured, delta, grade, score, weak, encoding, what }) {
+  let text;
+  let cls;
+  let words;
+  if (!measured) {
+    text = '—';
+    cls = 'heat-absent';
+    words = `${what}: not measured in the latest run`;
+  } else if (encoding === 'grade') {
+    text = `${grade || '—'} ${num(score, 0)}`;
+    cls = 'heat-grade';
+    words = `${what}: graded ${grade || 'unrecognised'}, scored ${num(score, 0)}`;
+  } else if (delta === null || delta === undefined) {
+    text = 'no peers';
+    cls = 'heat-none';
+    words = `${what}: no peer group to compare against`;
+  } else {
+    text = signed(delta, 0);
+    cls = heatStep(delta).cls;
+    words = `${what}: ${signed(delta, 1)} against identical machines`;
+  }
+  if (weak) words += '; weak — this machine carries the weak component finding for it';
+  return el('td', {
+    class: `heat ${cls}${weak ? ' heat-weak' : ''}`, title: words, 'aria-label': words,
+  }, [
+    el('span', { text }),
+    weak ? el('span', { class: 'heat-weak-mark', text: 'weak' }) : null,
+  ]);
+}
+
+function heatLegend(encoding) {
+  const swatch = (cls, label, mark) => el('span', { class: 'legend-item' }, [
+    el('span', { class: `legend-key heat-key ${cls}` }, mark ? [el('span', { text: mark })] : []),
+    el('span', { text: label }),
+  ]);
+  return el('div', { class: 'legend heat-legend' }, [
+    ...(encoding === 'grade' ? [] : HEAT_STEPS.map((s) => swatch(s.cls, s.label))),
+    encoding === 'grade' ? null : swatch('heat-none', 'no peer group'),
+    swatch('heat-absent', 'not measured'),
+    swatch('heat-weak', 'weak component', '!'),
+  ]);
+}
+
+function heatmapCard(h) {
+  const encoding = h.encoding;
+  const sortBy = (key) => {
+    // The same column again turns it round; a new one starts weakest first,
+    // or A to Z for the names.
+    const dir = h.sort === key && h.dir === 'asc' ? 'desc' : 'asc';
+    setComponents({ hsort: key, hdir: dir });
+  };
+  const header = (key, label) => {
+    const on = h.sort === key;
+    const th = el('th', {
+      class: `sortable${key === 'host' ? '' : ' num'}`, tabindex: '0',
+      'aria-sort': on ? (h.dir === 'asc' ? 'ascending' : 'descending') : 'none',
+      text: label + (on ? (h.dir === 'asc' ? ' ▲' : ' ▼') : ''),
+    });
+    th.addEventListener('click', () => sortBy(key));
+    th.addEventListener('keydown', (e) => { if (e.key === 'Enter') sortBy(key); });
+    return th;
+  };
+  const table = el('table', { class: 'data heatmap' }, [
+    el('thead', {}, [el('tr', {}, [
+      header('host', 'Machine'),
+      header('overall', encoding === 'grade' ? 'Overall' : 'Overall vs peers'),
+      ...h.components.map((c) => header(c, c)),
+    ])]),
+    el('tbody', {}, h.rows.map((r) => {
+      const name = r.hostname || r.key;
+      const tr = el('tr', { class: 'clickable', tabindex: '0' }, [
+        el('td', {}, [el('span', { class: 'heat-name', text: name })]),
+        heatCell({
+          measured: encoding === 'grade' ? r.score !== null : true,
+          delta: r.cohort_delta_pct, grade: r.grade, score: r.score, weak: false, encoding, what: `${name} overall`,
+        }),
+        ...r.cells.map((c) => heatCell({
+          measured: c.measured, delta: c.cohort_delta_pct, grade: c.grade, score: c.score, weak: c.weak,
+          encoding, what: `${name} ${c.component}`,
+        })),
+      ]);
+      const open = () => writeHash({ view: 'machine', key: r.key });
+      tr.addEventListener('click', open);
+      tr.addEventListener('keydown', (e) => { if (e.key === 'Enter') open(); });
+      return tr;
+    })),
+  ]);
+
+  const capped = h.shown < h.machines
+    ? `Showing ${nf0.format(h.shown)} of ${nf0.format(h.machines)} machines — the first ${nf0.format(h.cap)} by the `
+      + 'sort you chose. Filter to narrow.'
+    : null;
+  const toggle = (value, label) => el('button', {
+    type: 'button', class: 'btn', 'aria-pressed': encoding === value ? 'true' : 'false', text: label,
+    onclick: () => setComponents({ encoding: value === 'cohort' ? null : value }),
+  });
+  return el('div', { class: 'card col-12', dataset: { card: 'heatmap' } }, [
+    el('div', { class: 'card-head' }, [
+      el('h3', { text: 'Every machine, by component' }),
+      el('div', { class: 'card-actions', role: 'group', 'aria-label': 'What each cell shows' }, [
+        toggle('cohort', 'Against identical machines'), toggle('grade', 'Grade'),
+      ]),
+    ]),
+    el('p', {
+      class: 'card-sub',
+      text: encoding === 'grade'
+        ? 'Each cell is the component’s grade and score against the reference baseline — an absolute answer, so it '
+          + 'says how new the hardware is as much as how it is doing. Grades are not coloured: they share one hue '
+          + 'across the dashboard, and the letter carries the order.'
+        : 'Each cell is the component against the median of the same component on machines with the same CPU, '
+          + 'measured the same way, across the whole index — the comparison Groups headlines with. “No peers” '
+          + `means fewer than ${h.min_cohort} of them measured it: there is nothing to compare with, which is not `
+          + 'the same as average.',
+    }),
+    heatLegend(encoding),
+    el('p', {
+      class: 'card-sub',
+      text: `“Weak” marks the weak component finding — graded D or F and at least two grades below the machine’s `
+        + 'own — in either view, so a cell never looks fine on a machine that carries it. A cell well below its '
+        + 'peers without the mark is a different comparison: slower than the same part elsewhere, not a weak part '
+        + `on this machine. ${nf0.format(h.weak)} weak component(s) in view. Click a column to sort, or a machine `
+        + 'to open it.',
+    }),
+    capped ? el('p', { class: 'card-note heat-capped', text: capped }) : null,
+    h.rows.length
+      ? el('div', { class: 'table-wrap' }, [table])
+      : el('div', { class: 'empty', text: 'No machines in view.' }),
+  ]);
+}
+
+/** The measure picker: the overall score, then each component and its
+ *  subtests grouped under it, each with how many machines in view have it. */
+function measurePicker(d) {
+  const n = (k) => ` (${nf0.format(k)})`;
+  const select = el('select', {
+    'aria-label': 'Measure',
+    onchange: (e) => setComponents({ measure: e.target.value === 'overall' ? null : e.target.value }),
+  }, [
+    el('option', { value: 'overall', text: `Overall score${n(d.overall_machines)}` }),
+    ...d.measures.map((g) => el('optgroup', { label: `${g.label}${g.graded ? '' : ' — not graded'}` }, [
+      el('option', { value: g.measure, text: `${g.label}, the component score${n(g.machines)}` }),
+      ...g.subtests.map((t) => el('option', {
+        value: t.measure, text: `${t.label} · ${t.unit}${t.scored ? '' : ' · informational'}${n(t.machines)}`,
+      })),
+    ])),
+  ]);
+  select.value = d.measure;
+  return el('label', { class: 'field components-field' }, [el('span', { class: 'field-label', text: 'Measure' }), select]);
+}
+
+function configPicker(d) {
+  if (d.configurations.length < 2) return null;
+  const select = el('select', {
+    'aria-label': 'Configuration',
+    onchange: (e) => setComponents({ config: e.target.value }),
+  }, d.configurations.map((c) => el('option', {
+    value: c.key, text: `${c.label} (${nf0.format(c.machines)})`,
+  })));
+  select.value = d.config;
+  return el('label', { class: 'field components-field' }, [
+    el('span', { class: 'field-label', text: 'Configuration' }), select,
+  ]);
+}
+
+function splitPicker(d) {
+  const select = el('select', {
+    'aria-label': 'Split by',
+    onchange: (e) => setComponents({ split: e.target.value || null }),
+  }, [el('option', { value: '', text: 'Nothing' }), ...d.dimensions.map((v) => el('option', { value: v, text: dimensionLabel(v) }))]);
+  select.value = d.split ? d.split.by : '';
+  return el('label', { class: 'field components-field' }, [el('span', { class: 'field-label', text: 'Split by' }), select]);
+}
+
+/** The machines a chosen bin holds, or with none chosen the lowest and the
+ *  highest few — so both ends of the estate are a click from their pages. */
+function binCard(d, fmt) {
+  const chosen = state.bin !== null && state.bin >= 0 && state.bin < d.bins.length ? state.bin : null;
+  const row = (p) => ({
+    key: p.key,
+    cells: [machineLink({ key: p.key, hostname: p.hostname }), fmt(p.value)],
+    sort: [(p.hostname || p.key).toLowerCase(), p.value],
+  });
+  const table = (points) => dataTable({
+    columns: [{ label: 'Machine' }, { label: d.unit === 'score' ? 'Score' : d.unit, num: true }],
+    rows: points.map(row),
+    onRow: (r) => writeHash({ view: 'machine', key: r.key }),
+    sortable: true,
+  });
+  if (chosen !== null) {
+    const b = d.bins[chosen];
+    const points = d.values.filter((p) => p.bin === chosen);
+    return el('div', { class: 'card col-12', dataset: { card: 'bin' } }, [
+      el('div', { class: 'card-head' }, [
+        el('h3', { text: `${fmt(b.lo)} to ${fmt(b.hi)} · ${nf0.format(points.length)} machine(s)` }),
+        el('div', { class: 'card-actions' }, [el('button', {
+          type: 'button', class: 'btn btn-quiet', text: 'Show both ends instead',
+          onclick: () => setComponents({ bin: null }),
+        })]),
+      ]),
+      points.length ? table(points) : el('div', { class: 'empty', text: 'No machine falls in this bin.' }),
+    ]);
+  }
+  const few = Math.min(5, Math.floor(d.values.length / 2));
+  const ends = few > 0
+    ? [...d.values.slice(0, few), ...d.values.slice(d.values.length - few)]
+    : d.values;
+  return el('div', { class: 'card col-12', dataset: { card: 'bin' } }, [
+    el('div', { class: 'card-head' }, [el('h3', { text: 'At each end' })]),
+    el('p', {
+      class: 'card-sub',
+      text: d.values.length > ends.length
+        ? `The ${few} lowest and the ${few} highest. Choose a bar to list the machines in it.`
+        : 'Every machine drawn. Choose a bar to list just the machines in it.',
+    }),
+    d.values.length ? table(ends) : el('div', { class: 'empty', text: 'Nothing drawn.' }),
+  ]);
+}
+
+function distributionCards(d) {
+  const fmt = d.unit === 'score' ? (v) => nf0.format(v) : (v) => num(v);
+  const unitWords = d.unit === 'score' ? 'score against the baseline' : d.unit;
+  const direction = DIRECTION_WORDS[d.direction] || null;
+  const notes = [
+    d.direction_note,
+    d.counted ? null : (d.kind === 'subtest'
+      ? 'Informational, or part of a component that is not graded: measured and shown, never part of a grade.'
+      : 'Not graded: network and GPU describe the host, its drivers and the link as much as the machine, which is '
+        + 'why loadbearer keeps them out of a grade.'),
+    ...d.left_out.map((l) => `Left out: ${l.detail}`),
+  ].filter(Boolean);
+  const chart = chartCard({
+    title: `${d.label} · ${unitWords}`,
+    subtitle: d.config_label
+      ? `${nf0.format(d.included)} of ${nf0.format(d.machines)} machine(s) in view, all measured with `
+        + `${d.config_label} — numbers are only comparable within one configuration, so others are drawn on their own.`
+        + (d.statistic ? ` Each figure is the ${d.statistic} of its iterations.` : '')
+        + (direction ? ` For this measure ${direction}.` : '')
+      : 'No machine in view has this measure.',
+    note: notes.join(' ') || null,
+    span: 'col-12',
+    draw: (host) => {
+      if (!d.bins.length) {
+        host.append(el('div', { class: 'empty', text: 'Nothing to draw: no machine in view has this measure.' }));
+        return;
+      }
+      histogramChart(host, {
+        bins: d.bins,
+        marks: d.included > 1
+          ? [{ label: 'p10', value: d.p10 }, { label: 'median', value: d.median }, { label: 'p90', value: d.p90 }]
+          : [],
+        format: fmt,
+        selected: state.bin,
+        onSelect: (i) => setComponents({ bin: state.bin === i ? null : i }),
+        caption: direction
+          ? `${d.unit === 'score' ? 'score' : d.unit} — ${direction}`
+          : `${d.unit} — no direction recorded, so neither end is called better`,
+      });
+    },
+    table: () => dataTable({
+      columns: [{ label: 'From' }, { label: 'To' }, { label: 'Machines', num: true }],
+      rows: d.bins.map((b) => ({ cells: [fmt(b.lo), fmt(b.hi), b.machines] })),
+    }),
+  });
+
+  const figures = d.included
+    ? el('div', { class: 'col-12' }, [el('div', { class: 'tiles' }, [
+      ['Machines drawn', nf0.format(d.included), `of ${nf0.format(d.machines)} in view`],
+      ['p10', fmt(d.p10), 'a tenth are at or below'],
+      ['Median', fmt(d.median), 'half are at or below'],
+      ['p90', fmt(d.p90), 'a tenth are at or above'],
+    ].map(([label, value, sub]) => el('div', { class: 'card' }, [
+      el('div', { class: 'tile-label', text: label }),
+      el('div', { class: 'tile-value', text: value }),
+      el('div', { class: 'tile-sub', text: sub }),
+    ])))])
+    : null;
+
+  const cards = [figures, chart, binCard(d, fmt)];
+
+  if (d.split) {
+    const by = d.split.by;
+    const plotted = d.split.groups.filter((g) => !g.thin);
+    const thin = d.split.groups.length - plotted.length;
+    const label = (g) => (g.value !== null ? g.value : (by.startsWith('tag:') ? '(untagged)' : '(not recorded)'));
+    cards.push(chartCard({
+      title: `${d.label} by ${dimensionLabel(by).toLowerCase()}`,
+      subtitle: 'Each line runs from a group’s p10 to its p90, with its median marked, on the axis above. '
+        + 'Select a group to see its machines.',
+      note: thin
+        ? `${thin} group(s) with fewer than ${d.min_cohort} machines drawn are left off — quantiles of so few `
+          + 'describe those machines, not the group. The table has every one.'
+        : null,
+      span: 'col-12',
+      draw: (host) => {
+        if (!plotted.length) {
+          host.append(el('div', { class: 'empty', text: `No group has ${d.min_cohort} or more machines drawn.` }));
+          return;
+        }
+        rangeChart(host, {
+          rows: plotted.slice(0, GROUP_CHART_CAP).map((g) => ({ ...g, label: label(g), group: g })),
+          format: fmt,
+          onSelect: (r) => drillInto(r.group, by),
+        });
+      },
+      table: () => dataTable({
+        columns: [{ label: 'Group' }, { label: 'Machines', num: true }, { label: 'p10', num: true },
+          { label: 'Median', num: true }, { label: 'p90', num: true }, { label: 'Thin' }],
+        rows: d.split.groups.map((g) => ({
+          cells: [label(g), g.machines, fmt(g.p10), fmt(g.median), fmt(g.p90), g.thin ? 'yes' : 'no'],
+          sort: [label(g).toLowerCase(), g.machines, g.p10, g.median, g.p90, g.thin],
+        })),
+        sortable: true,
+      }),
+    }));
+  }
+  return cards.filter(Boolean);
+}
+
+/** A card holding the server's refusal and the way back to the default. */
+function refusedCard(err, label, reset) {
+  return el('div', { class: 'card col-12' }, [el('div', { class: 'banner' }, [
+    el('span', { text: err.message }),
+    ' ',
+    el('button', { type: 'button', class: 'link-button', text: label, onclick: reset }),
+  ])]);
+}
+
+export async function renderComponents(main) {
+  const [d, h] = await Promise.all([
+    fetchDistribution().catch((err) => err),
+    fetchHeatmap().catch((err) => err),
+  ]);
+
+  const intro = el('div', { class: 'card col-12' }, [
+    el('div', { class: 'card-head' }, [el('h3', { text: 'Components across the fleet' })]),
+    el('p', {
+      class: 'card-sub',
+      text: 'How one measure — the overall score, a component, or a single subtest — is spread across the machines '
+        + 'in view, and every machine against every graded component. A number is only comparable with another '
+        + 'measured the same way, so a distribution draws from one configuration at a time and counts the machines '
+        + 'it leaves out. A subtest is drawn as measured, in its own unit; a score is against the baseline.',
+    }),
+    d instanceof Error ? null : el('div', { class: 'components-pickers' }, [measurePicker(d), configPicker(d), splitPicker(d)]),
+  ]);
+
+  const cards = [intro];
+  if (d instanceof Error) {
+    cards.push(refusedCard(d, 'Show the overall score instead',
+      () => setComponents({ measure: null, config: null, split: null })));
+  } else {
+    cards.push(...distributionCards(d));
+  }
+  if (h instanceof Error) {
+    cards.push(refusedCard(h, 'Sort by the default instead',
+      () => setComponents({ encoding: null, hsort: null, hdir: null })));
+  } else {
+    cards.push(heatmapCard(h));
+  }
+  main.append(el('div', { class: 'grid' }, cards));
+}
+
 /** Tag keys across the machines in view, one table column each. */
 function tagKeysOf(machines) {
   return [...new Set(machines.flatMap((m) => Object.keys(m.tags || {})))].sort();
@@ -3179,6 +3829,7 @@ function render() {
   if (state.view === 'machine') { renderMachine(main, state.key); return; }
   if (state.view === 'compare') { renderCompare(main, state.runs); return; }
   if (state.view === 'groups') return renderGroups(main);
+  if (state.view === 'components') return renderComponents(main);
   if (state.view === 'lifecycle') renderLifecycle(main);
   else if (state.view === 'cohorts') renderCohorts(main);
   else if (state.view === 'machines') renderMachines(main);
@@ -3187,7 +3838,7 @@ function render() {
 
 async function route() {
   const {
-    view, key, filter, runs, by, window: weeks, decision,
+    view, key, filter, runs, by, window: weeks, decision, ...rest
   } = parseHash();
   state.view = view;
   state.key = key;
@@ -3198,6 +3849,7 @@ async function route() {
   if (view === 'groups') state.by = by;
   if (view === 'overview') state.window = weeks;
   if (view === 'lifecycle') state.decision = decision;
+  if (view === 'components') Object.assign(state, rest);
   const main = $('#main');
   main.classList.add('loading');
   try {

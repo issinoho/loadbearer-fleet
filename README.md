@@ -442,6 +442,8 @@ loadbearer-fleet report --json                     # the whole snapshot, as the 
 loadbearer-fleet report --by tag:site              # per site: worst share needing attention first
 loadbearer-fleet report --changes 4                # what changed in the last 4 weeks (1, 4 or 13)
 loadbearer-fleet report --lifecycle                # what to replace, repair or investigate, and why
+loadbearer-fleet report --distribution disk        # how one measure is spread, one configuration at a time
+loadbearer-fleet report --heatmap                  # every machine against every component
 loadbearer-fleet serve \\fileserver\loadbearer     # the dashboard, on http://127.0.0.1:8787
 loadbearer-fleet init-config > fleet.toml          # a starter config, placeholders included
 loadbearer-fleet serve --config fleet.toml         # with single sign-on
@@ -518,6 +520,10 @@ resets when they're reimaged" is something an estate owner should know.
       some machines by tag, system model or CPU model, named on each machine
       they change — see [Thresholds, and different lines for some
       machines](#thresholds-and-different-lines-for-some-machines)
+- [x] How each component and subtest is spread across the estate, drawn only
+      from runs measured the same way, and every machine against every
+      component — see [How each component is spread, and which machines are
+      weak where](#how-each-component-is-spread-and-which-machines-are-weak-where)
 
 ## Analysis
 
@@ -860,19 +866,21 @@ documents.
 loadbearer-fleet serve \\fileserver\loadbearer
 ```
 
-Scans the folder, then serves six views on `127.0.0.1:8787`: an executive
+Scans the folder, then serves seven views on `127.0.0.1:8787`: an executive
 **overview** (how many machines need attention, what changed since a week, a
 month or a quarter ago, grade distribution, findings by queue, score spread,
 the ranked list of what to look at, and the same figures week by week over
 the last half-year), a **cohort
 explorer** (each machine against the median of the machines like it), **groups**
-(the estate by site, system model, CPU, OS or any tag), **lifecycle** (what
+(the estate by site, system model, CPU, OS or any tag), **components** (how
+one measure is spread across the estate, and every machine against every
+component), **lifecycle** (what
 each machine calls for — replace, repair, investigate, watch or keep — and
 why), a sortable **machine table**, and a **drilldown** per machine with its
 score history, its components, its findings in full, its drives, every
 subtest of its latest run, and — where a [threshold
 override](#thresholds-and-different-lines-for-some-machines) applies — the
-lines it was judged against instead. On a phone the six tabs scroll sideways inside
+lines it was judged against instead. On a phone the seven tabs scroll sideways inside
 their strip, with the current one kept in view and a fade on the edge where
 more are hidden.
 
@@ -902,6 +910,90 @@ and clicking either count opens just those machines.
 
 `report --by <dimension>` prints the same thing at a prompt — `model`, `cpu`,
 `os`, or `tag:<key>` — and `--json` gives the document the dashboard draws.
+
+### How each component is spread, and which machines are weak where
+
+The other views read the fleet by its overall score. The **Components** tab
+asks the questions underneath it: how storage, or one particular subtest, is
+spread across the estate, and which machines are weak in which component.
+
+**A distribution of one measure.** Pick the overall score, a component, or a
+single subtest — the picker lists each component with its subtests, and how
+many machines in view have each — and the tab draws a histogram of the
+machines in view, with the median and the p10 and p90 marked. Choosing a bar
+lists the machines in it; with none chosen, the lowest and highest few are
+listed, so both ends are a click from their pages. A split by site, model,
+CPU, OS or any tag draws each group's p10-to-p90 range and median on the same
+axis, leaving out groups of fewer than four machines, as Groups does.
+
+What it will put on one axis is the point of it:
+
+- **One configuration at a time.** A number is only comparable with another
+  measured the same way — the same preset, profile, baseline and instruction
+  set, the rule [cohorts](#peers-first-then-history-then-the-baseline) follow
+  — so the distribution draws the configuration with the most machines, says
+  which, and offers the others with how many machines each.
+- **A score is a score, a subtest is its measurement.** The overall and a
+  component are drawn as the score against the baseline. A subtest is drawn
+  as its raw value in its own unit, as [Compare](#head-to-head-when-the-estate-view-isnt-the-question)
+  reads it: not every subtest is scored, and the raw figure is what was
+  measured. Within the configuration a subtest also has to be in the same
+  unit and the same statistic — a peak beside a median measures the
+  statistic, not the machine.
+- **Nothing left out silently.** Every machine in view is either drawn or
+  counted out with its reason: no such measurement in its latest run,
+  another configuration, another unit, another statistic.
+- **Direction is said, not assumed.** A score is higher-is-better. A subtest
+  says which way it runs where the runs recorded it; where they did not —
+  runs indexed before 0.5.3, until `scan --reindex` — the view says it cannot
+  tell which end is better rather than implying one. Network and GPU, and
+  informational subtests, are drawn and marked as never part of a grade.
+
+It describes the estate as measured: throttled, partial and on-battery runs
+are drawn like any other, and the findings say which to doubt. It does not
+rank machines across hardware — most of a raw spread across different CPUs
+is the CPUs — which is what the grid below is for.
+
+**Every machine against every component.** Below the distribution, a grid:
+one row per machine, one column per component the result grades — CPU, memory and disk in a
+current result. Each cell is the component **against the same
+component on identical machines**: the difference from the median of that
+component across the machines with the same CPU measured the same way,
+worked out across the whole index exactly as a cohort's median is. It is the
+per-component form of the comparison Groups headlines with, for the same
+reason: a raw disk score across different laptops mostly measures the
+laptops. The cells step at 5%, 15% and 25% either side of a neutral middle —
+within 5% is run-to-run noise, 15% is about where a cohort outlier is named,
+25% where it is critical — in the dashboard's validated blue and red, and
+every cell carries its figure as text. A machine whose cohort has fewer than
+`min_cohort` (four by default) measurements of a component has **no peers** there, and the cell says
+so and is left uncoloured rather than shown as average. A button switches to
+each component's grade and score against the reference baseline instead,
+which says how new the hardware is as much as how it is doing; grades are
+not coloured, as everywhere on the dashboard.
+
+A cell marked **weak** is the [weak component](#what-to-do-about-each-machine)
+finding — graded D or F and at least two grades below the machine's own —
+read from the same rule the finding is raised by, in either view, so a cell
+never looks fine on a machine carrying that finding. That rule reads no
+threshold, so no [override](#thresholds-and-different-lines-for-some-machines)
+moves it. A cell well below its peers without the mark is the other
+comparison: slower than the same part elsewhere, rather than weak against
+the rest of its own machine.
+
+The grid sorts by machine, by the overall standing or by any component, the
+weakest first, and a row opens the machine. It holds at most **200 rows**,
+after sorting, and says when there are more — "showing 200 of 1,340, filter
+to narrow" — so the filter row is how a large estate is read. The measure,
+configuration, split, chosen bin, sort and encoding are all in the URL, so a
+view can be linked.
+
+Both are projected through the filter and the sign-in scope like everything
+else, so every count, bin edge and "left out" figure is made of the machines
+in view; only the cohort medians behind the cells are drawn from the whole
+index, as they are everywhere. `report --distribution <measure>` and
+`report --heatmap` print the same at a prompt, and `--json` the documents
+the tab draws.
 
 ### What to do about each machine
 
@@ -1031,7 +1123,13 @@ returns exactly what the dashboard draws, so any view can be scripted or
 diffed; `GET /api/groups?by=<dimension>` is the Groups tab, taking the same
 filter parameters; `GET /api/changes?window=1|4|13` and
 `GET /api/timeline?weeks=4…26` are the overview's "What changed" and its
-charts, taking the same filter parameters too; and `GET /api/machine/{key}` is the drilldown payload.
+charts, taking the same filter parameters too;
+`GET /api/distribution?measure=overall|<component>|<component>/<subtest>&config=<key>&split=<dimension>`
+and `GET /api/heatmap?encoding=cohort|grade&sort=host|overall|<component>&dir=asc|desc`
+are the Components tab, taking the same filter parameters, an unknown
+measure, configuration, dimension, encoding or sort refused with a 400 that
+names what there is — judged against the caller's own view, so it names
+nothing they cannot see; and `GET /api/machine/{key}` is the drilldown payload.
 The snapshot carries the fleet-wide `thresholds` and the configured
 `threshold_overrides`, and each machine, there and in the drilldown, its
 `overridden_by`.

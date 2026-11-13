@@ -81,6 +81,7 @@ trade-off, not restate what the code already says.
 | `src/index.rs` | the SQLite index, ingest, the document archive, `backup`, `forget` |
 | `src/analytics.rs` | cohorts, the red-flag engine, the executive summary, the filter projection |
 | `src/analytics/timeline.rs` | the fleet over time, reconstructed from the runs already indexed, and what changed between two dates |
+| `src/analytics/components.rs` | the fleet by component: what may share an axis in a distribution of one measure, the per-component standing against the cohort, the one `component_weak` rule the heatmap marks, and the subtests cached beside the snapshot |
 | `src/analytics/thresholds.rs` | the lines each machine is judged against: which thresholds an override may set and why, and resolving a machine's own thresholds from `[thresholds]` and its overrides |
 | `src/web.rs` | the HTTP layer, the snapshot cache, authorization applied as part of the projection, the triage endpoints |
 | `src/state.rs` | the state file: acknowledgements, snoozes and suppressions, the one thing not derived from the folder; how they apply to a finding and when they lapse |
