@@ -5,7 +5,14 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
-## Unreleased
+## 0.11.0 - Fri, 13 Nov 2026
+
+**The fleet by component, and ways to take it with you.** A Components tab
+shows how any one measure is spread across the estate and which machines are
+weak where; the machines and the findings download as CSV; the Overview
+prints as a report; and any view can be given a name and opened again.
+Nothing to do on upgrade: no configuration changes, and the index and the
+state file are as they were.
 
 ### Added
 
