@@ -621,12 +621,7 @@ mod windows_impl {
             let index = crate::index::Index::open(&config.server.index)?
                 .with_archive(config.server.archive_dir.as_deref())?;
             let triage = crate::state::Store::open(&config.server.state_path())?;
-            let state = crate::web::AppState::new(
-                index,
-                triage,
-                config,
-                crate::analytics::Thresholds::default(),
-            )?;
+            let state = crate::web::AppState::new(index, triage, config)?;
             if config.server.collection_dir.is_some() {
                 crate::web::report_startup_scan(&state);
             }

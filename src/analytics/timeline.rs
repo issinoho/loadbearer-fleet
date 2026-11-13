@@ -21,7 +21,10 @@
 //! * **The past is judged by today's rules.** A threshold tuned or a rule added
 //!   today applies to every week of the series at once, so a line that moves
 //!   moved because the fleet did and not because the rules did. A recorded
-//!   series would have a step in it at every upgrade.
+//!   series would have a step in it at every upgrade. That includes the
+//!   per-machine overrides: an override picks a machine by the tags and models
+//!   of the run being judged, so a past week judges each machine by the lines
+//!   that pick it as it was then, at today's values.
 //!
 //! The honest caveats, each the same mechanism seen from another side:
 //!
@@ -73,7 +76,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
 use super::{
-    FlagKind, QueueCounts, Severity, Snapshot, Thresholds, grade_histogram, grade_rank, is_stale,
+    FlagKind, QueueCounts, Severity, Snapshot, Tuning, grade_histogram, grade_rank, is_stale,
     median, needs_attention, reconstruct, sorted_of,
 };
 
@@ -171,7 +174,7 @@ impl Interner {
 }
 
 impl Moment {
-    fn of(at: OffsetDateTime, snap: &Snapshot, th: &Thresholds, strings: &mut Interner) -> Self {
+    fn of(at: OffsetDateTime, snap: &Snapshot, strings: &mut Interner) -> Self {
         let mut flags: HashMap<&str, Vec<Held>> = HashMap::new();
         for f in &snap.flags {
             flags.entry(f.machine_key.as_str()).or_default().push(Held {
@@ -189,7 +192,7 @@ impl Moment {
                 hostname: m.hostname.as_deref().map(|h| strings.get(h)),
                 score: m.score,
                 grade: strings.get(&m.grade),
-                stale: is_stale(m, th),
+                stale: is_stale(m),
                 flags: flags.remove(m.key.as_str()).unwrap_or_default(),
             })
             .collect();
@@ -251,7 +254,7 @@ impl Timeline {
     /// point always agrees with the overview's headline.
     pub fn build(
         conn: &Connection,
-        th: &Thresholds,
+        th: &Tuning,
         current: &Snapshot,
         now: OffsetDateTime,
         weeks: usize,
@@ -263,10 +266,10 @@ impl Timeline {
         let mut strings = Interner::default();
         let mut points = Vec::with_capacity(weeks + 1);
         reconstruct(conn, th, &cutoffs, |at, snap| {
-            points.push(Moment::of(at, &snap, th, &mut strings));
+            points.push(Moment::of(at, &snap, &mut strings));
             Ok(())
         })?;
-        points.push(Moment::of(now, current, th, &mut strings));
+        points.push(Moment::of(now, current, &mut strings));
         Ok(Timeline { points })
     }
 

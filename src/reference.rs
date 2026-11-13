@@ -406,6 +406,25 @@ mod tests {
         // No `..Default::default()` anywhere below, on purpose: that is what
         // makes adding a config field a compile error here rather than a
         // silently unguarded setting.
+        fn every_threshold() -> crate::config::ThresholdValues {
+            crate::config::ThresholdValues {
+                min_cohort: Some(4),
+                cohort_z: Some(3.5),
+                cohort_min_shortfall: Some(0.1),
+                mad_floor_frac: Some(0.03),
+                regression_frac: Some(0.15),
+                stale_days: Some(90.0),
+                battery_health_pct: Some(70.0),
+                unstable_cpu_subtests: Some(2),
+                drive_wear_pct: Some(80.0),
+                drive_spare_pct: Some(20.0),
+                disk_free_pct: Some(10.0),
+                disk_free_critical_pct: Some(5.0),
+                firmware_behind_days: Some(90.0),
+                firmware_old_years: Some(4.0),
+                replace_age_years: Some(5.0),
+            }
+        }
         let everything = crate::config::Config {
             server: crate::config::Server {
                 bind: "127.0.0.1:8787".parse().expect("literal"),
@@ -453,6 +472,16 @@ mod tests {
                 critical: true,
                 digest: crate::config::DigestSchedule::Weekly,
                 digest_at: "08:00".into(),
+            },
+            thresholds: crate::config::ThresholdSettings {
+                values: every_threshold(),
+                overrides: vec![crate::config::ThresholdOverride {
+                    name: Some("lab machines".into()),
+                    tags: Some([("site".to_string(), "lab".to_string())].into()),
+                    system_model: Some("Dell Inc. OptiPlex 3000".into()),
+                    cpu_model: Some("Intel(R) Core(TM) i5-12500".into()),
+                    values: every_threshold(),
+                }],
             },
             log: crate::config::Log {
                 format: crate::config::LogFormat::Text,
