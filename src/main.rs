@@ -19,6 +19,7 @@ mod analytics;
 mod auth;
 mod compare;
 mod config;
+mod export;
 mod index;
 mod launch;
 mod metrics;
@@ -159,6 +160,22 @@ enum Command {
         /// at most 200 machines and says how many there were.
         #[arg(long, conflicts_with_all = ["by", "changes", "lifecycle", "distribution"])]
         heatmap: bool,
+        /// The machine table or every finding as CSV: `machines` or
+        /// `findings`. The same rows and columns as `/api/machines.csv` and
+        /// `/api/findings.csv`, without the byte-order mark the download
+        /// carries for Excel.
+        ///
+        /// Findings include informational and quieted ones, each with its
+        /// state, whatever `--all` says: a spreadsheet can filter a row out,
+        /// but not back in. A text cell starting `=`, `+`, `-` or `@` is
+        /// prefixed with `'` so a spreadsheet does not run it.
+        #[arg(
+            long,
+            value_name = "TABLE",
+            value_parser = parse_table,
+            conflicts_with_all = ["json", "by", "changes", "lifecycle", "distribution", "heatmap"]
+        )]
+        csv: Option<export::Table>,
     },
     /// Serve the web dashboard.
     Serve {
@@ -751,6 +768,7 @@ fn main() -> Result<()> {
             lifecycle,
             distribution,
             heatmap,
+            csv,
         } => {
             let idx = index::Index::open_existing(&config.server.index)?;
             // From the config, exactly as the server builds it, so a report
@@ -772,6 +790,12 @@ fn main() -> Result<()> {
                 None => state::Book::default(),
             };
             let snap = snap.filtered_with(&analytics::Filter::default(), &book, now);
+            if let Some(table) = csv {
+                // `print!`, not `println!`: the rows end CRLF already, and an
+                // extra line end would be an empty last row.
+                print!("{}", table.render(&snap));
+                return Ok(());
+            }
             if let Some(measure) = distribution {
                 let measures = analytics::Measures::load(idx.conn(), &snap)?;
                 let d = analytics::distribution(&snap, &measures, measure, None, None)
@@ -1431,6 +1455,10 @@ fn parse_group_by(s: &str) -> Result<analytics::GroupBy, String> {
 }
 
 fn parse_measure(s: &str) -> Result<analytics::Measure, String> {
+    s.parse()
+}
+
+fn parse_table(s: &str) -> Result<export::Table, String> {
     s.parse()
 }
 

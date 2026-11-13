@@ -1272,6 +1272,9 @@ pub struct Me {
     may_triage: bool,
     /// Create and remove suppression rules.
     may_suppress: bool,
+    /// `[server] public_url`, so a printed report can say where it came from.
+    /// Nothing secret: it is the address every sign-in redirects back to.
+    public_url: String,
 }
 
 pub async fn me(State(app): State<Arc<AppState>>, Caller(principal): Caller) -> axum::Json<Me> {
@@ -1281,6 +1284,7 @@ pub async fn me(State(app): State<Arc<AppState>>, Caller(principal): Caller) -> 
         may_triage: principal.may_triage(),
         may_suppress: principal.may_suppress(),
         sign_in_enabled: app.auth().enabled(),
+        public_url: app.public_url().to_string(),
         principal,
     })
 }

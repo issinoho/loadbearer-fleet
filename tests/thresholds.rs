@@ -6,7 +6,8 @@
 //! one and forgotten in the other would make the command line and the
 //! dashboard disagree about the same machine without any error. So this runs
 //! the real binary both ways over one index and one config, and compares what
-//! each says.
+//! each says — the snapshot, and the CSV tables `report --csv` prints and the
+//! dashboard downloads.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -197,6 +198,65 @@ fn report_and_the_server_judge_the_fleet_by_the_same_lines() {
         );
     }
 
+    // The CSV through both doors is the same file, the download's
+    // byte-order mark aside — row for row, cell for cell, but for the figures
+    // that move with the clock between the two reads: a machine's age in
+    // days, and a staleness finding's wording of it.
+    for table in ["machines", "findings"] {
+        let printed = run(&["--config", config, "report", "--csv", table]);
+        let served = get(port, &format!("/api/{table}.csv")).expect("the download");
+        let served = served
+            .strip_prefix('\u{feff}')
+            .expect("the download carries a BOM");
+        let (printed, served) = (rows_of(&printed), rows_of(served));
+        assert_eq!(printed[0], served[0], "{table}: the same columns");
+        assert_eq!(printed.len(), served.len(), "{table}: the same rows");
+        assert!(printed.len() > 1, "{table}: agreeing about nothing");
+        let head = &printed[0];
+        let col = |name: &str| head.iter().position(|c| c == name);
+        let moving: Vec<usize> = ["age_days", "headline", "detail"]
+            .iter()
+            .filter_map(|c| col(c))
+            .collect();
+        let code = col("code");
+        for (p, s) in printed.iter().zip(&served).skip(1) {
+            for (i, (a, b)) in p.iter().zip(s).enumerate() {
+                let clocked = moving.contains(&i)
+                    && (head[i] == "age_days" || code.is_some_and(|c| p[c] == "stale"));
+                if !clocked {
+                    assert_eq!(a, b, "{table}: {} differs", head[i]);
+                }
+            }
+        }
+    }
+
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CSV rows, read as RFC 4180 writes them: quoted fields may hold commas,
+/// quotes doubled, and line breaks; rows end CRLF.
+fn rows_of(csv: &str) -> Vec<Vec<String>> {
+    let (mut rows, mut row, mut field) = (Vec::new(), Vec::new(), String::new());
+    let mut quoted = false;
+    let mut chars = csv.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quoted, c) {
+            (true, '"') if chars.peek() == Some(&'"') => {
+                chars.next();
+                field.push('"');
+            }
+            (true, '"') => quoted = false,
+            (true, c) => field.push(c),
+            (false, '"') => quoted = true,
+            (false, ',') => row.push(std::mem::take(&mut field)),
+            (false, '\r') => {
+                assert_eq!(chars.next(), Some('\n'), "CR without LF");
+                row.push(std::mem::take(&mut field));
+                rows.push(std::mem::take(&mut row));
+            }
+            (false, c) => field.push(c),
+        }
+    }
+    rows
 }

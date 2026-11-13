@@ -122,6 +122,62 @@ fn report_by_writes_the_groups_to_stdout() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `report --csv` writes the table and nothing else: no byte-order mark (that
+/// is the download's, for Excel), no log line, a header first and every row
+/// CRLF-terminated whatever platform this runs on — so the bytes are the same
+/// on Windows and Linux, and the file the same as one the server would send.
+/// An unknown table is refused on stderr; `--csv` with `--json` is refused
+/// rather than one of them silently winning.
+#[test]
+fn report_csv_writes_only_the_table_to_stdout() {
+    let dir = scratch("report-csv");
+    let index = dir.join("i.db");
+    let index = index.to_str().expect("path");
+    stdout_of(&["--index", index, "scan", fixtures().to_str().expect("path")]);
+
+    let machines = stdout_of(&["--index", index, "report", "--csv", "machines"]);
+    assert!(
+        machines.starts_with("hostname,machine_key,"),
+        "stdout should open with the header, got:\n{}",
+        &machines[..machines.len().min(200)]
+    );
+    assert!(!machines.starts_with('\u{feff}'), "no BOM on stdout");
+    assert!(
+        !machines.contains('\u{1b}'),
+        "stdout carried ANSI escape codes"
+    );
+    assert!(machines.ends_with("\r\n"));
+    // Every line end is CRLF, and there is no line that is not a row.
+    let lines: Vec<&str> = machines.split_terminator("\r\n").collect();
+    assert!(lines.iter().all(|l| !l.contains('\n')), "a bare LF");
+    assert_eq!(lines.len(), 1 + 4, "a header and the four fixtures");
+    assert!(lines[0].ends_with(",tag:ring,tag:site"), "{}", lines[0]);
+
+    let findings = stdout_of(&["--index", index, "report", "--csv", "findings"]);
+    assert!(findings.starts_with("severity,queue,code,"), "{findings}");
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout_of(&["--index", index, "report", "--json"])).expect("JSON");
+    assert_eq!(
+        findings.split_terminator("\r\n").count(),
+        1 + report["flags"].as_array().expect("flags").len(),
+        "every finding, informational ones included, without --all"
+    );
+
+    for args in [
+        &["--index", index, "report", "--csv", "heatmap"][..],
+        &["--index", index, "report", "--csv", "machines", "--json"][..],
+    ] {
+        let refused = Command::new(EXE)
+            .args(args)
+            .output()
+            .expect("run the binary");
+        assert!(!refused.status.success(), "{args:?} must fail");
+        assert!(refused.stdout.is_empty(), "and print nothing to stdout");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `report --distribution` and `report --heatmap` print a summary, and with
 /// `--json` the documents `/api/distribution` and `/api/heatmap` send. A
 /// measure no machine has is refused, on stderr, with what there is.

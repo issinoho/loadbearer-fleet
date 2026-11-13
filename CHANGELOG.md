@@ -19,6 +19,22 @@ notes, so each one has to stand on its own.
   its grade), the weak components marked, sortable, at most 200 rows.
   `GET /api/distribution`, `GET /api/heatmap`, `report --distribution` and
   `report --heatmap`.
+- **CSV** of the machine table and of the findings: **Download CSV** on the
+  Machines tab and the findings queue, `GET /api/machines.csv`,
+  `GET /api/findings.csv` and `report --csv machines|findings`. The view on
+  screen — the same filter and sign-in scope — with more columns than the
+  table shows and one per tag key; every finding, informational and quieted
+  ones included with their state. Fixed columns, plain numbers, RFC 3339 UTC
+  times, RFC 4180 quoting with CRLF, a byte-order mark on the download for
+  Excel, and a `'` in front of any text cell a spreadsheet would run as a
+  formula.
+- **A printable report**: **Print report** on the overview opens the machines
+  in view as a document — the headline, what changed in four weeks, the live
+  critical and warning findings, what to replace, repair or investigate and
+  why, groups if one is chosen, and the charts over time — for the browser's
+  Print or Save as PDF. Lists stop at 50 rows and say how many more. Printing
+  any tab now drops the header, the filters and the buttons, in the light
+  theme. `/api/me` gains `public_url`, which the report names as its source.
 
 ## 0.10.0 - Fri, 13 Nov 2026
 

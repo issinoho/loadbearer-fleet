@@ -66,8 +66,10 @@ All of it must pass. Some notes on why it's shaped like that:
 - **`node scripts/check-mobile.mjs`** does the half of that a DOM shim cannot:
   it starts the binary, lays the real page out in headless Chrome at 390, 320,
   768 and 1440 pixels wide, and fails if anything scrolls sideways, is painted
-  past the right edge, clips instead of scrolling, or is too small to tap. It
-  skips itself with a message where there is no browser to drive.
+  past the right edge, clips instead of scrolling, or is too small to tap —
+  then once more under print media at the width of an A4 page, where the
+  chrome must be gone and the report must fit. It skips itself with a message
+  where there is no browser to drive.
 
 Match the style of the surrounding code — comment density, naming, idiom.
 Comments should explain *why*, especially for a platform quirk or a deliberate
@@ -89,6 +91,7 @@ trade-off, not restate what the code already says.
 | `src/config.rs` | the config file, and the validation that refuses placeholders |
 | `src/service.rs` | Windows service integration, and the systemd unit generator |
 | `src/metrics.rs` | the Prometheus exposition |
+| `src/export.rs` | the machine and findings tables as CSV, from a snapshot already projected for its reader: the columns, RFC 4180 quoting, and the prefix that keeps a cell from running as a spreadsheet formula |
 | `src/notify.rs` | the `[notify]` webhook: which findings are news after a rebuild, the payloads, the digest schedule, signing, and delivery off the scan path |
 | `src/reference.rs` | builds the command-line and configuration reference from the clap definition and `Config::starter()` — see below |
 | `build.rs` | stamps the commit into the binary, so `--version`, the log, the snapshot, `build_info` and the dashboard footer can all name the build |

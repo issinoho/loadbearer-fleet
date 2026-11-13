@@ -58,6 +58,19 @@ It:
   counts as needing attention — the rules, the lifecycle verdict and the
   history are untouched — so the worst a misused grant does here is hide a
   finding from the queue, visibly and attributably;
+- **puts the estate in a file when asked.** `GET /api/machines.csv` and
+  `GET /api/findings.csv` are projected for the caller exactly as
+  `/api/snapshot` is — the same session check, the same tag scope, the same
+  filter — so a scoped caller's file holds their machines and findings and
+  nothing else, and a tag column is only made for a key one of their machines
+  carries. Every text cell that starts with `=`, `+`, `-`, `@`, a tab or a
+  carriage return is prefixed with `'`, following OWASP's advice on CSV
+  injection, because hostnames, tag values, notes and finding text come from
+  machines in the field and from people, and a file opened in Excel or Sheets
+  would otherwise run them as formulas. Numeric columns are written as numbers
+  and never prefixed. The responses carry `Cache-Control: no-store`. A saved
+  file is outside this tool's control from then on: treat it as the inventory
+  it is;
 - **accepts submitted results only through one route.** `POST /api/upload`,
   from a signed-in `contributor` or an ingest token. Five things are checked
   before a byte is kept, and the first two — who the caller is, and whether
@@ -214,6 +227,11 @@ been audited":
   not exist, that a non-JSON body is refused, that only an admin may create or
   remove a suppression, and that a scoped caller is not shown rules about
   machines outside their scope.
+  On the CSV downloads: that a scoped caller's file holds only their machines
+  and findings, that the filter cannot widen it, that an anonymous caller gets
+  no file, and that a hostname, tag value or note beginning with a formula
+  character is prefixed while a number is not — the last watched failing with
+  the prefix removed before being kept.
   On the write path: that uploading is refused with no `upload_dir`, for the
   wrong role, for the wrong content type and for a document outside the
   caller's scope; that an unknown ingest token is refused *without* falling
