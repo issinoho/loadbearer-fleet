@@ -961,7 +961,15 @@ a.btn { text-decoration: none; }
   thead { display: table-header-group; }
   table.data th { position: static; }
   .table-wrap { overflow: visible; }
-  table.data th, table.data td { white-space: normal; padding: 4px 6px; }
+  /* Paper cannot scroll sideways, and how wide a column of text comes out
+     depends on the fonts the machine printing it has: a table that fits
+     with one set ran 40px past the page with another. So a cell may break
+     anywhere it has to, and the table is never wider than the page. */
+  table.data { width: 100%; max-width: 100%; }
+  /* On screen the report keeps a hostname on one line; on paper fitting the
+     page comes first, so it may wrap at its hyphen when the table is tight. */
+  .report table.data th:first-child, .report table.data td:first-child { white-space: normal; overflow-wrap: normal; }
+  table.data th, table.data td { white-space: normal; overflow-wrap: anywhere; padding: 4px 6px; }
   table.data td.wrap { min-width: 0; }
 
   /* Drawn at the screen's width; scaled to the page's, text and all. */
