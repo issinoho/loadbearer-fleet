@@ -6372,7 +6372,9 @@ mod tests {
     /// listed and never raised is a suppression that silently does nothing.
     #[test]
     fn every_code_evaluate_can_raise_is_in_rules_and_nothing_else_is() {
-        let src = include_str!("analytics.rs");
+        // A Windows checkout may have CRLF line endings, and the markers
+        // below are written with LF.
+        let src = include_str!("analytics.rs").replace("\r\n", "\n");
         let start = src
             .find("\nfn evaluate(")
             .expect("evaluate is in this file");
