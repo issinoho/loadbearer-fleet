@@ -44,7 +44,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-use crate::schema::ResultFile;
+use crate::schema::{Collected, ResultFile};
 
 /// Bumped when the derived tables change shape. A mismatch rebuilds from the
 /// folder rather than migrating — see `set_aside` for what happens to the old
@@ -213,7 +213,7 @@ fn present(s: Option<&str>) -> Option<&str> {
 /// Rows written before the column existed keep `NULL`, which is the honest
 /// answer — see `scan --reindex` for filling them in from the documents.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    const ADDED: [(&str, &str, &str); 31] = [
+    const ADDED: [(&str, &str, &str); 41] = [
         ("subtest", "label", "TEXT"),
         ("subtest", "direction", "TEXT"),
         // Component ids are short and lower-case — `cpu`, `memory` — so a
@@ -272,6 +272,28 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         // older CLI — which is unknown, not "no slots".
         ("run", "memory_slots", "INTEGER"),
         ("run", "memory_populated", "INTEGER"),
+        // What `--collect` asked for (`run.collect`), as sorted, comma-joined
+        // names — `elevation,security,uptime` — or NULL for nothing asked,
+        // which every older run is. It is what tells the columns after it
+        // apart: NULL in one of them is "not asked" when its category is
+        // missing here, and "asked, could not be read" when it is listed.
+        ("run", "run_collect", "TEXT"),
+        // `run.elevated`, 1 / 0 / NULL. Never written as 0 for "unknown".
+        ("run", "run_elevated", "INTEGER"),
+        // `machine.boot`, as of the run: when the machine last booted and
+        // how long it had been up then. Not a live uptime.
+        ("run", "booted_at", "TEXT"),
+        ("run", "uptime_secs", "INTEGER"),
+        // `machine.security`. Secure Boot and TPM presence are tri-state
+        // integers, the vocabularies text as the document has them.
+        ("run", "firmware_mode", "TEXT"),
+        ("run", "secure_boot", "INTEGER"),
+        ("run", "tpm_present", "INTEGER"),
+        ("run", "tpm_version", "TEXT"),
+        // `disk_encryption.system_volume` and `.method`: Linux only, the root
+        // filesystem only, dm-crypt only. `none_detected` is not "unencrypted".
+        ("run", "disk_encryption", "TEXT"),
+        ("run", "disk_encryption_method", "TEXT"),
     ];
 
     for (table, column, decl) in ADDED {
@@ -944,6 +966,29 @@ impl Index {
         let run = doc.run.clone().unwrap_or_default();
         let os = doc.machine.os_detail.clone().unwrap_or_default();
         let memory = doc.machine.memory.clone().unwrap_or_default();
+        // The opt-in facts, each recorded only when its category is in
+        // `run.collect`. No CLI writes a block it was not asked for, so one
+        // without its name is a document something else made; recording it
+        // would put a value where the index promises "not asked", and every
+        // view downstream reads the three states from these columns alone.
+        let asked = Collected::of(&run.collect);
+        let boot = doc
+            .machine
+            .boot
+            .clone()
+            .filter(|_| asked.has("uptime"))
+            .unwrap_or_default();
+        let security = doc
+            .machine
+            .security
+            .clone()
+            .filter(|_| asked.has("security"))
+            .unwrap_or_default();
+        let tpm = security.tpm.clone().unwrap_or_default();
+        let disk = security.disk_encryption.clone().unwrap_or_default();
+        // The fixed vocabularies, lower-cased so a filter matches however a
+        // future CLI capitalises them; a value never heard of is kept.
+        let word = |s: Option<&str>| present(s).map(str::to_lowercase);
         let tx = self.conn.transaction()?;
 
         tx.execute(
@@ -958,11 +1003,13 @@ impl Index {
                  power_held_back, bios_version, bios_date, disk_low_mount,
                  disk_low_free_pct, disk_low_free_bytes, run_uuid, run_started_at,
                  run_duration_secs, os_distro, os_version, os_build, os_edition,
-                 memory_slots, memory_populated, ingested_at
+                 memory_slots, memory_populated, run_collect, run_elevated, booted_at,
+                 uptime_secs, firmware_mode, secure_boot, tpm_present, tpm_version,
+                 disk_encryption, disk_encryption_method, ingested_at
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
                        ?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,
                        ?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,
-                       ?51,?52, datetime('now'))",
+                       ?51,?52,?53,?54,?55,?56,?57,?58,?59,?60,?61,?62, datetime('now'))",
             params![
                 key.value,
                 key.kind.as_str(),
@@ -1017,6 +1064,16 @@ impl Index {
                 present(os.edition.as_deref()),
                 memory.slots,
                 memory.populated,
+                asked.text(),
+                run.elevated.filter(|_| asked.has("elevation")),
+                present(boot.booted_at.as_deref()),
+                boot.uptime_secs.map(saturating),
+                word(security.firmware_mode.as_deref()),
+                security.secure_boot,
+                tpm.present,
+                present(tpm.version.as_deref()),
+                word(disk.system_volume.as_deref()),
+                word(disk.method.as_deref()),
             ],
         )?;
         let run_id = tx.last_insert_rowid();
@@ -1651,11 +1708,148 @@ mod tests {
     }
 
     /// `with_drives`, plus the run, OS-detail and memory blocks of a
-    /// loadbearer release after 1.8.1, Windows-shaped.
+    /// loadbearer release after 1.8.1, Windows-shaped, and the opt-in blocks
+    /// of a run made with `--collect uptime,elevation,security`.
     fn with_everything() -> String {
         let mut doc: serde_json::Value = serde_json::from_str(&with_drives()).unwrap();
         crate::schema::samples::windows(&mut doc);
+        crate::schema::samples::optin_windows(&mut doc);
         doc.to_string()
+    }
+
+    /// The opt-in columns of the one run in an index, in `ADDED`'s order.
+    type OptIn = (
+        Option<String>,
+        Option<bool>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<bool>,
+        Option<bool>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    fn opt_in_row(conn: &Connection, run_id: i64) -> OptIn {
+        conn.query_row(
+            "SELECT run_collect, run_elevated, booted_at, uptime_secs, firmware_mode,
+                    secure_boot, tpm_present, tpm_version, disk_encryption,
+                    disk_encryption_method FROM run WHERE id = ?1",
+            [run_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    /// Each shape the CLI writes, indexed as it says: what was asked, and
+    /// NULL for what was not read — never 0 or "none" for either.
+    #[test]
+    fn the_opt_in_facts_are_indexed_in_their_three_states() {
+        use crate::schema::samples;
+        let index_one = |enrich: fn(&mut serde_json::Value)| -> OptIn {
+            let mut idx = Index::open_in_memory().unwrap();
+            let mut doc = samples::fixture("linux-throttled.json");
+            enrich(&mut doc);
+            idx.ingest_text(&doc.to_string(), Path::new("x.json"))
+                .unwrap();
+            let id: i64 = idx
+                .conn
+                .query_row("SELECT id FROM run", [], |r| r.get(0))
+                .unwrap();
+            opt_in_row(&idx.conn, id)
+        };
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            index_one(samples::optin_windows),
+            (
+                s("elevation,security,uptime"),
+                Some(false),
+                s("2026-09-09T10:41:28Z"),
+                Some(14492),
+                s("uefi"),
+                Some(true),
+                Some(true),
+                s("2.0"),
+                None,
+                None
+            )
+        );
+        assert_eq!(
+            index_one(samples::optin_linux_luks),
+            (
+                s("elevation,security,uptime"),
+                Some(true),
+                s("2026-09-06T08:00:00Z"),
+                Some(266400),
+                s("uefi"),
+                Some(false),
+                Some(true),
+                s("2.0"),
+                s("encrypted"),
+                s("luks2")
+            )
+        );
+        assert_eq!(
+            index_one(samples::optin_linux_none_detected),
+            (
+                s("security"),
+                None,
+                None,
+                None,
+                s("uefi"),
+                Some(true),
+                Some(false),
+                None,
+                s("none_detected"),
+                None
+            )
+        );
+        let bios = index_one(samples::optin_legacy_bios);
+        assert_eq!((bios.4.as_deref(), bios.5), (Some("bios"), None));
+        assert_eq!(
+            index_one(samples::optin_unreadable),
+            (
+                s("elevation,security,uptime"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+        );
+        // Unknown values carried, lower-cased where they are a vocabulary.
+        let future = index_one(samples::optin_future);
+        assert_eq!(future.0.as_deref(), Some("network,security"));
+        assert_eq!(
+            (
+                future.4.as_deref(),
+                future.7.as_deref(),
+                future.8.as_deref()
+            ),
+            (Some("coreboot"), Some("3.0"), Some("partial"))
+        );
+        // Not asked: an older run, and blocks no `run.collect` names.
+        let none: OptIn = Default::default();
+        assert_eq!(index_one(|_| {}), none);
+        assert_eq!(index_one(samples::optin_blocks_without_collect), none);
     }
 
     fn module_rows(conn: &Connection) -> i64 {
@@ -1826,7 +2020,9 @@ mod tests {
     ///
     /// Two generations at once: what 0.9.0 lacked (the drive table, the
     /// firmware and free-space columns) and what 0.11.0 lacked (the
-    /// memory-module table, the run and OS-detail columns, the memory counts).
+    /// memory-module table, the run and OS-detail columns, the memory counts)
+    /// — and, a third, what 0.11.0 and the release after it lacked: the
+    /// `--collect` columns.
     #[test]
     fn an_older_index_gains_the_drive_and_memory_tables_and_their_columns() {
         let dir = scratch("migrate-drives");
@@ -1858,7 +2054,18 @@ mod tests {
                      ALTER TABLE run DROP COLUMN os_build;
                      ALTER TABLE run DROP COLUMN os_edition;
                      ALTER TABLE run DROP COLUMN memory_slots;
-                     ALTER TABLE run DROP COLUMN memory_populated;",
+                     ALTER TABLE run DROP COLUMN memory_populated;
+
+                     ALTER TABLE run DROP COLUMN run_collect;
+                     ALTER TABLE run DROP COLUMN run_elevated;
+                     ALTER TABLE run DROP COLUMN booted_at;
+                     ALTER TABLE run DROP COLUMN uptime_secs;
+                     ALTER TABLE run DROP COLUMN firmware_mode;
+                     ALTER TABLE run DROP COLUMN secure_boot;
+                     ALTER TABLE run DROP COLUMN tpm_present;
+                     ALTER TABLE run DROP COLUMN tpm_version;
+                     ALTER TABLE run DROP COLUMN disk_encryption;
+                     ALTER TABLE run DROP COLUMN disk_encryption_method;",
                 )
                 .unwrap();
         }
@@ -1878,6 +2085,12 @@ mod tests {
         assert_eq!(drive_rows(&idx.conn), 0, "the table is back, and empty");
         assert_eq!(module_rows(&idx.conn), 0, "this one too");
         assert_eq!(later(&idx), (None, None, None, None));
+        let none: OptIn = Default::default();
+        assert_eq!(
+            opt_in_row(&idx.conn, 1),
+            none,
+            "not asked, as far as it knows"
+        );
         // And the views read an index in that state without stumbling.
         let snap = crate::analytics::snapshot(
             &idx.conn,
@@ -1886,11 +2099,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snap.machines[0].memory_slots, None);
+        assert!(snap.machines[0].run_collect.is_empty());
+        assert_eq!(snap.machines[0].secure_boot, None);
 
         idx.scan(&collection).unwrap();
         assert_eq!(drive_rows(&idx.conn), 0, "a plain rescan cannot fill it");
         assert_eq!(module_rows(&idx.conn), 0);
         assert_eq!(later(&idx), (None, None, None, None));
+        assert_eq!(opt_in_row(&idx.conn, 1), none);
 
         idx.rescan_all(&collection).unwrap();
         assert_eq!(drive_rows(&idx.conn), 2);
@@ -1905,19 +2121,30 @@ mod tests {
             )
         );
         assert_eq!(idx.run_count().unwrap(), 1, "and not duplicated");
+        let id: i64 = idx
+            .conn
+            .query_row("SELECT id FROM run", [], |r| r.get(0))
+            .unwrap();
+        let filled = opt_in_row(&idx.conn, id);
+        assert_eq!(filled.0.as_deref(), Some("elevation,security,uptime"));
+        assert_eq!(
+            (filled.1, filled.5, filled.8),
+            (Some(false), Some(true), None)
+        );
 
         drop(idx);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn forgetting_a_machine_takes_its_drive_and_memory_rows() {
+    fn forgetting_a_machine_takes_its_drive_and_memory_rows_and_its_posture() {
         let mut idx = Index::open_in_memory().unwrap();
         idx.ingest_text(&with_everything(), Path::new("x.json"))
             .unwrap();
         // Another machine with modules of its own, which must stay.
         let mut other = crate::schema::samples::fixture("low-end.json");
         crate::schema::samples::linux_root(&mut other);
+        crate::schema::samples::optin_linux_luks(&mut other);
         idx.ingest_text(&other.to_string(), Path::new("y.json"))
             .unwrap();
         assert_eq!(drive_rows(&idx.conn), 2);
@@ -1934,6 +2161,17 @@ mod tests {
             "only the other machine's module is left"
         );
         assert_eq!(idx.run_count().unwrap(), 1);
+        // Its posture went with its runs — the columns are on `run` — and
+        // the other machine's stays.
+        let left: Vec<(String, Option<bool>)> = idx
+            .conn
+            .prepare("SELECT hostname, secure_boot FROM run WHERE run_collect IS NOT NULL")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(left, [("FLEET-LNX-02".to_string(), Some(false))]);
     }
 
     /// A scan only ever adds, so removing a machine has to be asked for. This

@@ -19,6 +19,12 @@
 //!   no identity block at all. The same goes for `run`, `machine.os_detail` and
 //!   `machine.memory`, and for every field inside them: absent is unknown,
 //!   never zero, false or "none".
+//! * **Opt-in facts have three states.** `machine.boot`, `machine.security`
+//!   and `run.elevated` are written only when the run was asked for them with
+//!   `--collect`, and `run.collect` records what was asked. A category not in
+//!   that list was *not asked* — every run from an older loadbearer included —
+//!   which says nothing about the machine; one in it whose field is absent was
+//!   *asked and could not be read*. Neither is ever "off" or "no".
 //! * **Open enumerations stay `String`.** `grade`, `confidence` and
 //!   `representative` are parsed as text rather than enums so that a value this
 //!   build has never heard of degrades to "unrecognised" instead of failing the
@@ -90,6 +96,111 @@ pub struct RunInfo {
     /// `--jitter` wait, the link probe and the soak are not in it.
     #[serde(default)]
     pub duration_secs: Option<f64>,
+    /// The opt-in categories this run was asked to collect (`--collect`):
+    /// `uptime`, `elevation`, `security`. Omitted when none was, and absent
+    /// on every run from an older loadbearer. Kept as text, like any open
+    /// vocabulary, so a category this build has never heard of is carried
+    /// rather than refused. A category missing from here was **not asked**;
+    /// one listed whose block or field is absent was asked and **could not
+    /// be read** — see `Collected`.
+    #[serde(default)]
+    pub collect: Vec<String>,
+    /// Whether this run had administrator / root rights. Only with
+    /// `elevation` asked, and absent when the query failed — never a
+    /// guessed `false`.
+    #[serde(default)]
+    pub elevated: Option<bool>,
+}
+
+/// What a run was asked to collect, from `run.collect`, normalised: trimmed,
+/// lower-cased, de-duplicated and sorted, so the index's text form of it is
+/// the same for the same set however the document ordered or spelled it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Collected(Vec<String>);
+
+impl Collected {
+    pub fn of(names: &[String]) -> Self {
+        let mut v: Vec<String> = names
+            .iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        v.sort();
+        v.dedup();
+        Collected(v)
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.0.iter().any(|n| n == name)
+    }
+
+    /// `elevation,security,uptime`, or `None` when nothing was asked — which
+    /// is also what every run from an older loadbearer reads as.
+    pub fn text(&self) -> Option<String> {
+        (!self.0.is_empty()).then(|| self.0.join(","))
+    }
+}
+
+/// `machine.boot`, only with `--collect uptime`: when the machine last
+/// booted and how long it had been up **when the inventory was taken** —
+/// a fact as of the run, never a live uptime. On Windows with Fast Startup
+/// (the default) a shutdown does not restart the kernel, so this is the time
+/// since the last *restart*.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Boot {
+    /// RFC 3339 UTC, to the second.
+    #[serde(default)]
+    pub booted_at: Option<String>,
+    #[serde(default)]
+    pub uptime_secs: Option<u64>,
+}
+
+/// `machine.security`, only with `--collect security`. Every part is absent
+/// where the CLI could not read it, and the fixed vocabularies stay text so
+/// that a value this build has never heard of is carried, not refused.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Security {
+    /// `"uefi"` or `"bios"` (not booted through UEFI: legacy BIOS/CSM, or a VM
+    /// started straight into its kernel).
+    #[serde(default)]
+    pub firmware_mode: Option<String>,
+    /// Whether Secure Boot is enforcing. Absent on a machine that did not boot
+    /// through UEFI — there is no Secure Boot there to be off — as well as
+    /// where it could not be read.
+    #[serde(default)]
+    pub secure_boot: Option<bool>,
+    #[serde(default)]
+    pub tpm: Option<Tpm>,
+    /// **Linux only**, and only the root filesystem. Never present on
+    /// Windows, where BitLocker cannot be read within the CLI's privacy
+    /// promises.
+    #[serde(default)]
+    pub disk_encryption: Option<DiskEncryption>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Tpm {
+    /// Whether the OS exposes a TPM. `false` covers none fitted, one off in
+    /// firmware and (Linux) no driver for it. Required in the CLI's own type;
+    /// optional here, like everything else this reads.
+    #[serde(default)]
+    pub present: Option<bool>,
+    /// `"2.0"` or `"1.2"`; absent when the OS does not say.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DiskEncryption {
+    /// `"encrypted"`: the root filesystem sits on a dm-crypt mapping.
+    /// `"none_detected"`: no dm-crypt under `/` — which is **not**
+    /// "unencrypted": ZFS native encryption, fscrypt, eCryptfs and
+    /// self-encrypting drives are not looked for.
+    #[serde(default)]
+    pub system_volume: Option<String>,
+    /// With `"encrypted"`, the cryptsetup type: `luks1`, `luks2`, `plain`, …
+    #[serde(default)]
+    pub method: Option<String>,
 }
 
 /// `machine.os_detail`: the OS release in parts, beside the free-text `os`
@@ -192,6 +303,15 @@ pub struct Machine {
     /// as root on Linux.
     #[serde(default)]
     pub memory: Option<Memory>,
+    /// When the machine last booted. Only with `--collect uptime` (a
+    /// loadbearer release after 1.8.1); `run.collect` says whether it was
+    /// asked for.
+    #[serde(default)]
+    pub boot: Option<Boot>,
+    /// Firmware mode, Secure Boot, TPM and (Linux) disk encryption. Only with
+    /// `--collect security`.
+    #[serde(default)]
+    pub security: Option<Security>,
 }
 
 /// The power settings a run had. Windows records a power mode for plugged in
@@ -798,6 +918,87 @@ pub(crate) mod samples {
         d["run"] = json!({ "id": "5b1d7e0c-3a2f-4e8b-9c6d-1e2f3a4b5c6d", "duration_secs": 61.0 });
         d["machine"]["os_detail"] = json!({ "distro": "debian", "version": "13" });
     }
+
+    /// The opt-in blocks (`--collect`, a loadbearer release after 1.8.1), each
+    /// added to whatever `run` block the document already has.
+    fn asked(d: &mut Value, names: &[&str]) {
+        d["run"]["collect"] = json!(names);
+    }
+
+    /// Windows, all three asked: up four hours, not elevated, UEFI with Secure
+    /// Boot on and a TPM 2.0 — and no `disk_encryption`, which the CLI never
+    /// writes on Windows.
+    pub(crate) fn optin_windows(d: &mut Value) {
+        asked(d, &["uptime", "elevation", "security"]);
+        d["run"]["elevated"] = json!(false);
+        d["machine"]["boot"] = json!({ "booted_at": "2026-09-09T10:41:28Z", "uptime_secs": 14492 });
+        d["machine"]["security"] = json!({
+            "firmware_mode": "uefi", "secure_boot": true,
+            "tpm": { "present": true, "version": "2.0" }
+        });
+    }
+
+    /// Linux as root, all three asked: Secure Boot off, a TPM 2.0, and the root
+    /// filesystem on LUKS2. Up three days.
+    pub(crate) fn optin_linux_luks(d: &mut Value) {
+        asked(d, &["uptime", "elevation", "security"]);
+        d["run"]["elevated"] = json!(true);
+        d["machine"]["boot"] =
+            json!({ "booted_at": "2026-09-06T08:00:00Z", "uptime_secs": 266400 });
+        d["machine"]["security"] = json!({
+            "firmware_mode": "uefi", "secure_boot": false,
+            "tpm": { "present": true, "version": "2.0" },
+            "disk_encryption": { "system_volume": "encrypted", "method": "luks2" }
+        });
+    }
+
+    /// Linux, only `security` asked: Secure Boot on, no TPM exposed, and no
+    /// dm-crypt under `/` — which is not "unencrypted".
+    pub(crate) fn optin_linux_none_detected(d: &mut Value) {
+        asked(d, &["security"]);
+        d["machine"]["security"] = json!({
+            "firmware_mode": "uefi", "secure_boot": true,
+            "tpm": { "present": false },
+            "disk_encryption": { "system_volume": "none_detected" }
+        });
+    }
+
+    /// A legacy-BIOS boot: no `secure_boot` at all, because there is none to
+    /// be on or off; a TPM 1.2. Uptime asked too.
+    pub(crate) fn optin_legacy_bios(d: &mut Value) {
+        asked(d, &["security", "uptime"]);
+        d["machine"]["boot"] =
+            json!({ "booted_at": "2026-08-30T07:15:00Z", "uptime_secs": 958_000 });
+        d["machine"]["security"] = json!({
+            "firmware_mode": "bios",
+            "tpm": { "present": true, "version": "1.2" },
+            "disk_encryption": { "system_volume": "none_detected" }
+        });
+    }
+
+    /// All three asked, none readable: `run.collect` and nothing else.
+    pub(crate) fn optin_unreadable(d: &mut Value) {
+        asked(d, &["uptime", "elevation", "security"]);
+    }
+
+    /// Values this build has never heard of in every vocabulary, an unknown
+    /// category, unknown fields, and the list in another order and case.
+    pub(crate) fn optin_future(d: &mut Value) {
+        asked(d, &["Security", "network", "security"]);
+        d["machine"]["security"] = json!({
+            "firmware_mode": "coreboot", "secure_boot": true, "measured_boot": true,
+            "tpm": { "present": true, "version": "3.0", "vendor_hidden": true },
+            "disk_encryption": { "system_volume": "partial", "method": "zfs" }
+        });
+    }
+
+    /// The blocks without `run.collect`: what no CLI writes, and which the
+    /// index therefore records as not asked rather than guess from.
+    pub(crate) fn optin_blocks_without_collect(d: &mut Value) {
+        d["run"]["elevated"] = json!(false);
+        d["machine"]["boot"] = json!({ "booted_at": "2026-09-09T10:41:28Z", "uptime_secs": 14492 });
+        d["machine"]["security"] = json!({ "firmware_mode": "uefi", "secure_boot": false });
+    }
 }
 
 #[cfg(test)]
@@ -856,5 +1057,70 @@ mod tests {
         assert_eq!(mem.slots, None, "absent, not zero");
         assert_eq!(mem.modules.len(), 2);
         assert!(mem.modules[0].size_bytes.is_none());
+    }
+
+    #[test]
+    fn the_opt_in_blocks_are_read_and_absent_without_them() {
+        let old = parse(&samples::fixture("legacy-1.2.4.json"));
+        assert!(old.machine.boot.is_none() && old.machine.security.is_none());
+
+        let mut v = samples::fixture("win-modern.json");
+        samples::windows(&mut v);
+        samples::optin_windows(&mut v);
+        let doc = parse(&v);
+        let run = doc.run.expect("run");
+        assert_eq!(run.collect, ["uptime", "elevation", "security"]);
+        assert_eq!(run.elevated, Some(false));
+        assert_eq!(run.duration_secs, Some(472.318), "the 1.8.1 block is kept");
+        let boot = doc.machine.boot.expect("boot");
+        assert_eq!(boot.uptime_secs, Some(14492));
+        let sec = doc.machine.security.expect("security");
+        assert_eq!(sec.firmware_mode.as_deref(), Some("uefi"));
+        assert_eq!(sec.secure_boot, Some(true));
+        let tpm = sec.tpm.expect("tpm");
+        assert_eq!(
+            (tpm.present, tpm.version.as_deref()),
+            (Some(true), Some("2.0"))
+        );
+        assert!(sec.disk_encryption.is_none(), "never on Windows");
+
+        let mut v = samples::fixture("linux-throttled.json");
+        samples::optin_legacy_bios(&mut v);
+        let sec = parse(&v).machine.security.expect("security");
+        assert_eq!(sec.firmware_mode.as_deref(), Some("bios"));
+        assert_eq!(sec.secure_boot, None, "no Secure Boot to be off");
+    }
+
+    /// A value in a vocabulary this build has never heard of, an unknown
+    /// category and unknown fields are carried, not refused.
+    #[test]
+    fn unknown_opt_in_values_and_fields_parse() {
+        let mut v = samples::fixture("linux-throttled.json");
+        samples::optin_future(&mut v);
+        let doc = parse(&v);
+        let sec = doc.machine.security.expect("security");
+        assert_eq!(sec.firmware_mode.as_deref(), Some("coreboot"));
+        assert_eq!(sec.tpm.expect("tpm").version.as_deref(), Some("3.0"));
+        let disk = sec.disk_encryption.expect("disk");
+        assert_eq!(disk.system_volume.as_deref(), Some("partial"));
+        let asked = Collected::of(&doc.run.expect("run").collect);
+        assert!(asked.has("security") && asked.has("network") && !asked.has("uptime"));
+        assert_eq!(asked.text().as_deref(), Some("network,security"));
+
+        // Empty blocks, too: asked, and nothing in them.
+        v["machine"]["security"] = json!({ "tpm": {} });
+        v["machine"]["boot"] = json!({});
+        let doc = parse(&v);
+        assert!(
+            doc.machine
+                .security
+                .expect("s")
+                .tpm
+                .expect("t")
+                .present
+                .is_none()
+        );
+        assert!(doc.machine.boot.expect("b").uptime_secs.is_none());
+        assert_eq!(Collected::of(&[]).text(), None);
     }
 }

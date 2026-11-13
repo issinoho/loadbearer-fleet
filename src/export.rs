@@ -165,12 +165,16 @@ fn header(out: &mut String, names: impl IntoIterator<Item = String>) {
 /// fractional digits as the clock gave, which no spreadsheet reads as a time.
 /// Empty for one that does not parse, rather than passed on as it came.
 fn utc(at: &str) -> Cell {
+    text(utc_text(at))
+}
+
+fn utc_text(at: &str) -> String {
     let Ok(t) = OffsetDateTime::parse(at, &Rfc3339) else {
-        return text("");
+        return String::new();
     };
     let t = t.to_offset(UtcOffset::UTC);
     let t = t.replace_nanosecond(0).unwrap_or(t);
-    text(t.format(&Rfc3339).unwrap_or_default())
+    t.format(&Rfc3339).unwrap_or_default()
 }
 
 fn severity(s: Severity) -> &'static str {
@@ -217,7 +221,7 @@ fn tag_cells<'a>(m: Option<&'a MachineView>, keys: &'a [&str]) -> impl Iterator<
 ///
 /// New columns go on the end of the fixed ones, before the tags, so a
 /// spreadsheet or script that reads by position keeps working.
-pub const MACHINE_COLUMNS: [&str; 46] = [
+pub const MACHINE_COLUMNS: [&str; 56] = [
     "hostname",
     "machine_key",
     "key_kind",
@@ -264,7 +268,48 @@ pub const MACHINE_COLUMNS: [&str; 46] = [
     "memory_modules",
     "run_duration_secs",
     "run_uuid",
+    "run_collect",
+    "run_elevated",
+    "booted_at",
+    "uptime_secs",
+    "firmware_mode",
+    "secure_boot",
+    "tpm_present",
+    "tpm_version",
+    "disk_encryption",
+    "disk_encryption_method",
 ];
+
+/// What an opt-in fact's cell says when there is no value — the three states
+/// told apart in a way a script can read (see the README's CSV columns):
+const NOT_ASKED: &str = "";
+/// The run named the category in `run.collect` and the CLI could not read
+/// this part. On Windows that is always so for `disk_encryption`, which the
+/// CLI never reads there: unknown, never "not encrypted".
+const UNKNOWN: &str = "unknown";
+/// The fact does not exist on this machine: Secure Boot on a legacy-BIOS boot,
+/// a TPM version with no TPM, an encryption method with no dm-crypt.
+const NOT_APPLICABLE: &str = "not_applicable";
+
+/// One opt-in fact as a cell: empty when `category` was not asked for,
+/// otherwise the value, `not_applicable` where `moot` says it cannot exist,
+/// and `unknown` for asked and unreadable. Text throughout, even for the
+/// number, since `unknown` has to fit in the same column.
+fn opted(m: &MachineView, category: &str, value: Option<String>, moot: bool) -> Cell {
+    text(if !m.run_collect.iter().any(|c| c == category) {
+        NOT_ASKED.to_string()
+    } else if let Some(v) = value {
+        v
+    } else if moot {
+        NOT_APPLICABLE.to_string()
+    } else {
+        UNKNOWN.to_string()
+    })
+}
+
+fn yes_no(v: Option<bool>) -> Option<String> {
+    v.map(|b| b.to_string())
+}
 
 /// `size_bytes:type:form_factor:speed_mts:configured_speed_mts` per module,
 /// `; ` between modules, each part empty where the firmware didn't say:
@@ -381,6 +426,41 @@ pub fn machines(snap: &Snapshot) -> String {
             text(module_tokens(m)),
             Num(m.run_duration_secs),
             opt(m.run_uuid.as_deref()),
+            text(m.run_collect.join("; ")),
+            opted(m, "elevation", yes_no(m.run_elevated), false),
+            opted(
+                m,
+                "uptime",
+                m.booted_at
+                    .as_deref()
+                    .map(utc_text)
+                    .filter(|s| !s.is_empty()),
+                false,
+            ),
+            opted(m, "uptime", m.uptime_secs.map(|s| s.to_string()), false),
+            opted(m, "security", m.firmware_mode.clone(), false),
+            opted(
+                m,
+                "security",
+                yes_no(m.secure_boot),
+                m.firmware_mode.as_deref() == Some("bios"),
+            ),
+            opted(m, "security", yes_no(m.tpm_present), false),
+            opted(
+                m,
+                "security",
+                m.tpm_version.clone(),
+                m.tpm_present == Some(false),
+            ),
+            opted(m, "security", m.disk_encryption.clone(), false),
+            opted(
+                m,
+                "security",
+                m.disk_encryption_method.clone(),
+                m.disk_encryption
+                    .as_deref()
+                    .is_some_and(|d| d != "encrypted"),
+            ),
         ];
         row(&mut out, cells.into_iter().chain(tag_cells(Some(m), &keys)));
     }

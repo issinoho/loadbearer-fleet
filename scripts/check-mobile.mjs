@@ -78,13 +78,24 @@ const SIZES = [
 // `machine-memory` is a drilldown whose latest run carries the run, OS-detail
 // and memory blocks of a loadbearer release after 1.8.1, with a mixed set of
 // modules — the Memory line at its longest, and the module table under it.
+// It was also made with `--collect uptime,elevation,security`, so it has the
+// Security and Uptime lines.
+//
+// `machine-security` is the unprivileged Linux machine, asked for its
+// elevation and security posture: the Security line at its longest (no
+// dm-crypt detected, and what that does not mean) and the one sentence that
+// says why its root-only reads are missing. `machine` is a fixture that was
+// never asked, so it carries the one quiet line pointing at `--collect`.
+// `machines-posture` is the Machines tab filtered to Secure Boot off, with the
+// Security select showing what it is set to.
 const VIEWS = ['overview', 'overview-quarter', 'cohorts', 'groups', 'components', 'components-split',
-  'lifecycle', 'lifecycle-keep', 'machines', 'drilled', 'machine', 'machine-memory', 'compare', 'report'];
+  'lifecycle', 'lifecycle-keep', 'machines', 'machines-posture', 'drilled', 'machine', 'machine-memory',
+  'machine-security', 'compare', 'report'];
 
 /** The tab each view should mark as current. */
 const TAB_OF = {
   'overview-quarter': 'overview', 'lifecycle-keep': 'lifecycle', 'components-split': 'components', drilled: 'machines', machine: 'machines',
-  'machine-memory': 'machines', report: 'overview',
+  'machine-memory': 'machines', 'machine-security': 'machines', 'machines-posture': 'machines', report: 'overview',
 };
 
 // The printed page as the browser lays it out: A4 portrait, the narrower of
@@ -93,7 +104,7 @@ const TAB_OF = {
 // and must drop its chrome; the views here must also fit the page, the report
 // above all, since paper cannot scroll sideways.
 const PRINT = { width: 703, height: 1123 };
-const PRINT_FITS = ['report', 'overview', 'lifecycle', 'machine', 'machine-memory'];
+const PRINT_FITS = ['report', 'overview', 'lifecycle', 'machine', 'machine-memory', 'machine-security'];
 
 // A control smaller than this is a control you miss. 40px is the floor here
 // rather than Apple's 44 because the theme toggle is square and 44 looks
@@ -332,6 +343,11 @@ for (const f of readdirSync(join(root, 'tests/fixtures'))) {
       { size_bytes: 8 * GiB, type: 'LPDDR4X', form_factor: 'Row Of Chips', speed_mts: 4266 },
     ],
   };
+  // And what `--collect uptime,elevation,security` adds.
+  doc.run.collect = ['uptime', 'elevation', 'security'];
+  doc.run.elevated = false;
+  doc.machine.boot = { booted_at: recent(2.2), uptime_secs: 19021 };
+  doc.machine.security = { firmware_mode: 'uefi', secure_boot: true, tpm: { present: true, version: '2.0' } };
   writeFileSync(join(collection, 'later-run.json'), JSON.stringify(doc));
   const arrived = JSON.parse(readFileSync(join(root, 'tests/fixtures/low-end.json'), 'utf8'));
   arrived.timestamp = recent(1);
@@ -340,6 +356,13 @@ for (const f of readdirSync(join(root, 'tests/fixtures'))) {
   // Unprivileged Linux: os-release and a run block, and no memory block.
   arrived.run = { id: '5b1d7e0c-3a2f-4e8b-9c6d-1e2f3a4b5c6d', duration_secs: 61 };
   arrived.machine.os_detail = { distro: 'debian', version: '13' };
+  // Asked for its elevation and security posture: not elevated, Secure Boot
+  // off, no TPM exposed, and no dm-crypt under its root.
+  arrived.run.collect = ['elevation', 'security'];
+  arrived.run.elevated = false;
+  arrived.machine.security = {
+    firmware_mode: 'uefi', secure_boot: false, tpm: { present: false }, disk_encryption: { system_volume: 'none_detected' },
+  };
   writeFileSync(join(collection, 'arrived.json'), JSON.stringify(arrived));
 }
 
@@ -373,6 +396,13 @@ const machineKey = snapshot.machines[0].key;
 const memoryKey = snapshot.machines.find((m) => m.hostname === 'FLEET-WIN-01')?.key;
 check('fixtures', !!memoryKey && snapshot.machines.find((m) => m.key === memoryKey).memory_slots === 4,
   'the drilldown with a memory layout has none');
+// The machine asked for its security posture, unelevated: see `arrived`.
+const securityKey = snapshot.machines.find((m) => m.hostname === 'WORKSTATION-WITH-A-VERY-LONG-HOSTNAME-07')?.key;
+check('fixtures', !!securityKey
+  && (snapshot.machines.find((m) => m.key === securityKey).run_collect || []).includes('security'),
+'the drilldown with a security posture has none');
+check('fixtures', !(snapshot.machines[0].run_collect || []).length,
+  'the plain drilldown was asked for something, so its page has no --collect line to lay out');
 // Three runs: the widest table a reader can ask for on a phone, short of four.
 const compareRuns = snapshot.machines.slice(0, 3).map((m) => m.run_id);
 const longestCpu = snapshot.machines.map((m) => m.cpu_model)
@@ -407,6 +437,8 @@ check('fixtures', snapshot.machines.length > 0, 'the fixtures produced no machin
 function hashOf(view) {
   if (view === 'machine') return `machine/${encodeURIComponent(machineKey)}`;
   if (view === 'machine-memory') return `machine/${encodeURIComponent(memoryKey)}`;
+  if (view === 'machine-security') return `machine/${encodeURIComponent(securityKey)}`;
+  if (view === 'machines-posture') return 'machines?posture=secure_boot_off';
   // A comparison with nothing chosen is only the picker, which is not the
   // layout worth checking — the table is.
   if (view === 'compare') return `compare/${compareRuns.join(',')}`;
@@ -628,15 +660,48 @@ try {
         `the topbar is ${m.topbarHeight}px at ${size.width}px wide (ceiling ${ceiling}px)`);
 
       // Read on load, which is a fresh navigation straight to this view — but
-      // a frame after the view has drawn. A page long enough for a scrollbar
-      // narrows the strip once it has rendered, and the page's own
-      // ResizeObserver brings the current tab back into view on the next
-      // frame; measuring inside that frame failed about one run in three on
-      // the last tab, on a page that had put itself right by the time anybody
-      // could have looked.
-      await evaluate('new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))');
-      const tabs =JSON.parse((await cdp.send('Runtime.evaluate', { expression: TABS, returnByValue: true })).result.value);
+      // once the page has settled. A page long enough for a scrollbar narrows
+      // the strip after it has rendered, and the page's own ResizeObserver
+      // brings the current tab back into view on the frame after that. When
+      // the scrollbar arrives depends on what else is still being laid out —
+      // a filter row that wraps, a table that fills — so a fixed wait of a
+      // frame or two was a race that failed about one run in three on the
+      // last tab. What has to hold is that the page puts the tab back by
+      // itself and promptly: so read until it has, for at most a second, and
+      // fail on a strip that stays wrong.
+      const readTabs = async () => {
+        await evaluate('new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))');
+        return JSON.parse((await cdp.send('Runtime.evaluate', { expression: TABS, returnByValue: true })).result.value);
+      };
+      const inView = (t) => t.activeLeft !== null && t.activeLeft >= -1 && t.activeRight >= -1;
+      let tabs = await readTabs();
+      for (let i = 0; i < 10 && !inView(tabs); i++) {
+        await sleep(100);
+        tabs = await readTabs();
+      }
       checkTabs(where, tabs, TAB_OF[view] || view);
+
+      // The opt-in facts on the real page, as the server delivered them:
+      // what each page must say, and must not.
+      const SAYS = {
+        'machine-memory': [['UEFI · Secure Boot on · TPM 2.0 · disk encryption not read on Windows',
+          'at the time of the run', 'last restarted', 'not elevated'], ['--collect']],
+        'machine-security': [['Secure Boot off', 'no TPM exposed to the OS', 'no dm-crypt detected under /',
+          'not elevated, so drive health'], ['not encrypted', 'unencrypted', 'Uptime']],
+        machine: [['--collect'], ['Secure Boot', 'UEFI', 'not collected']],
+        'machines-posture': [['WORKSTATION-WITH-A-VERY-LONG-HOSTNAME-07'], ['FLEET-OLD-01']],
+      }[view];
+      if (SAYS) {
+        const body = await evaluate('document.querySelector("#main").innerText');
+        for (const w of SAYS[0]) check(where, body.includes(w), `"${w}" is not on the page`);
+        for (const w of SAYS[1]) check(where, !body.includes(w), `"${w}" should not be on the page`);
+      }
+      if (view === 'machines-posture') {
+        const select = await evaluate(`(() => { const s = document.querySelector('#f-posture');
+          return s ? { value: s.value, shown: !s.closest('.field').hidden && s.offsetWidth > 0 } : null; })()`);
+        check(where, select?.value === 'secure_boot_off' && select.shown,
+          `the Security select does not show the filter: ${JSON.stringify(select)}`);
+      }
 
       notes.push(`${where}: ${m.documentWidth}px wide, topbar ${m.topbarHeight}px, `
         + `${m.controls.length} control(s), ${m.selfScrolls.length} scroller(s), `

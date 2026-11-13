@@ -17,6 +17,14 @@
 //! multiply the fleet's size by every label. The fleet view is the place to ask
 //! about a machine; this is the place to ask whether the fleet view can be
 //! trusted.
+//!
+//! Nor anything drawn from the opt-in facts of `--collect` — Secure Boot, the
+//! TPM, disk encryption, uptime, elevation — **not even as a fleet-wide
+//! count**. "Machines without Secure Boot" in a store that is less protected
+//! than this one is exactly the list loadbearer's PRIVACY.md makes those
+//! facts opt-in to keep from leaking, and a count of it is half the way
+//! there. The Machines tab's `posture=` filter, behind sign-in and scope, is
+//! where that question is asked.
 
 use std::fmt::Write as _;
 
@@ -594,6 +602,39 @@ mod tests {
             value_of(&text, "loadbearer_fleet_machines "),
             snap.summary.machines.to_string()
         );
+    }
+
+    /// Nothing of a machine's security posture reaches a scrape, even where
+    /// every machine opted in and several lack Secure Boot.
+    #[test]
+    fn the_opt_in_facts_are_not_exported() {
+        use crate::schema::samples;
+        let mut index = Index::open_in_memory().unwrap();
+        for (f, enrich) in [
+            (
+                "win-modern.json",
+                samples::optin_windows as fn(&mut serde_json::Value),
+            ),
+            ("linux-throttled.json", samples::optin_linux_luks),
+            ("low-end.json", samples::optin_legacy_bios),
+        ] {
+            let mut doc = samples::fixture(f);
+            enrich(&mut doc);
+            index.ingest_text(&doc.to_string(), Path::new(f)).unwrap();
+        }
+        let snap = crate::analytics::snapshot(index.conn(), &Tuning::default(), now()).unwrap();
+        let text = render_all(&snap, &runtime(), now()).to_lowercase();
+        for word in [
+            "secure",
+            "tpm",
+            "encrypt",
+            "firmware_mode",
+            "bios",
+            "elevat",
+            "boot",
+        ] {
+            assert!(!text.contains(word), "{word} in the exposition");
+        }
     }
 
     #[test]

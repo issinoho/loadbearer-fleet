@@ -897,6 +897,92 @@ record none of it. An index from an earlier version gains the columns and the
 module table on open, empty for the runs it already holds, and
 `scan --reindex` fills them in.
 
+### Uptime, elevation and security posture, where a run asked
+
+A loadbearer release after 1.8.1 can also record three things it **does not
+collect unless asked**, because each says something about one particular
+machine or its user rather than its hardware: when the machine last booted,
+whether the run was elevated, and its security posture. They are turned on on
+the CLI with `--collect uptime,elevation,security` (or `collect = [...]` in its
+config file) — see [Collected only when asked
+for](https://github.com/issinoho/loadbearer#collected-only-when-asked-for) in
+loadbearer's README for how, and its
+[PRIVACY.md](https://github.com/issinoho/loadbearer/blob/main/PRIVACY.md#collected-only-when-asked-for)
+for why they are opt-in. Nothing here turns them on; fleet only reads what a
+run wrote.
+
+**Three states, kept apart everywhere.** The run records what it was asked for
+as `run.collect`, so each fact is one of:
+
+- **not asked** — the category isn't in `run.collect`, which is every run made
+  without `--collect` and every run from an older loadbearer. That says
+  nothing about the machine, and the page says nothing about it: no row, no
+  "not collected", and never "off" or "no".
+- **asked, but could not be read** — the category is listed and the field is
+  absent. The page says **not reported**.
+- **read** — the value, meaning exactly what the CLI says it means, no more.
+
+What each value means:
+
+- **Firmware** — `uefi`, or `bios`: not booted through UEFI (legacy BIOS or
+  CSM, or a VM started straight into its kernel).
+- **Secure Boot** — on or off. On a `bios` boot there is none to be on or off,
+  and the page says **Secure Boot does not apply** rather than "off".
+- **TPM** — whether the OS exposes one, and its version (`2.0`, `1.2`) where
+  it says. "No TPM exposed" covers none fitted, one turned off in firmware, and
+  no driver for it — and many VMs have none.
+- **Disk encryption** — **Linux only, and only the root filesystem**: on
+  dm-crypt (`encrypted`, with the cryptsetup type — `luks2` and so on), or
+  `none_detected`, which means exactly "no dm-crypt under `/`". ZFS native
+  encryption, fscrypt, eCryptfs and self-encrypting drives are not looked for,
+  so `none_detected` is **not** "unencrypted", and the page says what was
+  looked for. It is **never present on Windows**, where BitLocker cannot be read
+  within loadbearer's privacy promises: a Windows machine says **disk encryption
+  not read on Windows**, and is never shown, counted or filtered as
+  unencrypted.
+- **Uptime** — how long the machine had been up and when it booted **as of the
+  run**, not now: the page says "up 4h 01m at the time of the run" and never
+  counts on from `booted_at`. On Windows with Fast Startup (the default) a shut
+  down does not restart the kernel, so the boot it counts from is the last
+  *restart*, and the page says **last restarted**.
+- **Elevation** — whether that run had administrator or root rights. It is a
+  property of the run, not the machine, so it is on the **Measured** line. On
+  Linux an unelevated run cannot read what is root-only there, so where its
+  drive health, serial or memory layout is missing the same line says that is
+  why.
+
+The machine page shows a **Security** line —
+`UEFI · Secure Boot on · TPM 2.0 · disk encryption not read on Windows` — and
+an **Uptime** line, each only where the latest run asked. A machine whose run
+did not ask shows neither; if another machine *in your own view* does, one
+quiet line under the facts says which `--collect` would add them, so the
+feature can be found.
+
+Across the estate, the filter row gains a **Security** select — shown once a
+machine in view has opted in — and the URL a `posture=` parameter:
+`secure_boot_off`, `secure_boot_on`, `legacy_bios`, `tpm_absent`,
+`tpm_present`, `tpm_1.2`, `disk_none_detected` and `disk_encrypted`, one at a
+time. **Each matches only machines where that fact was read**: a machine that
+was not asked, or could not say, is on neither side of any of them, a
+legacy-BIOS machine is on neither side of Secure Boot, and Windows is on
+neither side of disk encryption. It narrows every tab, a link and a saved view
+like any other filter, goes through the sign-in scope like any other filter,
+and any other value is refused with a 400. The Search box does not match the
+posture — "off" or "none" as a substring would read as an answer it isn't.
+
+**No findings, no metrics, no notifications** are drawn from any of it. Secure
+Boot off, no TPM, no dm-crypt detected and a long uptime are each a question to
+ask of the estate rather than a fault this tool can judge — see the paragraph
+above on what `none_detected` and "no TPM" do and don't mean. And `/metrics`
+carries nothing of it, not even a fleet-wide count: a count of machines
+without Secure Boot in a metrics store less protected than this one is
+exactly what the CLI's PRIVACY.md worries about. See [SECURITY.md](SECURITY.md)
+for how sensitive the list is.
+
+An index from an earlier version gains the columns on open, with no format
+change; runs it already holds read as not asked until `scan --reindex` fills
+them in from the documents. `forget` takes them with the machine's runs.
+
 ## The dashboard
 
 ```
@@ -915,7 +1001,8 @@ component), **lifecycle** (what
 each machine calls for — replace, repair, investigate, watch or keep — and
 why), a sortable **machine table**, and a **drilldown** per machine with its
 score history, its components, its findings in full, its drives, its OS
-release and memory layout, every subtest of its latest run, and — where a [threshold
+release and memory layout, its security posture and uptime where its run
+[asked for them](#uptime-elevation-and-security-posture-where-a-run-asked), every subtest of its latest run, and — where a [threshold
 override](#thresholds-and-different-lines-for-some-machines) applies — the
 lines it was judged against instead. On a phone the seven tabs scroll sideways inside
 their strip, with the current one kept in view and a fade on the edge where
@@ -1177,7 +1264,13 @@ The snapshot carries the fleet-wide `thresholds` and the configured
 `memory_slots`, `memory_populated` and `memory_types`; and its latest run's
 `run_uuid` (loadbearer's random `run.id`, not the index's `run_id`) and
 `run_duration_secs` — each null (`memory_types` empty) where the run didn't
-record it. The drilldown
+record it; and `run_collect` (what the latest run asked for with `--collect`,
+sorted — empty for none), `run_elevated`, `booted_at`, `uptime_secs`,
+`firmware_mode`, `secure_boot`, `tpm_present`, `tpm_version`,
+`disk_encryption` and `disk_encryption_method`, each null where it was not
+read: `run_collect` is what tells "not asked" (category missing) from "asked,
+could not be read" (category listed) — see [Uptime, elevation and security
+posture](#uptime-elevation-and-security-posture-where-a-run-asked). The drilldown
 adds `memory_modules`, one per filled slot (`size_bytes`, `type`,
 `form_factor`, `speed_mts`, `configured_speed_mts`), delivered as `drives` are,
 and each run in its `history` carries `duration_secs` and `run_uuid`; each run
@@ -1197,7 +1290,10 @@ verdicts ride in the snapshot and the drilldown — each machine's `lifecycle`
 and `age_estimate`, and the counts in `summary.lifecycle` — so there is no
 endpoint of its own; `lifecycle=replace|repair|investigate|watch|keep` is a
 filter parameter like the others, and any other value is refused with a 400
-naming the five rather than answered with an empty fleet. Every endpoint, the
+naming the five rather than answered with an empty fleet. `posture=` is the
+same: one of `secure_boot_off`, `secure_boot_on`, `legacy_bios`,
+`tpm_absent`, `tpm_present`, `tpm_1.2`, `disk_none_detected` or
+`disk_encrypted`, matching only machines whose latest run read that fact. Every endpoint, the
 filter parameters they share with the dashboard, and how authorization is
 applied are in
 [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API).
@@ -1241,7 +1337,20 @@ MT/s), `memory_modules` (one `size_bytes:type:form_factor:speed_mts:configured_s
 per module, `; `-separated, a part empty where the firmware didn't say — so
 `17179869184:DDR5:SODIMM:5600:4800; 17179869184:DDR5:SODIMM:5600:4800`),
 `run_duration_secs` (how long the latest run's benchmarks took) and `run_uuid`
-(its random run ID). New columns are added after these and before the tags,
+(its random run ID), then what a run made with `--collect` records:
+`run_collect` (the categories it asked for, `; `-separated), `run_elevated`,
+`booted_at` and `uptime_secs` (as of the run), `firmware_mode`,
+`secure_boot`, `tpm_present`, `tpm_version`, `disk_encryption` and
+`disk_encryption_method`. **These ten tell the three states apart**: a cell
+is empty where the run did not ask for its category, `unknown` where it asked
+and the CLI could not read that part, `not_applicable` where the fact cannot
+exist on that machine (`secure_boot` on a `bios` boot, `tpm_version` with no
+TPM, `disk_encryption_method` without dm-crypt), and otherwise the value —
+`true`/`false`, or the word the CLI wrote (`uefi`, `encrypted`,
+`none_detected`, `luks2`, …). `disk_encryption` on Windows is always
+`unknown`, never `none_detected`: the CLI does not read BitLocker.
+`none_detected` means no dm-crypt under `/`, not unencrypted. Because
+`unknown` can sit in it, `uptime_secs` is a text column. New columns are added after these and before the tags,
 so a column's position never moves. Then one `tag:<key>` column per tag key
 any machine in the file carries, sorted by key; the prefix means a tag can
 never be mistaken for a fixed column.

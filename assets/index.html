@@ -106,6 +106,16 @@
     </select>
   </label>
 
+  <!-- Shown only where a machine in view opted in with --collect security:
+       each value matches machines whose run read that fact, and nothing a
+       run was not asked for. -->
+  <label class="field" hidden>
+    <span class="field-label">Security</span>
+    <select name="posture" id="f-posture">
+      <option value="">Any</option>
+    </select>
+  </label>
+
   <label class="field field-grow">
     <span class="field-label">Search</span>
     <input type="search" name="q" id="f-q" placeholder="Hostname, key, serial, asset tag, model, CPU, power mode, OS edition, version or build, memory type or a tag value"

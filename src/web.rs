@@ -535,6 +535,12 @@ struct FilterParams {
     /// `replace`, `repair`, `investigate`, `watch` or `keep`.
     #[serde(default, deserialize_with = "verdict_param")]
     lifecycle: Option<analytics::Verdict>,
+    /// One security fact a run read — `secure_boot_off`, `tpm_absent`,
+    /// `disk_none_detected`, … — closed, like `lifecycle`, and for the same
+    /// reason: a misspelt value answered with an empty fleet would read as
+    /// "no machine has that problem".
+    #[serde(default, deserialize_with = "posture_param")]
+    posture: Option<analytics::Posture>,
 }
 
 /// `lifecycle=` as a closed set: empty is no filter, as every other parameter
@@ -546,6 +552,17 @@ struct FilterParams {
 fn verdict_param<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<analytics::Verdict>, D::Error> {
+    match Option::<String>::deserialize(d)?.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(v) => v.parse().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// `posture=`, closed as `lifecycle=` is: empty is no filter, anything else
+/// that is not one of the values is a 400 naming them.
+fn posture_param<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<analytics::Posture>, D::Error> {
     match Option::<String>::deserialize(d)?.as_deref().map(str::trim) {
         None | Some("") => Ok(None),
         Some(v) => v.parse().map(Some).map_err(serde::de::Error::custom),
@@ -575,6 +592,7 @@ impl FilterParams {
             search: self.q.filter(|s| !s.trim().is_empty()),
             flag: self.flag.filter(|s| !s.is_empty()),
             lifecycle: self.lifecycle,
+            posture: self.posture,
             scopes: Vec::new(),
         }
     }
@@ -4236,6 +4254,279 @@ mod tests {
         let csv = get(&state, "/api/machines.csv", Some(&glasgow)).await;
         assert!(!csv.body.contains("DDR4"), "{}", csv.body);
         assert!(!csv.body.contains("ubuntu"), "{}", csv.body);
+    }
+
+    /// The fixtures re-measured later by runs made with `--collect`:
+    /// Glasgow's Windows machine with all three (Secure Boot on, a TPM 2.0,
+    /// not elevated), an Edinburgh machine as root with Secure Boot off and
+    /// its root on LUKS2, the other with only `security` and no dm-crypt
+    /// detected. The 1.2.4 machine was never asked.
+    fn state_with_opted_in_runs(config: &Config) -> Arc<AppState> {
+        use crate::schema::samples;
+        let state = state_for(config);
+        {
+            let mut idx = state.index.lock().expect("index");
+            for (name, enrich) in [
+                (
+                    "win-modern.json",
+                    samples::optin_windows as fn(&mut serde_json::Value),
+                ),
+                ("linux-throttled.json", samples::optin_linux_luks),
+                ("low-end.json", samples::optin_linux_none_detected),
+            ] {
+                let mut doc = samples::fixture(name);
+                doc["timestamp"] = serde_json::json!("2026-09-10T09:00:00Z");
+                enrich(&mut doc);
+                idx.ingest_text(&doc.to_string(), &fixtures().join(format!("later-{name}")))
+                    .expect("ingested");
+            }
+        }
+        state.recompute().expect("recomputed");
+        state
+    }
+
+    /// The opt-in facts from the document to the snapshot, the drilldown and
+    /// the CSV through the real router, in their three states: not asked
+    /// (empty, null, no `run_collect`), asked and unreadable (`unknown`,
+    /// null with the category listed), and read.
+    #[tokio::test]
+    async fn the_opt_in_facts_reach_the_api_and_the_csv_in_their_three_states() {
+        let state = state_with_opted_in_runs(&Config::default());
+        let null = serde_json::Value::Null;
+
+        let page = get(&state, "/api/machine/SN-WIN-0001", None).await.json();
+        let m = &page["machine"];
+        assert_eq!(
+            m["run_collect"],
+            serde_json::json!(["elevation", "security", "uptime"])
+        );
+        assert_eq!(m["run_elevated"], false);
+        assert_eq!(m["booted_at"], "2026-09-09T10:41:28Z");
+        assert_eq!(m["uptime_secs"], 14492);
+        assert_eq!(m["firmware_mode"], "uefi");
+        assert_eq!(m["secure_boot"], true);
+        assert_eq!(m["tpm_present"], true);
+        assert_eq!(m["tpm_version"], "2.0");
+        assert_eq!(m["disk_encryption"], null, "never read on Windows");
+
+        let old = get(&state, "/api/machine/FLEET-OLD-01", None).await.json();
+        assert_eq!(old["machine"]["run_collect"], serde_json::json!([]));
+        for field in ["run_elevated", "uptime_secs", "secure_boot", "tpm_present"] {
+            assert_eq!(old["machine"][field], null, "{field}");
+        }
+
+        let (head, rows) = csv_of(&get(&state, "/api/machines.csv", None).await);
+        assert_eq!(
+            &head[..export::MACHINE_COLUMNS.len()],
+            export::MACHINE_COLUMNS
+        );
+        assert!(
+            head[export::MACHINE_COLUMNS.len()..]
+                .iter()
+                .all(|c| c.starts_with("tag:"))
+        );
+        let row = |host: &str| rows.iter().find(|r| r["hostname"] == host).expect(host);
+        let cells = |host: &str| -> Vec<String> {
+            let r = row(host);
+            export::MACHINE_COLUMNS[46..]
+                .iter()
+                .map(|c| r[*c].clone())
+                .collect()
+        };
+        assert_eq!(
+            cells("FLEET-WIN-01"),
+            [
+                "elevation; security; uptime",
+                "false",
+                "2026-09-09T10:41:28Z",
+                "14492",
+                "uefi",
+                "true",
+                "true",
+                "2.0",
+                "unknown",
+                "unknown"
+            ]
+        );
+        assert_eq!(
+            cells("FLEET-LNX-01"),
+            [
+                "elevation; security; uptime",
+                "true",
+                "2026-09-06T08:00:00Z",
+                "266400",
+                "uefi",
+                "false",
+                "true",
+                "2.0",
+                "encrypted",
+                "luks2"
+            ]
+        );
+        // Only `security` asked: the uptime and elevation cells are empty,
+        // not `unknown`; no TPM, so no version; no dm-crypt, so no method.
+        assert_eq!(
+            cells("FLEET-LNX-02"),
+            [
+                "security",
+                "",
+                "",
+                "",
+                "uefi",
+                "true",
+                "false",
+                "not_applicable",
+                "none_detected",
+                "not_applicable"
+            ]
+        );
+        assert!(
+            cells("FLEET-OLD-01").iter().all(String::is_empty),
+            "never asked"
+        );
+        // The tags are still where they were.
+        assert_eq!(row("FLEET-WIN-01")["tag:site"], "glasgow");
+    }
+
+    /// The opt-in facts go through the caller's own view like everything
+    /// else: a viewer scoped to Glasgow cannot learn an Edinburgh machine's
+    /// posture from its page, the `posture=` filter, the counts, the
+    /// groups, the timeline, a search or the CSV — and the snapshot they get,
+    /// which is what the page's "other machines have this" line is drawn
+    /// from, carries no machine but their own.
+    #[tokio::test]
+    async fn a_scoped_viewer_cannot_learn_another_machines_posture() {
+        let state = state_with_opted_in_runs(&oidc_config());
+        let admin = session(&state, Role::Admin, &[]);
+        let glasgow = session(&state, Role::Viewer, &[&[("site", "glasgow")]]);
+
+        // Edinburgh has a machine with Secure Boot off, which the admin sees.
+        let off = get(
+            &state,
+            "/api/snapshot?posture=secure_boot_off",
+            Some(&admin),
+        )
+        .await
+        .json();
+        assert_eq!(off["summary"]["machines"], 1);
+        assert_eq!(off["machines"][0]["hostname"], "FLEET-LNX-01");
+        let edinburgh = off["machines"][0]["key"].as_str().expect("key").to_string();
+
+        for uri in [
+            "/api/snapshot?posture=secure_boot_off",
+            "/api/snapshot?posture=secure_boot_off&tags=site%3Dedinburgh",
+            "/api/snapshot?posture=disk_encrypted",
+            "/api/snapshot?posture=tpm_absent",
+            "/api/snapshot?posture=disk_none_detected",
+        ] {
+            let r = get(&state, uri, Some(&glasgow)).await.json();
+            assert_eq!(r["summary"]["machines"], 0, "{uri}");
+            assert_eq!(r["flags"].as_array().map(Vec::len), Some(0), "{uri}");
+        }
+        let mine = get(
+            &state,
+            "/api/snapshot?posture=secure_boot_on",
+            Some(&glasgow),
+        )
+        .await
+        .json();
+        assert_eq!(mine["summary"]["machines"], 1);
+        assert_eq!(mine["machines"][0]["tags"]["site"], "glasgow");
+
+        let everything = get(&state, "/api/snapshot", Some(&glasgow)).await;
+        let everything_json = everything.json();
+        let machines = everything_json["machines"].as_array().expect("machines");
+        assert!(
+            machines.iter().all(|m| m["tags"]["site"] == "glasgow"),
+            "the view the page's hint is drawn from is the caller's own"
+        );
+        assert!(!everything.body.contains("luks2"));
+        assert!(!everything.body.contains("none_detected"));
+
+        let page = get(&state, &format!("/api/machine/{edinburgh}"), Some(&glasgow)).await;
+        assert_eq!(page.status, StatusCode::NOT_FOUND);
+        assert!(!page.body.contains("luks2"), "{}", page.body);
+
+        let groups = get(
+            &state,
+            "/api/groups?by=tag:site&posture=secure_boot_off",
+            Some(&glasgow),
+        )
+        .await;
+        assert_eq!(groups.status, StatusCode::OK, "{}", groups.body);
+        assert_eq!(groups.json()["machines"], 0);
+        let over_time = get(
+            &state,
+            "/api/timeline?posture=secure_boot_off",
+            Some(&glasgow),
+        )
+        .await;
+        assert_eq!(over_time.status, StatusCode::OK, "{}", over_time.body);
+        assert!(
+            over_time.json()["points"]
+                .as_array()
+                .expect("points")
+                .iter()
+                .all(|p| p["machines"] == 0),
+            "nobody in view, at any point"
+        );
+
+        let found = get(&state, "/api/snapshot?q=luks2", Some(&glasgow))
+            .await
+            .json();
+        assert_eq!(found["summary"]["machines"], 0);
+
+        let csv = get(&state, "/api/machines.csv", Some(&glasgow)).await;
+        assert!(!csv.body.contains("luks2"), "{}", csv.body);
+        assert!(!csv.body.contains("none_detected"), "{}", csv.body);
+        let (_, rows) = csv_of(
+            &get(
+                &state,
+                "/api/machines.csv?posture=secure_boot_off",
+                Some(&glasgow),
+            )
+            .await,
+        );
+        assert!(rows.is_empty(), "no row for a machine out of scope");
+    }
+
+    /// `posture=` is a closed set, like `lifecycle=`: a value that is not one
+    /// is refused with the list, everywhere the filter is accepted, and empty
+    /// is no filter.
+    #[tokio::test]
+    async fn an_unknown_posture_is_a_bad_request() {
+        let state = state_for(&oidc_config());
+        let cookie = session(&state, Role::Viewer, &[]);
+        for uri in [
+            "/api/snapshot?posture=secure_boot",
+            "/api/snapshot?posture=Secure_Boot_Off",
+            "/api/snapshot?posture=unknown",
+            "/api/groups?posture=off",
+            "/api/timeline?posture=tpm",
+            "/api/changes?posture=tpm",
+            "/api/machines.csv?posture=encrypted",
+        ] {
+            let r = get(&state, uri, Some(&cookie)).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.body);
+            assert!(
+                r.body.contains("secure_boot_off") && r.body.contains("disk_none_detected"),
+                "{uri} said: {}",
+                r.body
+            );
+        }
+        let empty = get(&state, "/api/snapshot?posture=", Some(&cookie)).await;
+        assert_eq!(empty.status, StatusCode::OK, "{}", empty.body);
+        assert_eq!(empty.json()["summary"]["machines"], 4);
+        // On fixtures that never opted in, every value is an empty view —
+        // not the whole fleet, and not a refusal.
+        let none = get(
+            &state,
+            "/api/snapshot?posture=secure_boot_off",
+            Some(&cookie),
+        )
+        .await
+        .json();
+        assert_eq!(none["summary"]["machines"], 0);
     }
 
     #[tokio::test]
