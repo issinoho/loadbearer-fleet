@@ -1902,7 +1902,8 @@ async function renderReportWith(name, { snap, changes, timeline, grouping = null
   if (fixtures) {
     const { text } = fixtures;
     check('report/fixtures', text.includes('Every machine, no filter applied.'), 'the filter is not stated');
-    check('report/fixtures', text.includes('http://fleet.example') && text.includes(`loadbearer-fleet ${snapshot.version}`),
+    // The line as the report writes it: where it came from, then the build.
+    check('report/fixtures', text.includes(`${globalThis.location.origin} · loadbearer-fleet ${snapshot.version}`),
       'the source and the build are not stated');
     const live = snapshot.flags.filter((f) => !f.triage && f.severity !== 'info');
     check('report/fixtures', text.includes(`${live.length} live critical or warning finding(s)`),
