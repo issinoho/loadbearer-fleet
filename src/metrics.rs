@@ -413,7 +413,7 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analytics::{Filter, Snapshot, Thresholds};
+    use crate::analytics::{Filter, Snapshot, Tuning};
     use crate::index::Index;
     use std::path::Path;
     use time::Duration;
@@ -439,7 +439,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        crate::analytics::snapshot(index.conn(), &Thresholds::default(), now()).unwrap()
+        crate::analytics::snapshot(index.conn(), &Tuning::default(), now()).unwrap()
     }
 
     fn runtime() -> Runtime {
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn an_empty_fleet_renders_without_pretending_to_have_a_median() {
         let index = Index::open_in_memory().unwrap();
-        let snap = crate::analytics::snapshot(index.conn(), &Thresholds::default(), now()).unwrap();
+        let snap = crate::analytics::snapshot(index.conn(), &Tuning::default(), now()).unwrap();
         let text = render_all(&snap, &runtime(), now());
         assert_eq!(value_of(&text, "loadbearer_fleet_machines "), "0");
         assert!(
@@ -584,13 +584,10 @@ mod tests {
     #[test]
     fn the_numbers_are_fleet_wide() {
         let snap = snapshot();
-        let narrowed = snap.filtered(
-            &Filter {
-                search: Some("nothing-matches-this".into()),
-                ..Default::default()
-            },
-            &Thresholds::default(),
-        );
+        let narrowed = snap.filtered(&Filter {
+            search: Some("nothing-matches-this".into()),
+            ..Default::default()
+        });
         assert_eq!(narrowed.summary.machines, 0);
         let text = render_all(&snap, &runtime(), now());
         assert_eq!(

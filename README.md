@@ -514,6 +514,10 @@ resets when they're reimaged" is something an estate owner should know.
 - [x] A webhook when a scan finds a new critical finding, and a daily or weekly
       digest — one generic, signed JSON POST, off unless configured — see
       [Notifications](#notifications)
+- [x] Every threshold set from the configuration file, and different lines for
+      some machines by tag, system model or CPU model, named on each machine
+      they change — see [Thresholds, and different lines for some
+      machines](#thresholds-and-different-lines-for-some-machines)
 
 ## Analysis
 
@@ -557,10 +561,123 @@ means an estate owner reads a thermal caveat as a failing asset:
 | **measurement** | the number can't be trusted until collection is fixed | thermally limited, run on battery, held back by its power settings, partial run, RAM-backed disk target, unstable CPU timings |
 | **coverage** | about the data we hold, not about the machine | stale result, attributed by hostname only, no peer group |
 
-Every threshold lives in one struct with its reasoning attached, so tuning the
-engine is a config change rather than a code read. Every rule, what fires
-each one and every threshold with its default are in
+Every threshold lives in one struct with its reasoning attached, and every one
+can be set in the configuration file — see [below](#thresholds-and-different-lines-for-some-machines).
+Every rule and what fires each one are in
 [Findings](https://github.com/issinoho/loadbearer-fleet/wiki/Findings).
+
+### Thresholds, and different lines for some machines
+
+Every number a rule turns on is a threshold, and each can be set in
+`[thresholds]` in the configuration file. One left unset keeps its default, so
+a file without the section judges the fleet exactly as this README describes.
+
+| Threshold | Default | What it is | Per machine |
+| --- | --- | --- | --- |
+| `min_cohort` | 4 | How many machines a cohort needs before a member is compared with its median. At least 3: with two, each is exactly as far from their median as the other, so neither can ever stand out. | no |
+| `cohort_z` | 3.5 | The modified z-score, from the median and MAD, at which a member is an outlier. | no |
+| `cohort_min_shortfall` | 0.10 | A shortfall against the cohort median smaller than this is never named, however unusual it is. | no |
+| `mad_floor_frac` | 0.03 | The cohort's spread is floored at this fraction of its median. On a cohort of clones, this is what binds. | no |
+| `regression_frac` | 0.15 | A drop against the median of the machine's own earlier comparable runs that counts as a regression. | yes |
+| `stale_days` | 90 | After this many days a machine's latest result is stale — history rather than inventory. | yes |
+| `battery_health_pct` | 70 | Battery capacity, as a percentage of design, below which the battery is worn. | yes |
+| `unstable_cpu_subtests` | 2 | Low-confidence CPU subtests at which a run is too shaky to read. | yes |
+| `drive_wear_pct` | 80 | Rated endurance used, as a percentage, at which a drive is worn. 100 is critical whatever this says. | yes |
+| `drive_spare_pct` | 20 | Spare blocks left, as a percentage, below which a drive is worn. | yes |
+| `disk_free_pct` | 10 | Free space on the fullest fixed volume, as a percentage, below which the disk is nearly full. | yes |
+| `disk_free_critical_pct` | 5 | Below this, nearly full is critical. Never above `disk_free_pct`. | yes |
+| `firmware_behind_days` | 90 | How far behind the newest firmware seen on the same system model a machine's has to be before it is named. | yes |
+| `firmware_old_years` | 4 | Firmware older than this when the machine was measured is named even with no peer to compare against. | yes |
+| `replace_age_years` | 5 | From this best-estimate age a machine is old, for the [lifecycle verdict](#what-to-do-about-each-machine). | yes |
+
+Each value is checked when the file is loaded, and a bad one stops the start
+with a message naming it: a percentage from 0 to 100, a fraction above 0 and
+below 1, days, years and the z-score above zero, a count a whole number of at
+least 1 (`min_cohort` at least 3), and `disk_free_critical_pct` never above
+`disk_free_pct`. An unknown key is refused, as everywhere in the file.
+
+**Different lines for some machines.** A lab measured once a year is not stale
+at ninety days, and a kiosk with a small fixed image runs mostly full by
+design. Loosening the line for everybody hides the machines that are stale or
+full by accident; leaving it means the same known findings in the queue for
+ever. So an override sets some thresholds for the machines it picks:
+
+```toml
+[thresholds]
+stale_days = 120
+
+[[thresholds.overrides]]
+name = "lab machines"
+tags = { site = "lab" }
+stale_days = 365
+
+[[thresholds.overrides]]
+name = "kiosks"
+system_model = "HP t640 Thin Client"
+disk_free_pct = 5
+disk_free_critical_pct = 2
+```
+
+A rule picks machines by `tags` — every one given must be among the machine's
+tags, matched exactly as a grant's or a suppression's are — and by
+`system_model` and `cpu_model`, exactly as the machine reports them: the same
+values the Groups view groups by, so `"Dell Inc. Latitude 7440"` does not pick
+a Latitude 7440 2-in-1. Everything given must match. A rule has to give at
+least one of the three, and an empty `tags` table is refused: values for the
+whole fleet belong in `[thresholds]` itself. `name` is what people see; unset,
+the rule is named after what it picks (`site=lab`), and no two rules may share
+a name.
+
+**First match wins, threshold by threshold.** For each threshold, a machine
+takes the value from the first rule in the file that picks it and sets that
+threshold; otherwise `[thresholds]`; otherwise the default. A later rule still
+supplies a threshold an earlier one left alone. Above, every machine is stale
+after 120 days except the lab's, after 365, and a kiosk in the lab takes 365
+days from the first rule and 5% from the second. A rule that can never change
+anything, because earlier rules picking every machine it picks already set
+everything it sets, is reported in the log at startup. The two disk lines are
+checked together for every pairing a machine could end up with — one rule's
+critical line against another's, or the fleet's, nearly-full line — and a
+pairing with critical above nearly full is refused.
+
+**Only the lines that judge one machine.** The four cohort thresholds are
+fleet-wide only, and an override that sets one is refused at startup. Whether
+a cohort is big enough, how spread it is and where in that spread an outlier
+starts describe one calculation over every identical machine in the index, and
+a value for some of them would be a different calculation over the same
+cohort. Every other threshold judges one machine against a fixed line, so a
+different line for some machines changes what is said about those machines
+and nothing else. `firmware_behind_days` compares a machine with its peers,
+but the newest firmware on a model is worked out across the estate without
+reference to any threshold, so a machine's own line moves only what is said
+about that machine.
+
+**Visible, not silent.** A machine with 8% free and no finding has to be told
+apart from one nobody looked at. So each machine's page says which rules
+changed how it was judged, and what they set — *Judged by: kiosks: disk nearly
+full under 5% free, critical under 2% free* — and the findings quote the line
+they were drawn against. Where the dashboard quotes a fleet-wide value — the
+Overview's stale tile, the lifecycle rule and its age line — it says how many
+machines in view are on a line of their own. `report` counts the machines an
+override judged and names the rules, and `report --lifecycle` names the rule
+beside each machine it applies to. In the API, the snapshot carries the
+fleet-wide `thresholds` and the rules as `threshold_overrides`, and each
+machine carries `overridden_by`: the rules that changed it, each with the
+thresholds it supplied — only those, so a threshold an earlier rule supplied
+first is not listed against a later one.
+
+**A threshold is configuration, not history.** Changing one, or adding a rule,
+re-judges the past as well as the present: [the history is
+reconstructed](#what-changed-and-the-fleet-over-time) with today's lines, as
+it is with today's rules. In each past week a rule picks a machine by the tags
+and models of the run that stood for it then, so a laptop that has since left
+the lab was judged as a lab machine while it was there. The file is read at
+startup, so a change needs a restart. A finding a change makes go away is
+resolved like any other: an acknowledgement or snooze of it is spent when the
+server starts, and the finding is listed as resolved in "What changed".
+Notifications compare one rebuild with the one before, and the first after a
+restart is already judged by the new lines, so a finding a change makes
+critical is not sent as news; it is in the next digest.
 
 ### Acknowledge, snooze, suppress
 
@@ -609,7 +726,10 @@ and the log says which and why. A machine missing from the index altogether
 keeps its marks, so an index rebuilt by an upgrade, which is empty until its
 first scan, does not wipe them. The judgement is made at those rebuilds, so a
 finding resolved and back again between two of them was never seen resolved
-and its acknowledgement stands.
+and its acknowledgement stands. A finding that goes away because a
+[threshold](#thresholds-and-different-lines-for-some-machines) was changed is
+resolved the same way: the server reads thresholds when it starts, and the
+mark is spent then.
 
 It is all kept in the [state file](#how-it-fits-together), never the index.
 `report` reads it and shows what a running server would — live findings
@@ -724,8 +844,11 @@ warning — and six findings in the **machine** queue read them:
   **old firmware** — more than four years older than the run — is named
   instead.
 
-Every drive is judged, not just the boot drive, with one finding per rule per
-machine naming the worst. Unsafe-shutdown counts are recorded and shown but
+Every line above is a threshold the configuration can change, for the whole
+fleet or for some machines — see [Thresholds, and different lines for some
+machines](#thresholds-and-different-lines-for-some-machines). Every drive is
+judged, not just the boot drive, with one finding per rule per machine naming
+the worst. Unsafe-shutdown counts are recorded and shown but
 never flagged: a healthy laptop collects hundreds from lid closes and flat
 batteries. An index from an earlier version gains all of this on open, empty
 for the runs it already holds — `scan --reindex` fills them in from the
@@ -746,8 +869,10 @@ explorer** (each machine against the median of the machines like it), **groups**
 (the estate by site, system model, CPU, OS or any tag), **lifecycle** (what
 each machine calls for — replace, repair, investigate, watch or keep — and
 why), a sortable **machine table**, and a **drilldown** per machine with its
-score history, its components, its findings in full, its drives, and every
-subtest of its latest run. On a phone the six tabs scroll sideways inside
+score history, its components, its findings in full, its drives, every
+subtest of its latest run, and — where a [threshold
+override](#thresholds-and-different-lines-for-some-machines) applies — the
+lines it was judged against instead. On a phone the six tabs scroll sideways inside
 their strip, with the current one kept in view and a fade on the edge where
 more are hidden.
 
@@ -794,9 +919,11 @@ that fired it written out:
 | **Watch** | Old, or graded D |
 | **Keep** | None of the above |
 
-- **Old** is at least five years by the machine's best-estimate age — the
-  upper bound from its CPU, or the dating from original firmware where there
-  is one (see [How old a machine is](#how-old-a-machine-is)). The reason says
+- **Old** is at least five years (`replace_age_years`, which the configuration
+  can change for the whole fleet or for some machines — see
+  [Thresholds](#thresholds-and-different-lines-for-some-machines)) by the
+  machine's best-estimate age — the upper bound from its CPU, or the dating
+  from original firmware where there is one (see [How old a machine is](#how-old-a-machine-is)). The reason says
   which: "At most 6.2 years old, by its CPU's launch date" or "About 4.1 years
   old, by its original firmware's date". A machine with no age evidence is
   never old; it is not guessed.
@@ -836,7 +963,8 @@ to replace.
 `report --lifecycle` prints the replace, repair and investigate lists with
 their reasons (`--all` adds the machines to watch), and `--json` the counts
 and every machine that is not *keep*. The five-year line is
-`replace_age_years` in the `thresholds` every snapshot carries.
+`replace_age_years` in the `thresholds` every snapshot carries; a machine an
+override gives another age names that rule in its `overridden_by`.
 
 ### What changed, and the fleet over time
 
@@ -875,6 +1003,11 @@ than because a threshold was tuned — and some consequences worth knowing:
   of this tool reads (drive health, for one) is empty on runs indexed before
   it until `scan --reindex`, so a drive finding cannot appear in a week before
   the drive data does.
+- **Thresholds are today's too.** A threshold changed, or an override added,
+  re-judges every week. Which override picks a machine in a past week depends
+  on the tags and models of the run that stood for it then — what it was
+  judged as is what it was — while which week it is *shown* in follows its
+  tags now, as below.
 - **A machine is shown under the tags it carries now**, in every week — the
   history is projected onto your current view, so the filter and your sign-in
   scope apply exactly as they do everywhere else, and a machine that moved
@@ -899,6 +1032,9 @@ diffed; `GET /api/groups?by=<dimension>` is the Groups tab, taking the same
 filter parameters; `GET /api/changes?window=1|4|13` and
 `GET /api/timeline?weeks=4…26` are the overview's "What changed" and its
 charts, taking the same filter parameters too; and `GET /api/machine/{key}` is the drilldown payload.
+The snapshot carries the fleet-wide `thresholds` and the configured
+`threshold_overrides`, and each machine, there and in the drilldown, its
+`overridden_by`.
 `POST /api/triage` (`{ machine_key, code, action: "acknowledge" | "snooze" |
 "clear", until?, note? }`) acknowledges, snoozes or clears one finding;
 `GET /api/suppressions` lists the suppression rules the caller may see, and an

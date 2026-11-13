@@ -96,14 +96,17 @@
 //! their own condition is not; a weak component is read off the benchmark, so
 //! it counts as a performance figure here.
 
+mod thresholds;
 mod timeline;
 
+pub use thresholds::{AppliedOverride, FIELDS, Override, Tuning, field};
 pub use timeline::{
     BySeverity, CHANGE_WINDOWS, Changes, FindingChange, TIMELINE_WEEKS, Timeline, TimelineView,
     parse_weeks, parse_window,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -112,8 +115,10 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Every number a rule turns on, in one place, so tuning the engine is a config
-/// change rather than a code read.
-#[derive(Debug, Clone, Serialize)]
+/// change rather than a code read: `[thresholds]` in the config file sets any of
+/// them for the whole fleet, and `[[thresholds.overrides]]` sets the ones that
+/// judge a single machine for the machines a rule picks — see `thresholds`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Thresholds {
     /// Below this many members a cohort median is not worth comparing against:
     /// with three machines, one bad machine is a third of the sample.
@@ -402,6 +407,13 @@ fn parse_day(s: &str) -> Option<time::Date> {
     .ok()
 }
 
+/// A threshold as a finding quotes it: `15`, `7.5`, never `15.000000000000002`
+/// — which is what 0.15 × 100 is in floating point.
+fn figure(v: f64) -> String {
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 /// "12.4 GiB" for small amounts, where "12 GiB" and "0 GiB" would hide the
 /// difference that matters on a nearly full disk; whole GiB above that.
 fn free_bytes(bytes: i64) -> String {
@@ -567,6 +579,17 @@ pub struct MachineView {
     pub trend_pct: Option<f64>,
     /// What to do about the machine. Set by `assess`, from its findings.
     pub lifecycle: Lifecycle,
+    /// The lines this machine is judged against: the fleet-wide thresholds
+    /// with whatever overrides pick it applied. Set by `assess`, and read by
+    /// every rule that judges one machine, so none can fall back to the
+    /// fleet-wide value for a machine an override has changed. Not
+    /// serialised: `overridden_by` says what differs, and the snapshot carries
+    /// the fleet-wide values.
+    #[serde(skip)]
+    pub thresholds: Arc<Thresholds>,
+    /// The overrides that changed how this machine was judged, each with the
+    /// thresholds it supplied. Empty when the fleet-wide lines apply.
+    pub overridden_by: Vec<AppliedOverride>,
     pub run_id: i64,
     pub source_path: String,
 }
@@ -784,7 +807,8 @@ impl Evidence<'_> {
 }
 
 /// A machine's lifecycle verdict, from its own findings and its age.
-fn lifecycle(m: &MachineView, flags: &[&Flag], th: &Thresholds) -> Lifecycle {
+fn lifecycle(m: &MachineView, flags: &[&Flag]) -> Lifecycle {
+    let th = &m.thresholds;
     let grade = flags.iter().copied().find(|f| f.code == "grade_low");
     let e = Evidence {
         failing: grade.filter(|f| f.severity == Severity::Critical),
@@ -973,7 +997,12 @@ pub struct Snapshot {
     /// every commit between two releases reports the same one.
     pub build: &'static str,
     pub generated_at: String,
+    /// The fleet-wide thresholds: what a machine is judged against unless an
+    /// override picks it.
     pub thresholds: Thresholds,
+    /// The `[[thresholds.overrides]]` rules, in the order they are tried. Each
+    /// machine's `overridden_by` names the ones that changed it.
+    pub threshold_overrides: Vec<Override>,
     pub summary: Summary,
     pub machines: Vec<MachineView>,
     pub cohorts: Vec<Cohort>,
@@ -1130,7 +1159,7 @@ fn cohort_id(cpu_model: &str, cmp: &Comparability) -> String {
 /// view of *now* deliberately does not, because a machine that vanished from
 /// the dashboard for having a bad clock would be a worse answer than one shown
 /// with a date that looks odd.
-pub fn snapshot(conn: &Connection, th: &Thresholds, now: OffsetDateTime) -> Result<Snapshot> {
+pub fn snapshot(conn: &Connection, th: &Tuning, now: OffsetDateTime) -> Result<Snapshot> {
     let history = load_history(conn)?;
     let own = by_machine(&history);
     let mut machines = load_runs(conn, &Pick::Latest)?;
@@ -1162,7 +1191,7 @@ pub fn snapshot(conn: &Connection, th: &Thresholds, now: OffsetDateTime) -> Resu
 /// most two cutoffs' worth.
 fn reconstruct(
     conn: &Connection,
-    th: &Thresholds,
+    th: &Tuning,
     cutoffs: &[OffsetDateTime],
     mut each: impl FnMut(OffsetDateTime, Snapshot) -> Result<()>,
 ) -> Result<()> {
@@ -1214,11 +1243,18 @@ fn reconstruct(
 /// Cohorts, deltas, findings and the summary, over machines already placed in
 /// time. The half of a snapshot that is pure rules: everything here sees only
 /// what it is handed, which is what lets a reconstruction of the past share it.
+///
+/// Each machine's own thresholds are resolved first, from the run being
+/// judged, so the live snapshot and every week of the timeline choose a
+/// machine's lines the same way. The cohort statistics take the fleet-wide
+/// values, which no override can change.
 fn assess(
     mut machines: Vec<MachineView>,
-    th: &Thresholds,
+    tuning: &Tuning,
     now: OffsetDateTime,
 ) -> Result<Snapshot> {
+    tuning.apply(&mut machines);
+    let th = &tuning.fleet;
     let cohorts = build_cohorts(&machines, th);
 
     let by_id: HashMap<&str, &Cohort> = cohorts.iter().map(|c| (c.id.as_str(), c)).collect();
@@ -1239,16 +1275,17 @@ fn assess(
     }
     for m in &mut machines {
         let own = flags_of.get(m.key.as_str()).map_or(&[][..], Vec::as_slice);
-        m.lifecycle = lifecycle(m, own, th);
+        m.lifecycle = lifecycle(m, own);
     }
 
-    let summary = summarise(&machines, &cohorts, &flags, th);
+    let summary = summarise(&machines, &cohorts, &flags);
 
     Ok(Snapshot {
         version: env!("CARGO_PKG_VERSION"),
         build: env!("FLEET_BUILD"),
         generated_at: now.format(&Rfc3339)?,
         thresholds: th.clone(),
+        threshold_overrides: tuning.overrides.clone(),
         summary,
         machines,
         cohorts,
@@ -1447,6 +1484,8 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
             age_days: None,
             // Set by `assess`, once the findings it rests on exist.
             lifecycle: Lifecycle::default(),
+            thresholds: Arc::default(),
+            overridden_by: Vec::new(),
             worst_drive_wear_pct: drives
                 .iter()
                 .filter_map(|d| d.percentage_used)
@@ -1589,14 +1628,20 @@ fn build_cohorts(machines: &[MachineView], th: &Thresholds) -> Vec<Cohort> {
         .collect()
 }
 
+/// Every finding, machine by machine.
+///
+/// `fleet` is the fleet-wide thresholds, and only the cohort statistics read
+/// it; everything that judges one machine against a line reads that machine's
+/// own, `th` below, which an override may have changed.
 fn evaluate(
     machines: &[MachineView],
     cohorts: &HashMap<&str, &Cohort>,
     firmware: &HashMap<&str, NewestFirmware>,
-    th: &Thresholds,
+    fleet: &Thresholds,
 ) -> Vec<Flag> {
     let mut flags = Vec::new();
     for m in machines {
+        let th = &*m.thresholds;
         let score = m.score.unwrap_or(0.0);
         let mut push = |severity: Severity,
                         kind: FlagKind,
@@ -1651,7 +1696,7 @@ fn evaluate(
         {
             let shortfall = -delta / 100.0;
             let z = 0.6745 * (cohort.median - score) / cohort.scale;
-            if shortfall >= th.cohort_min_shortfall && z >= th.cohort_z {
+            if shortfall >= fleet.cohort_min_shortfall && z >= fleet.cohort_z {
                 let sev = if shortfall >= 0.25 {
                     Severity::Critical
                 } else {
@@ -1699,10 +1744,12 @@ fn evaluate(
                 format!("{:.0}% slower than its own earlier runs", -trend),
                 format!(
                     "Now {score:.0}, against a median of {:.0} over {} earlier comparable \
-                     run(s). Comparing a machine with itself holds the hardware constant, which \
-                     makes this the strongest signal in the fleet: something has changed.{}",
+                     run(s); a drop of {}% or more is a regression. Comparing a machine with \
+                     itself holds the hardware constant, which makes this the strongest signal \
+                     in the fleet: something has changed.{}",
                     score / (1.0 + trend / 100.0),
                     m.runs.saturating_sub(1),
+                    figure(th.regression_frac * 100.0),
                     if explained {
                         " This run was thermally limited, taken on battery or held back by its \
                          power settings, which may account for some of it — re-measure before \
@@ -1751,15 +1798,14 @@ fn evaluate(
                 FlagKind::Machine,
                 "battery_worn",
                 format!("Battery at {health:.0}% of design capacity"),
-                match m.battery_cycles {
-                    Some(c) => format!(
-                        "{c} charge cycles. Nothing to do with performance, but it is the part \
-                         of a laptop that fails first and the one its user notices."
-                    ),
-                    None => "Nothing to do with performance, but it is the part of a laptop that \
-                             fails first and the one its user notices."
-                        .to_string(),
-                },
+                format!(
+                    "{}Under {}% a battery counts as worn. Nothing to do with performance, but it \
+                     is the part of a laptop that fails first and the one its user notices.",
+                    m.battery_cycles
+                        .map(|c| format!("{c} charge cycles. "))
+                        .unwrap_or_default(),
+                    figure(th.battery_health_pct),
+                ),
             );
         }
 
@@ -1870,15 +1916,22 @@ fn evaluate(
                     if w >= 100 {
                         "the rating, and usually the warranty's write allowance, is spent. Keep \
                          its data backed up and replace it."
+                            .to_string()
                     } else {
-                        "it is most of the way there. Plan a replacement before it reaches 100."
+                        format!(
+                            "it is past the {}% at which a drive counts as worn. Plan a \
+                             replacement before it reaches 100.",
+                            figure(th.drive_wear_pct)
+                        )
                     }
                 ));
             }
             if let Some(s) = spare {
                 why.push(format!(
-                    "It has {s}% of its spare blocks left — the pool worn-out cells are remapped \
-                     to. When that runs out, a drive typically makes itself read-only."
+                    "It has {s}% of its spare blocks left, under the {}% line — the pool \
+                     worn-out cells are remapped to. When that runs out, a drive typically makes \
+                     itself read-only.",
+                    figure(th.drive_spare_pct)
                 ));
             }
             push(
@@ -1914,14 +1967,17 @@ fn evaluate(
                 "disk_nearly_full",
                 format!("Only {pct:.1}% free on {mount}"),
                 format!(
-                    "{}An SSD slows down as it fills — it has fewer free blocks to write into and \
-                     spends more time reclaiming them — so this is judged as a share of the volume \
-                     rather than in gigabytes: a nearly full large drive is as slow as a nearly \
-                     full small one. Updates need room to install, too. Clear space, then \
-                     re-measure; the disk figures from this run may understate the drive.",
+                    "{}Under {}% free is nearly full, and under {}% critical. An SSD slows down \
+                     as it fills — it has fewer free blocks to write into and spends more time \
+                     reclaiming them — so this is judged as a share of the volume rather than in \
+                     gigabytes: a nearly full large drive is as slow as a nearly full small one. \
+                     Updates need room to install, too. Clear space, then re-measure; the disk \
+                     figures from this run may understate the drive.",
                     m.disk_low_free_bytes
                         .map(|b| format!("{} free. ", free_bytes(b)))
                         .unwrap_or_default(),
+                    figure(th.disk_free_pct),
+                    figure(th.disk_free_critical_pct),
                 ),
             );
         }
@@ -1949,15 +2005,16 @@ fn evaluate(
                 "Firmware older than on other machines of this model".to_string(),
                 format!(
                     "This machine runs BIOS {bios_version}, dated {day}. The newest seen on a \
-                     {model} in this estate is {}, dated {}, {} days newer — {others}, of {} with \
-                     a recorded firmware date. So the update exists and has been installed \
-                     elsewhere. Firmware updates carry security and stability fixes, and \
-                     sometimes power or thermal changes that move benchmark results, which also \
-                     makes this machine's figures less comparable with its peers' until it is \
-                     updated.",
+                     {model} in this estate is {}, dated {}, {} days newer, where {} days is \
+                     the line — {others}, of {} with a recorded firmware date. So the update \
+                     exists and has been installed elsewhere. Firmware updates carry security \
+                     and stability fixes, and sometimes power or thermal changes that move \
+                     benchmark results, which also makes this machine's figures less comparable \
+                     with its peers' until it is updated.",
                     newest.version.as_deref().unwrap_or("an unrecorded version"),
                     newest.date,
                     (newest.date - day).whole_days(),
+                    figure(th.firmware_behind_days),
                     newest.dated,
                 ),
             );
@@ -1979,11 +2036,13 @@ fn evaluate(
                     format!("Firmware {years:.1} years old when measured"),
                     format!(
                         "BIOS {bios_version}, dated {day}, was {years:.1} years old when this \
-                         machine was measured on {run_day}. Firmware updates carry security and \
-                         stability fixes, and sometimes power or thermal changes that move \
-                         benchmark results. No machine of the same model here is far enough ahead \
-                         to compare against, so check the vendor's support site for a later \
-                         release."
+                         machine was measured on {run_day}, past the {} years after which \
+                         firmware is named as old. Firmware updates carry security and stability \
+                         fixes, and sometimes power or thermal changes that move benchmark \
+                         results. No machine of the same model here is far enough ahead to \
+                         compare against, so check the vendor's support site for a later \
+                         release.",
+                        figure(th.firmware_old_years)
                     ),
                 );
             }
@@ -2070,11 +2129,14 @@ fn evaluate(
                     "{} CPU subtests measured with low confidence",
                     m.low_confidence_cpu_subtests
                 ),
-                "The CPU kernels are deterministic, so iteration-to-iteration spread there means \
-                 something else was running on the machine — unlike spread on disk writes or on \
-                 the network, which is the hardware behaving normally. Re-measure it idle before \
-                 drawing anything from this run."
-                    .to_string(),
+                format!(
+                    "At {} or more the run is too shaky to read. The CPU kernels are \
+                     deterministic, so iteration-to-iteration spread there means something else \
+                     was running on the machine — unlike spread on disk writes or on the \
+                     network, which is the hardware behaving normally. Re-measure it idle before \
+                     drawing anything from this run.",
+                    th.unstable_cpu_subtests
+                ),
             );
         }
 
@@ -2089,9 +2151,11 @@ fn evaluate(
                 "stale",
                 format!("Last measured {age:.0} days ago"),
                 format!(
-                    "Taken {} with loadbearer {}. Old enough that it describes the machine as it \
-                     was rather than as it is.",
-                    m.taken_at, m.tool_version
+                    "Taken {} with loadbearer {}. After {} days a result describes the machine \
+                     as it was rather than as it is.",
+                    m.taken_at,
+                    m.tool_version,
+                    figure(th.stale_days)
                 ),
             );
         }
@@ -2138,7 +2202,7 @@ fn evaluate(
                     cohort.members,
                     m.cpu_model,
                     m.comparability.label(),
-                    th.min_cohort
+                    fleet.min_cohort
                 ),
             );
         }
@@ -2197,20 +2261,16 @@ fn needs_attention(s: Severity) -> bool {
     s != Severity::Info
 }
 
-/// Whether a machine's latest result is history rather than inventory.
-fn is_stale(m: &MachineView, th: &Thresholds) -> bool {
-    m.age_days.is_some_and(|a| a > th.stale_days)
+/// Whether a machine's latest result is history rather than inventory, by the
+/// machine's own `stale_days`.
+fn is_stale(m: &MachineView) -> bool {
+    m.age_days.is_some_and(|a| a > m.thresholds.stale_days)
 }
 
 /// Everything in the summary is derived from the machines in view, never from a
 /// separate query, so a filtered view's headline always agrees with the rows
 /// underneath it.
-fn summarise(
-    machines: &[MachineView],
-    cohorts: &[Cohort],
-    flags: &[Flag],
-    th: &Thresholds,
-) -> Summary {
+fn summarise(machines: &[MachineView], cohorts: &[Cohort], flags: &[Flag]) -> Summary {
     let scores = sorted_of(machines.iter().filter_map(|m| m.score));
     let grades = grade_histogram(machines.iter().map(|m| m.grade.as_str()));
 
@@ -2241,7 +2301,7 @@ fn summarise(
         info: live(Severity::Info),
         machines_flagged: flagged.len(),
         quieted: QuietCounts::of(flags),
-        stale: machines.iter().filter(|m| is_stale(m, th)).count(),
+        stale: machines.iter().filter(|m| is_stale(m)).count(),
         partial: machines.iter().filter(|m| m.partial).count(),
         thermally_limited: machines
             .iter()
@@ -2422,10 +2482,9 @@ impl Snapshot {
     /// finding comes out live; see `filtered_with` for the view with triage.
     /// Only the tests want a view without it.
     #[cfg(test)]
-    pub fn filtered(&self, f: &Filter, th: &Thresholds) -> Snapshot {
+    pub fn filtered(&self, f: &Filter) -> Snapshot {
         self.filtered_with(
             f,
-            th,
             &crate::state::Book::default(),
             OffsetDateTime::UNIX_EPOCH,
         )
@@ -2453,7 +2512,6 @@ impl Snapshot {
     pub fn filtered_with(
         &self,
         f: &Filter,
-        th: &Thresholds,
         book: &crate::state::Book,
         now: OffsetDateTime,
     ) -> Snapshot {
@@ -2517,7 +2575,8 @@ impl Snapshot {
             build: self.build,
             generated_at: self.generated_at.clone(),
             thresholds: self.thresholds.clone(),
-            summary: summarise(&machines, &cohorts, &flags, th),
+            threshold_overrides: self.threshold_overrides.clone(),
+            summary: summarise(&machines, &cohorts, &flags),
             machines,
             cohorts,
             flags,
@@ -2805,7 +2864,7 @@ pub fn groups(snap: &Snapshot, by: &GroupBy) -> Vec<Group> {
                 quieted,
                 queues,
                 top_flags,
-                stale: ms.iter().filter(|m| is_stale(m, th)).count(),
+                stale: ms.iter().filter(|m| is_stale(m)).count(),
                 median_max_age_months: med(&ages),
                 with_age: ages.len(),
                 replace: decided.replace,
@@ -2870,6 +2929,9 @@ pub struct Candidate {
     pub score: Option<f64>,
     pub system_model: Option<String>,
     pub tags: BTreeMap<String, String>,
+    /// The overrides that changed how this machine was judged, by name — one
+    /// may have moved where "old" starts for it.
+    pub overridden_by: Vec<String>,
 }
 
 /// The lifecycle list, as `report --lifecycle --json` prints it.
@@ -2879,6 +2941,8 @@ pub struct LifecycleReport {
     /// Machines in view; `counts` adds up to it.
     pub machines: usize,
     pub counts: LifecycleCounts,
+    /// Fleet-wide. A candidate an override picks may be judged against
+    /// another; its `overridden_by` says so.
     pub replace_age_years: f64,
     /// Every machine with a verdict other than keep, most urgent first and
     /// then by name. Keep is only counted: it is most of a healthy estate, and
@@ -2901,6 +2965,7 @@ pub fn lifecycle_report(snap: &Snapshot) -> LifecycleReport {
             score: m.score,
             system_model: m.system_model.clone(),
             tags: m.tags.clone(),
+            overridden_by: m.overridden_by.iter().map(|o| o.name.clone()).collect(),
         })
         .collect();
     candidates.sort_by(|a, b| {
@@ -3123,14 +3188,14 @@ mod tests {
         }
 
         fn snap_at(&self, at: OffsetDateTime) -> Snapshot {
-            snapshot(self.idx.conn(), &Thresholds::default(), at).unwrap()
+            snapshot(self.idx.conn(), &Tuning::default(), at).unwrap()
         }
 
         /// The fleet as it was known at `at`: only runs taken by then, judged
         /// with `at` as now. What the timeline holds for each of its weeks.
         fn snap_as_of(&self, at: OffsetDateTime) -> Snapshot {
             let mut out = None;
-            reconstruct(self.idx.conn(), &Thresholds::default(), &[at], |_, s| {
+            reconstruct(self.idx.conn(), &Tuning::default(), &[at], |_, s| {
                 out = Some(s);
                 Ok(())
             })
@@ -3140,7 +3205,7 @@ mod tests {
 
         /// The timeline as the server builds it, `weeks` back from `now()`.
         fn timeline(&self, weeks: usize) -> (Snapshot, Timeline) {
-            let th = Thresholds::default();
+            let th = Tuning::default();
             let snap = snapshot(self.idx.conn(), &th, now()).unwrap();
             let t = Timeline::build(self.idx.conn(), &th, &snap, now(), weeks).unwrap();
             (snap, t)
@@ -3744,13 +3809,10 @@ mod tests {
 
         let mut tags = BTreeMap::new();
         tags.insert("site".to_string(), "glasgow".to_string());
-        let view = all.filtered(
-            &Filter {
-                tags,
-                ..Default::default()
-            },
-            &Thresholds::default(),
-        );
+        let view = all.filtered(&Filter {
+            tags,
+            ..Default::default()
+        });
 
         assert_eq!(view.summary.machines, 5);
         assert_eq!(
@@ -3783,13 +3845,10 @@ mod tests {
 
         let mut tags = BTreeMap::new();
         tags.insert("site".to_string(), "glasgow".to_string());
-        let view = all.filtered(
-            &Filter {
-                tags,
-                ..Default::default()
-            },
-            &Thresholds::default(),
-        );
+        let view = all.filtered(&Filter {
+            tags,
+            ..Default::default()
+        });
         assert_eq!(view.summary.machines, 1);
         assert!(
             flags_for(&view, "thermal_limited").is_empty(),
@@ -3804,35 +3863,25 @@ mod tests {
         e.add("FRESH-1", 1000.0, "2026-09-08T10:00:00Z");
         e.add("OLD-1", 1000.0, "2026-01-01T10:00:00Z");
         let all = e.snap();
-        let th = Thresholds::default();
 
-        let recent = all.filtered(
-            &Filter {
-                max_age_days: Some(30.0),
-                ..Default::default()
-            },
-            &th,
-        );
+        let recent = all.filtered(&Filter {
+            max_age_days: Some(30.0),
+            ..Default::default()
+        });
         assert_eq!(recent.summary.machines, 1);
         assert_eq!(recent.machines[0].hostname.as_deref(), Some("FRESH-1"));
 
-        let searched = all.filtered(
-            &Filter {
-                search: Some("old".into()),
-                ..Default::default()
-            },
-            &th,
-        );
+        let searched = all.filtered(&Filter {
+            search: Some("old".into()),
+            ..Default::default()
+        });
         assert_eq!(searched.summary.machines, 1, "search is case-insensitive");
         assert_eq!(searched.machines[0].hostname.as_deref(), Some("OLD-1"));
 
-        let stale = all.filtered(
-            &Filter {
-                flag: Some("stale".into()),
-                ..Default::default()
-            },
-            &th,
-        );
+        let stale = all.filtered(&Filter {
+            flag: Some("stale".into()),
+            ..Default::default()
+        });
         assert_eq!(stale.summary.machines, 1);
         assert_eq!(stale.machines[0].hostname.as_deref(), Some("OLD-1"));
     }
@@ -3855,15 +3904,11 @@ mod tests {
             d["tags"] = json!({ "owner": "akhan", "site": "glasgow" });
         });
         let all = e.snap();
-        let th = Thresholds::default();
 
-        let mine = all.filtered(
-            &Filter {
-                search: Some("JSmith".into()),
-                ..Default::default()
-            },
-            &th,
-        );
+        let mine = all.filtered(&Filter {
+            search: Some("JSmith".into()),
+            ..Default::default()
+        });
         assert_eq!(
             mine.summary.machines, 2,
             "one person can own several machines, and searching them should return all of them"
@@ -3871,13 +3916,10 @@ mod tests {
 
         // Keys are deliberately not matched: every machine carries `site`, so
         // searching for it returning the whole estate would be useless.
-        let by_key = all.filtered(
-            &Filter {
-                search: Some("site".into()),
-                ..Default::default()
-            },
-            &th,
-        );
+        let by_key = all.filtered(&Filter {
+            search: Some("site".into()),
+            ..Default::default()
+        });
         assert_eq!(
             by_key.summary.machines, 0,
             "a tag key is not a value and must not match every machine that has one"
@@ -3916,15 +3958,11 @@ mod tests {
             d["machine"]["power"] = json!({ "source": "mains", "platform_profile": "low-power" });
         });
         let all = e.snap();
-        let th = Thresholds::default();
         let hosts = |q: &str| -> Vec<String> {
-            let s = all.filtered(
-                &Filter {
-                    search: Some(q.into()),
-                    ..Default::default()
-                },
-                &th,
-            );
+            let s = all.filtered(&Filter {
+                search: Some(q.into()),
+                ..Default::default()
+            });
             let mut h: Vec<_> = s
                 .machines
                 .iter()
@@ -3974,33 +4012,26 @@ mod tests {
             );
         }
         let all = e.snap();
-        let th = Thresholds::default();
         let glasgow_only = vec![BTreeMap::from([(
             "site".to_string(),
             "glasgow".to_string(),
         )])];
 
-        let scoped = all.filtered(
-            &Filter {
-                scopes: glasgow_only.clone(),
-                ..Default::default()
-            },
-            &th,
-        );
+        let scoped = all.filtered(&Filter {
+            scopes: glasgow_only.clone(),
+            ..Default::default()
+        });
         assert_eq!(scoped.summary.machines, 2);
         assert!(scoped.machines.iter().all(|m| m.tags["site"] == "glasgow"));
 
         // The interesting case: a scoped viewer asking for the other site.
         let mut tags = BTreeMap::new();
         tags.insert("site".to_string(), "edinburgh".to_string());
-        let overreach = all.filtered(
-            &Filter {
-                scopes: glasgow_only,
-                tags,
-                ..Default::default()
-            },
-            &th,
-        );
+        let overreach = all.filtered(&Filter {
+            scopes: glasgow_only,
+            tags,
+            ..Default::default()
+        });
         assert_eq!(
             overreach.summary.machines, 0,
             "asking outside your scope returns nothing, not the other site"
@@ -4022,30 +4053,23 @@ mod tests {
         });
         e.add_with("EDI-1", 1000.0, "2026-09-01T10:00:00Z", tagged("edinburgh"));
         let all = e.snap();
-        let th = Thresholds::default();
 
-        let both_sites = all.filtered(
-            &Filter {
-                scopes: vec![
-                    BTreeMap::from([("site".to_string(), "glasgow".to_string())]),
-                    BTreeMap::from([("site".to_string(), "edinburgh".to_string())]),
-                ],
-                ..Default::default()
-            },
-            &th,
-        );
+        let both_sites = all.filtered(&Filter {
+            scopes: vec![
+                BTreeMap::from([("site".to_string(), "glasgow".to_string())]),
+                BTreeMap::from([("site".to_string(), "edinburgh".to_string())]),
+            ],
+            ..Default::default()
+        });
         assert_eq!(both_sites.summary.machines, 3);
 
-        let narrow = all.filtered(
-            &Filter {
-                scopes: vec![BTreeMap::from([
-                    ("site".to_string(), "glasgow".to_string()),
-                    ("ring".to_string(), "canary".to_string()),
-                ])],
-                ..Default::default()
-            },
-            &th,
-        );
+        let narrow = all.filtered(&Filter {
+            scopes: vec![BTreeMap::from([
+                ("site".to_string(), "glasgow".to_string()),
+                ("ring".to_string(), "canary".to_string()),
+            ])],
+            ..Default::default()
+        });
         assert_eq!(
             narrow.summary.machines, 1,
             "every tag in a scope must match"
@@ -4067,16 +4091,13 @@ mod tests {
         let all = e.snap();
         assert_eq!(all.summary.machines, 2, "both are in the fleet");
 
-        let scoped = all.filtered(
-            &Filter {
-                scopes: vec![BTreeMap::from([(
-                    "site".to_string(),
-                    "glasgow".to_string(),
-                )])],
-                ..Default::default()
-            },
-            &Thresholds::default(),
-        );
+        let scoped = all.filtered(&Filter {
+            scopes: vec![BTreeMap::from([(
+                "site".to_string(),
+                "glasgow".to_string(),
+            )])],
+            ..Default::default()
+        });
         assert_eq!(scoped.summary.machines, 1);
         assert_eq!(scoped.machines[0].hostname.as_deref(), Some("TAGGED"));
     }
@@ -4090,9 +4111,7 @@ mod tests {
         e.add_with("UNTAGGED", 1000.0, "2026-09-01T10:00:00Z", |d| {
             d["tags"] = json!({});
         });
-        let view = e
-            .snap()
-            .filtered(&Filter::default(), &Thresholds::default());
+        let view = e.snap().filtered(&Filter::default());
         assert_eq!(view.summary.machines, 2);
     }
 
@@ -4541,16 +4560,13 @@ mod tests {
             firmware("N32ET91W (1.67)", "2026-06-01")(d);
             tagged("edinburgh")(d);
         });
-        let view = e.snap().filtered(
-            &Filter {
-                scopes: vec![BTreeMap::from([(
-                    "site".to_string(),
-                    "glasgow".to_string(),
-                )])],
-                ..Default::default()
-            },
-            &Thresholds::default(),
-        );
+        let view = e.snap().filtered(&Filter {
+            scopes: vec![BTreeMap::from([(
+                "site".to_string(),
+                "glasgow".to_string(),
+            )])],
+            ..Default::default()
+        });
         assert_eq!(view.summary.machines, 1);
         assert!(flag_on(&view, "firmware_behind_peers", "GLA-OLD").is_some());
     }
@@ -5046,7 +5062,6 @@ mod tests {
         }
         let all = e.snap();
         let fleet = groups(&all, &GroupBy::Model);
-        let th = Thresholds::default();
         let glasgow = BTreeMap::from([("site".to_string(), "glasgow".to_string())]);
 
         for (why, filter) in [
@@ -5065,7 +5080,7 @@ mod tests {
                 },
             ),
         ] {
-            let view = all.filtered(&filter, &th);
+            let view = all.filtered(&filter);
             let gs = groups(&view, &GroupBy::Model);
             assert_eq!(gs.len(), 1, "{why}: only Glasgow's model is in view");
             assert_eq!(gs[0].value.as_deref(), Some("Dell Inc. Latitude 7440"));
@@ -5098,9 +5113,8 @@ mod tests {
             d["machine"]["cpu_model"] = json!("Some Other CPU");
         });
         let all = e.snap();
-        let th = Thresholds::default();
         let hosts = |f: Filter| -> Vec<String> {
-            all.filtered(&f, &th)
+            all.filtered(&f)
                 .machines
                 .iter()
                 .filter_map(|m| m.hostname.clone())
@@ -5506,13 +5520,10 @@ mod tests {
         );
 
         let (snap, t) = e.timeline(4);
-        let glasgow = snap.filtered(
-            &Filter {
-                scopes: vec![BTreeMap::from([("site".into(), "glasgow".into())])],
-                ..Default::default()
-            },
-            &Thresholds::default(),
-        );
+        let glasgow = snap.filtered(&Filter {
+            scopes: vec![BTreeMap::from([("site".into(), "glasgow".into())])],
+            ..Default::default()
+        });
         assert_eq!(glasgow.summary.machines, 3);
         let points = t.view(&glasgow, 4).points;
         let machines: Vec<usize> = points.iter().map(|p| p.machines).collect();
@@ -5526,13 +5537,10 @@ mod tests {
             glasgow.summary.machines_flagged
         );
 
-        let edinburgh = snap.filtered(
-            &Filter {
-                tags: BTreeMap::from([("site".into(), "edinburgh".into())]),
-                ..Default::default()
-            },
-            &Thresholds::default(),
-        );
+        let edinburgh = snap.filtered(&Filter {
+            tags: BTreeMap::from([("site".into(), "edinburgh".into())]),
+            ..Default::default()
+        });
         let machines: Vec<usize> = t
             .view(&edinburgh, 4)
             .points
@@ -5542,13 +5550,10 @@ mod tests {
         assert_eq!(machines, [1, 1, 1, 1, 1], "the mover left with its history");
 
         // Nobody in view: nothing sent, rather than a line of zeros.
-        let nobody = snap.filtered(
-            &Filter {
-                tags: BTreeMap::from([("site".into(), "dundee".into())]),
-                ..Default::default()
-            },
-            &Thresholds::default(),
-        );
+        let nobody = snap.filtered(&Filter {
+            tags: BTreeMap::from([("site".into(), "dundee".into())]),
+            ..Default::default()
+        });
         assert!(t.view(&nobody, 4).points.is_empty());
         assert!(t.changes(&nobody, 1).baseline_empty);
     }
@@ -5805,7 +5810,7 @@ mod tests {
         }
         eprintln!("ingest: {:?}", started.elapsed());
 
-        let th = Thresholds::default();
+        let th = Tuning::default();
         let started = std::time::Instant::now();
         let snap = snapshot(e.idx.conn(), &th, now()).unwrap();
         eprintln!("snapshot: {:?}", started.elapsed());
@@ -6286,14 +6291,10 @@ mod tests {
         let edi = group(&gs, Some("edinburgh"));
         assert_eq!((edi.replace, edi.repair), (1, 0));
 
-        let th = Thresholds::default();
-        let replace = s.filtered(
-            &Filter {
-                lifecycle: Some(Verdict::Replace),
-                ..Default::default()
-            },
-            &th,
-        );
+        let replace = s.filtered(&Filter {
+            lifecycle: Some(Verdict::Replace),
+            ..Default::default()
+        });
         let mut hosts: Vec<_> = replace
             .machines
             .iter()
@@ -6315,14 +6316,11 @@ mod tests {
         // With another filter, both apply.
         let mut tags = BTreeMap::new();
         tags.insert("site".to_string(), "glasgow".to_string());
-        let glasgow_replace = s.filtered(
-            &Filter {
-                tags,
-                lifecycle: Some(Verdict::Replace),
-                ..Default::default()
-            },
-            &th,
-        );
+        let glasgow_replace = s.filtered(&Filter {
+            tags,
+            lifecycle: Some(Verdict::Replace),
+            ..Default::default()
+        });
         assert_eq!(glasgow_replace.summary.machines, 1);
 
         let report = lifecycle_report(&s);
@@ -6518,13 +6516,8 @@ mod tests {
             )],
             &[],
         );
-        let plain = raw.filtered_with(
-            &Filter::default(),
-            &Thresholds::default(),
-            &Default::default(),
-            now(),
-        );
-        let view = raw.filtered_with(&Filter::default(), &Thresholds::default(), &book, now());
+        let plain = raw.filtered_with(&Filter::default(), &Default::default(), now());
+        let view = raw.filtered_with(&Filter::default(), &book, now());
 
         assert_eq!(triage_of(&view, "FULL"), Some(Acknowledged));
         assert_eq!(
@@ -6569,7 +6562,6 @@ mod tests {
                 flag: Some("disk_nearly_full".into()),
                 ..Filter::default()
             },
-            &Thresholds::default(),
             &book,
             now(),
         );
@@ -6596,9 +6588,7 @@ mod tests {
             )],
             &[],
         );
-        let at = |t: OffsetDateTime| {
-            raw.filtered_with(&Filter::default(), &Thresholds::default(), &book, t)
-        };
+        let at = |t: OffsetDateTime| raw.filtered_with(&Filter::default(), &book, t);
 
         assert_eq!(triage_of(&at(now()), "FULL"), Some(Snoozed));
         assert_eq!(
@@ -6653,9 +6643,7 @@ mod tests {
                 None,
             )],
         );
-        let view = |s: &Snapshot| {
-            s.filtered_with(&Filter::default(), &Thresholds::default(), &book, now())
-        };
+        let view = |s: &Snapshot| s.filtered_with(&Filter::default(), &book, now());
         let v = view(&before);
         assert_eq!(triage_of(&v, "ACKED"), Some(Acknowledged));
         assert_eq!(triage_of(&v, "SNOOZED"), Some(Snoozed));
@@ -6721,9 +6709,7 @@ mod tests {
 
         // And it fills again.
         e.add_with("FULL", 1000.0, "2026-09-07T10:00:00Z", disk_at(8.0, None));
-        let recurred =
-            e.snap()
-                .filtered_with(&Filter::default(), &Thresholds::default(), &book, now());
+        let recurred = e.snap().filtered_with(&Filter::default(), &book, now());
         assert_eq!(triage_of(&recurred, "FULL"), None, "a recurrence is news");
 
         // A machine missing altogether is not a finding resolved: an index
@@ -6763,9 +6749,7 @@ mod tests {
         e.add_with("NONE", 1000.0, "2026-09-01T10:00:00Z", disk_at(8.0, None));
         let raw = e.snap();
         let key = |h: &str| machine(&raw, h).key.clone();
-        let view = |book: &crate::state::Book| {
-            raw.filtered_with(&Filter::default(), &Thresholds::default(), book, now())
-        };
+        let view = |book: &crate::state::Book| raw.filtered_with(&Filter::default(), book, now());
         let states = |v: &Snapshot| ["GLA", "EDI", "NONE"].map(|h| triage_of(v, h));
 
         let by_tags = view(&book_of(
@@ -6815,5 +6799,405 @@ mod tests {
             .unwrap();
         assert_eq!(t.state, Suppressed, "suppress over acknowledge");
         assert_eq!(t.reach, Some(crate::state::Reach::Machine));
+    }
+
+    // --- Thresholds from the config file ------------------------------------
+
+    /// `[thresholds]` as a config file holds it, through the same reader and
+    /// the same checks a server applies at load.
+    fn tuning(text: &str) -> Tuning {
+        let c: crate::config::Config = toml::from_str(text).expect("parses");
+        c.validate().expect("valid");
+        c.thresholds.tuning().expect("valid thresholds")
+    }
+
+    impl Estate {
+        fn snap_with(&self, t: &Tuning) -> Snapshot {
+            snapshot(self.idx.conn(), t, now()).unwrap()
+        }
+    }
+
+    /// Tagged with a site, and nothing else changed.
+    fn at_site(site: &str) -> impl FnOnce(&mut Value) + use<'_> {
+        move |d: &mut Value| {
+            d["tags"] = json!({ "site": site });
+        }
+    }
+
+    fn overridden(s: &Snapshot, host: &str) -> Vec<(String, Vec<(&'static str, f64)>)> {
+        machine(s, host)
+            .overridden_by
+            .iter()
+            .map(|o| {
+                (
+                    o.name.clone(),
+                    o.set.iter().map(|(k, v)| (*k, *v)).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn hosts_with(s: &Snapshot, code: &str) -> Vec<String> {
+        flags_for(s, code)
+            .iter()
+            .filter_map(|f| f.hostname.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_fleet_wide_threshold_changes_the_finding() {
+        let mut e = Estate::new();
+        e.add("PC-1", 1000.0, "2026-05-01T10:00:00Z");
+        let s = e.snap();
+        assert_eq!(hosts_with(&s, "stale"), ["PC-1"], "131 days is past 90");
+        assert_eq!(s.summary.stale, 1);
+
+        let s = e.snap_with(&tuning("[thresholds]\nstale_days = 180\n"));
+        assert!(flags_for(&s, "stale").is_empty(), "{:?}", codes(&s));
+        assert_eq!(s.summary.stale, 0);
+        assert_eq!(s.thresholds.stale_days, 180.0, "the snapshot carries it");
+        assert!(
+            machine(&s, "PC-1").overridden_by.is_empty(),
+            "a fleet-wide value is not an override"
+        );
+    }
+
+    #[test]
+    fn an_override_by_tags_changes_only_the_machines_it_picks() {
+        let mut e = Estate::new();
+        e.add_with(
+            "KIOSK-1",
+            1000.0,
+            "2026-09-08T10:00:00Z",
+            disk_at(8.0, Some("kiosk")),
+        );
+        e.add_with(
+            "DESK-1",
+            1000.0,
+            "2026-09-08T10:00:00Z",
+            disk_at(8.0, Some("office")),
+        );
+        let t = tuning(
+            "[[thresholds.overrides]]\nname = \"kiosks\"\ntags = { site = \"kiosk\" }\n\
+             disk_free_pct = 5\ndisk_free_critical_pct = 2\n",
+        );
+        let s = e.snap_with(&t);
+        assert_eq!(hosts_with(&s, "disk_nearly_full"), ["DESK-1"]);
+        assert_eq!(
+            overridden(&s, "KIOSK-1"),
+            [(
+                "kiosks".to_string(),
+                vec![("disk_free_critical_pct", 2.0), ("disk_free_pct", 5.0)]
+            )]
+        );
+        assert!(machine(&s, "DESK-1").overridden_by.is_empty());
+        assert_eq!(s.threshold_overrides.len(), 1);
+        assert_eq!(s.threshold_overrides[0].name, "kiosks");
+        assert_eq!(s.thresholds.disk_free_pct, 10.0, "fleet-wide is untouched");
+
+        // The same estate without the rule flags both.
+        assert_eq!(
+            hosts_with(&e.snap(), "disk_nearly_full"),
+            ["DESK-1", "KIOSK-1"]
+        );
+    }
+
+    /// The finding says which line it was drawn against, and for a machine an
+    /// override picks that is the override's.
+    #[test]
+    fn a_finding_quotes_the_line_the_machine_was_judged_by() {
+        let mut e = Estate::new();
+        e.add_with(
+            "KIOSK-1",
+            1000.0,
+            "2026-09-08T10:00:00Z",
+            disk_at(11.0, Some("kiosk")),
+        );
+        e.add_with(
+            "DESK-1",
+            1000.0,
+            "2026-09-08T10:00:00Z",
+            disk_at(8.0, Some("office")),
+        );
+        let s = e.snap_with(&tuning(
+            "[[thresholds.overrides]]\ntags = { site = \"kiosk\" }\ndisk_free_pct = 12.5\n",
+        ));
+        let detail = |host: &str| {
+            flags_for(&s, "disk_nearly_full")
+                .iter()
+                .find(|f| f.hostname.as_deref() == Some(host))
+                .map(|f| f.detail.clone())
+                .unwrap_or_else(|| panic!("{host} should be nearly full"))
+        };
+        assert!(
+            detail("KIOSK-1").contains("Under 12.5% free is nearly full, and under 5% critical"),
+            "{}",
+            detail("KIOSK-1")
+        );
+        assert!(
+            detail("DESK-1").contains("Under 10% free is nearly full"),
+            "{}",
+            detail("DESK-1")
+        );
+        assert_eq!(
+            overridden(&s, "KIOSK-1")[0].0,
+            "site=kiosk",
+            "named after its selector"
+        );
+    }
+
+    /// "This model" means what the Groups view groups on: the system name as
+    /// the firmware gives it, vendor and all.
+    #[test]
+    fn an_override_by_system_model_changes_only_that_model() {
+        let mut e = Estate::new();
+        e.add_with(
+            "LAB-7440",
+            1000.0,
+            "2026-05-01T10:00:00Z",
+            dell("Latitude 7440"),
+        );
+        e.add_with(
+            "LAB-5440",
+            1000.0,
+            "2026-05-01T10:00:00Z",
+            dell("Latitude 5440"),
+        );
+        let t = tuning(
+            "[[thresholds.overrides]]\nsystem_model = \"Dell Inc. Latitude 7440\"\nstale_days = 365\n",
+        );
+        let s = e.snap_with(&t);
+        assert_eq!(
+            GroupBy::Model.value_of(machine(&s, "LAB-7440")),
+            Some("Dell Inc. Latitude 7440"),
+            "the rule and the group agree about what the model is called"
+        );
+        assert_eq!(hosts_with(&s, "stale"), ["LAB-5440"]);
+        assert_eq!(s.summary.stale, 1);
+        assert_eq!(
+            overridden(&s, "LAB-7440"),
+            [(
+                "system_model=Dell Inc. Latitude 7440".to_string(),
+                vec![("stale_days", 365.0)]
+            )]
+        );
+
+        // Not a substring: the 7440's rule does not reach a "Latitude 7440
+        // 2-in-1", any more than the model filter does.
+        let mut e = Estate::new();
+        e.add_with(
+            "LAB-2IN1",
+            1000.0,
+            "2026-05-01T10:00:00Z",
+            dell("Latitude 7440 2-in-1"),
+        );
+        assert_eq!(hosts_with(&e.snap_with(&t), "stale"), ["LAB-2IN1"]);
+    }
+
+    #[test]
+    fn an_override_by_cpu_model_changes_only_that_cpu() {
+        let mut e = Estate::new();
+        e.add("NEW-CPU", 1000.0, "2026-05-01T10:00:00Z");
+        e.add_with("OLD-CPU", 1000.0, "2026-05-01T10:00:00Z", |d| {
+            d["machine"]["cpu_model"] = json!("Intel(R) Core(TM) i5-8350U CPU @ 1.70GHz");
+        });
+        let s = e.snap_with(&tuning(
+            "[[thresholds.overrides]]\ncpu_model = \"Intel(R) Core(TM) i5-8350U CPU @ 1.70GHz\"\n\
+             stale_days = 365\n",
+        ));
+        assert_eq!(hosts_with(&s, "stale"), ["NEW-CPU"]);
+        assert!(machine(&s, "NEW-CPU").overridden_by.is_empty());
+        assert_eq!(machine(&s, "OLD-CPU").overridden_by.len(), 1);
+    }
+
+    /// Per threshold, not per rule: the first rule that picks the machine and
+    /// sets the threshold supplies it, and a later rule still supplies one the
+    /// first left alone.
+    #[test]
+    fn the_first_matching_override_wins_threshold_by_threshold() {
+        let mut e = Estate::new();
+        e.add_with(
+            "LAB-1",
+            1000.0,
+            "2026-05-01T10:00:00Z",
+            disk_at(8.0, Some("lab")),
+        );
+        let t = tuning(
+            "[thresholds]\nstale_days = 30\n\
+             [[thresholds.overrides]]\nname = \"lab\"\ntags = { site = \"lab\" }\nstale_days = 365\n\
+             [[thresholds.overrides]]\nname = \"lab disks\"\ntags = { site = \"lab\" }\n\
+             stale_days = 7\ndisk_free_pct = 5\n",
+        );
+        let s = e.snap_with(&t);
+        assert!(
+            flags_for(&s, "stale").is_empty(),
+            "365 from the first rule, not 7 from the second or 30 from [thresholds]"
+        );
+        assert!(
+            flags_for(&s, "disk_nearly_full").is_empty(),
+            "5 from the second rule, which the first did not set"
+        );
+        assert_eq!(
+            overridden(&s, "LAB-1"),
+            [
+                ("lab".to_string(), vec![("stale_days", 365.0)]),
+                ("lab disks".to_string(), vec![("disk_free_pct", 5.0)]),
+            ],
+            "each rule is listed with what it supplied, and only that"
+        );
+        assert_eq!(machine(&s, "LAB-1").thresholds.stale_days, 365.0);
+        assert_eq!(machine(&s, "LAB-1").thresholds.disk_free_pct, 5.0);
+        assert!(
+            t.shadowed().is_empty(),
+            "the second rule still does something"
+        );
+
+        // A rule whose every threshold an earlier, wider rule already sets
+        // can never change anything, and is worth a warning.
+        let t = tuning(
+            "[[thresholds.overrides]]\nname = \"lab\"\ntags = { site = \"lab\" }\nstale_days = 365\n\
+             [[thresholds.overrides]]\nname = \"lab pilot\"\ntags = { site = \"lab\", ring = \"pilot\" }\n\
+             stale_days = 30\n",
+        );
+        let warned = t.shadowed();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].contains("\"lab pilot\"") && warned[0].contains("\"lab\""),
+            "{warned:?}"
+        );
+    }
+
+    /// Staleness is counted in the summary, in each group and in the
+    /// timeline, and all of them read the machine's own line.
+    #[test]
+    fn stale_counts_follow_the_override_everywhere_they_are_made() {
+        let mut e = Estate::new();
+        e.add_with("LAB-1", 1000.0, "2026-05-01T10:00:00Z", at_site("lab"));
+        e.add_with("DESK-1", 1000.0, "2026-05-01T10:00:00Z", at_site("office"));
+        let t = tuning("[[thresholds.overrides]]\ntags = { site = \"lab\" }\nstale_days = 365\n");
+        let s = e.snap_with(&t);
+        assert_eq!(s.summary.stale, 1);
+
+        let by_site = groups(&s, &GroupBy::Tag("site".into()));
+        let stale_in = |site: &str| {
+            by_site
+                .iter()
+                .find(|g| g.value.as_deref() == Some(site))
+                .map(|g| g.stale)
+                .expect("group")
+        };
+        assert_eq!((stale_in("lab"), stale_in("office")), (0, 1));
+
+        let mut tags = BTreeMap::new();
+        tags.insert("site".to_string(), "lab".to_string());
+        let lab = s.filtered(&Filter {
+            tags,
+            ..Filter::default()
+        });
+        assert_eq!(
+            lab.summary.stale, 0,
+            "a filtered view counts by the same lines"
+        );
+        assert_eq!(
+            lab.threshold_overrides.len(),
+            1,
+            "and still carries the rules"
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_verdict_follows_an_overridden_replace_age() {
+        let mut e = Estate::new();
+        // The i7-1370P launched in January 2023: at most 3.7 years old today.
+        e.add_with("KIOSK-1", 1000.0, "2026-09-08T10:00:00Z", at_site("kiosk"));
+        e.add_with("DESK-1", 1000.0, "2026-09-08T10:00:00Z", at_site("office"));
+        let s = e.snap();
+        assert_eq!(machine(&s, "KIOSK-1").lifecycle.verdict, Verdict::Keep);
+
+        let s = e.snap_with(&tuning(
+            "[[thresholds.overrides]]\nname = \"kiosks\"\ntags = { site = \"kiosk\" }\n\
+             replace_age_years = 3\n",
+        ));
+        let kiosk = &machine(&s, "KIOSK-1").lifecycle;
+        assert_eq!(
+            kiosk.verdict,
+            Verdict::Watch,
+            "old at three years: {kiosk:?}"
+        );
+        assert!(kiosk.reasons[0].contains("years old"), "{kiosk:?}");
+        assert_eq!(machine(&s, "DESK-1").lifecycle.verdict, Verdict::Keep);
+        assert_eq!(s.summary.lifecycle.watch, 1);
+        let report = lifecycle_report(&s);
+        assert_eq!(report.replace_age_years, 5.0, "the fleet-wide age");
+        assert_eq!(report.candidates[0].overridden_by, ["kiosks"]);
+    }
+
+    /// The timeline re-judges the past with today's lines, through the same
+    /// resolution as the snapshot, and an override picks a machine by the run
+    /// standing for it at the time.
+    #[test]
+    fn the_timeline_judges_the_past_by_the_same_overrides() {
+        let mut e = Estate::new();
+        e.add_with("LAB-1", 1000.0, "2026-05-01T10:00:00Z", at_site("lab"));
+        e.add_with("DESK-1", 1000.0, "2026-05-01T10:00:00Z", at_site("office"));
+        // Was in the lab, and has since moved.
+        e.add_with("MOVED-1", 1000.0, "2026-03-01T10:00:00Z", at_site("lab"));
+        e.add_with("MOVED-1", 1000.0, "2026-09-01T10:00:00Z", at_site("office"));
+        let t = tuning("[[thresholds.overrides]]\ntags = { site = \"lab\" }\nstale_days = 365\n");
+
+        let s = e.snap_with(&t);
+        let mut rebuilt = None;
+        reconstruct(e.idx.conn(), &t, &[now()], |_, r| {
+            rebuilt = Some(r);
+            Ok(())
+        })
+        .unwrap();
+        let rebuilt = rebuilt.expect("one cutoff");
+        let findings = |s: &Snapshot| -> Vec<(String, &'static str)> {
+            s.flags
+                .iter()
+                .map(|f| (f.machine_key.clone(), f.code))
+                .collect()
+        };
+        assert_eq!(findings(&rebuilt), findings(&s), "now, rebuilt, is now");
+        assert_eq!(overridden(&rebuilt, "LAB-1"), overridden(&s, "LAB-1"));
+        assert_eq!(rebuilt.summary.stale, s.summary.stale);
+
+        let timeline = Timeline::build(e.idx.conn(), &t, &s, now(), 4).unwrap();
+        let points = timeline.view(&s, 4).points;
+        assert_eq!(points.len(), 5);
+        assert!(
+            points.iter().all(|p| p.stale == 1),
+            "only DESK-1, in every week: {:?}",
+            points.iter().map(|p| p.stale).collect::<Vec<_>>()
+        );
+        let plain = Timeline::build(e.idx.conn(), &Tuning::default(), &e.snap(), now(), 4)
+            .unwrap()
+            .view(&s, 4)
+            .points;
+        assert_eq!(
+            plain.iter().map(|p| p.stale).collect::<Vec<_>>(),
+            [3, 3, 3, 2, 2],
+            "without the rule both lab machines are stale too, MOVED-1 until its new run"
+        );
+
+        // A month ago MOVED-1 stood on its lab run, and was judged as a lab
+        // machine; today it stands on its office run and is not.
+        let then = e.snap_as_of(datetime!(2026-08-01 12:00:00 UTC));
+        assert!(then.machines.iter().all(|m| m.overridden_by.is_empty()));
+        let mut month_ago = None;
+        reconstruct(
+            e.idx.conn(),
+            &t,
+            &[datetime!(2026-08-01 12:00:00 UTC)],
+            |_, r| {
+                month_ago = Some(r);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let month_ago = month_ago.expect("one cutoff");
+        assert_eq!(overridden(&month_ago, "MOVED-1").len(), 1);
+        assert!(machine(&s, "MOVED-1").overridden_by.is_empty());
     }
 }

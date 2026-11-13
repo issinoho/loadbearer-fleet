@@ -48,7 +48,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::analytics::{
-    self, Cohort, Detail, Filter, Flag, MachineView, Snapshot, Thresholds, Timeline,
+    self, Cohort, Detail, Filter, Flag, MachineView, Snapshot, Timeline, Tuning,
 };
 use crate::auth::{self, Authenticator, Caller, IngestTokens, Submitter, token_matches};
 use crate::compare;
@@ -77,12 +77,12 @@ struct Analysis {
 impl Analysis {
     /// The whole of what a rescan or an external change has to rebuild. The
     /// timeline is built here and nowhere else, so no request pays for it.
-    fn compute(index: &Index, thresholds: &Thresholds) -> Result<Self> {
+    fn compute(index: &Index, tuning: &Tuning) -> Result<Self> {
         let now = OffsetDateTime::now_utc();
-        let snapshot = analytics::snapshot(index.conn(), thresholds, now)?;
+        let snapshot = analytics::snapshot(index.conn(), tuning, now)?;
         let timeline = Timeline::build(
             index.conn(),
-            thresholds,
+            tuning,
             &snapshot,
             now,
             analytics::TIMELINE_WEEKS,
@@ -103,7 +103,9 @@ pub struct AppState {
     /// process — `forget` from a terminal, most obviously — is noticed rather
     /// than waited out.
     data_version: Mutex<i64>,
-    thresholds: Thresholds,
+    /// The thresholds from `[thresholds]`, fixed for the life of the process
+    /// like the rest of the configuration.
+    tuning: Tuning,
     /// The collection folder, if this instance was told about one. Absent means
     /// the index is read-only from here and `rescan` has nothing to walk.
     root: Option<PathBuf>,
@@ -135,13 +137,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(
-        index: Index,
-        store: Store,
-        config: &Config,
-        thresholds: Thresholds,
-    ) -> Result<Arc<Self>> {
-        let analysis = Analysis::compute(&index, &thresholds)?;
+    pub fn new(index: Index, store: Store, config: &Config) -> Result<Arc<Self>> {
+        // From the config, the way `report` builds it, so the dashboard and
+        // the command line judge the fleet by the same lines.
+        let tuning = config.tuning()?;
+        let analysis = Analysis::compute(&index, &tuning)?;
         let version = index.data_version().unwrap_or(0);
         spend_marks(&store, &analysis.snapshot)?;
         let book = store.load()?;
@@ -159,7 +159,7 @@ impl AppState {
             index: Mutex::new(index),
             cache: RwLock::new(Arc::new(analysis)),
             data_version: Mutex::new(version),
-            thresholds,
+            tuning,
             root: config.server.collection_dir.clone(),
             upload_dir: config.server.upload_dir.clone(),
             authenticator: Authenticator::new(config),
@@ -282,7 +282,7 @@ impl AppState {
 
     fn recompute(&self) -> Result<()> {
         let idx = self.index.lock().expect("index lock");
-        let analysis = Arc::new(Analysis::compute(&idx, &self.thresholds)?);
+        let analysis = Arc::new(Analysis::compute(&idx, &self.tuning)?);
         // Taken *before* publishing, so a commit that lands during the analysis
         // is noticed next time rather than being taken as already included.
         let version = idx.data_version().unwrap_or(0);
@@ -333,7 +333,7 @@ impl AppState {
         // book as it now stands, after this rebuild has spent its marks, so a
         // finding the dashboard shows as quieted is never sent.
         let book = Arc::clone(&self.book.read().expect("book lock"));
-        let live = after.filtered_with(&Filter::default(), &self.thresholds, &book, now);
+        let live = after.filtered_with(&Filter::default(), &book, now);
         notifier.after_rebuild(before, &live, now);
     }
 
@@ -346,12 +346,9 @@ impl AppState {
         };
         let now = OffsetDateTime::now_utc();
         let analysis = self.analysis();
-        let live = analysis.snapshot.filtered_with(
-            &Filter::default(),
-            &self.thresholds,
-            &self.book(),
-            now,
-        );
+        let live = analysis
+            .snapshot
+            .filtered_with(&Filter::default(), &self.book(), now);
         // The timeline's points are a week apart, so a week is what it can
         // compare without re-deriving anything. A day is not one of its
         // points, so a daily digest leaves change out.
@@ -587,12 +584,7 @@ fn visible_in(
     filter.scopes = caller.0.scopes.clone();
     // Triage in the same pass as the scope, against the clock now: one
     // projection decides both what a caller sees and what of it is quieted.
-    snap.filtered_with(
-        &filter,
-        &state.thresholds,
-        &state.book(),
-        OffsetDateTime::now_utc(),
-    )
+    snap.filtered_with(&filter, &state.book(), OffsetDateTime::now_utc())
 }
 
 async fn get_snapshot(
@@ -1459,12 +1451,7 @@ async fn get_metrics(
     let now = OffsetDateTime::now_utc();
     // The same projection every view goes through, with no filter and no
     // scope, so the live counts are the ones an unscoped Overview shows.
-    let live = snapshot.filtered_with(
-        &analytics::Filter::default(),
-        &state.thresholds,
-        &state.book(),
-        now,
-    );
+    let live = snapshot.filtered_with(&analytics::Filter::default(), &state.book(), now);
     let body = metrics::render(&snapshot, &live.summary, &runtime, now);
     Ok((
         [(
@@ -1861,13 +1848,7 @@ mod tests {
         }
         let mut config = config.clone();
         config.server.collection_dir = Some(fixtures());
-        AppState::new(
-            index,
-            Store::open_in_memory().expect("state file"),
-            &config,
-            Thresholds::default(),
-        )
-        .expect("state")
+        AppState::new(index, Store::open_in_memory().expect("state file"), &config).expect("state")
     }
 
     struct Reply {
@@ -2178,13 +2159,8 @@ mod tests {
         // No collection folder: nothing here may quietly rescan and mask the
         // mechanism under test.
         config.server.collection_dir = None;
-        let state = AppState::new(
-            index,
-            Store::open_in_memory().expect("state file"),
-            &config,
-            Thresholds::default(),
-        )
-        .expect("state");
+        let state = AppState::new(index, Store::open_in_memory().expect("state file"), &config)
+            .expect("state");
 
         let cookie = session(&state, Role::Admin, &[]);
         let before = get(&state, "/api/snapshot", Some(&cookie)).await.json();
@@ -3594,13 +3570,8 @@ mod tests {
         index
             .ingest_file(&fixtures().join("win-modern.json"))
             .expect("fixture");
-        let state = AppState::new(
-            index,
-            Store::open_in_memory().expect("state file"),
-            &config,
-            Thresholds::default(),
-        )
-        .expect("state");
+        let state = AppState::new(index, Store::open_in_memory().expect("state file"), &config)
+            .expect("state");
 
         assert_eq!(
             request(&state, Method::POST, "/api/rescan", None)
@@ -4145,13 +4116,8 @@ mod tests {
             .expect("fixture");
         let mut config = oidc_config();
         config.server.collection_dir = None;
-        let state = AppState::new(
-            index,
-            Store::open(&path).expect("state file"),
-            &config,
-            Thresholds::default(),
-        )
-        .expect("state");
+        let state =
+            AppState::new(index, Store::open(&path).expect("state file"), &config).expect("state");
         let key = key_of(&state, "FLEET-LNX-01").await;
         let cookie = session(&state, Role::Contributor, &[]);
         let ack = triage(
@@ -4236,13 +4202,8 @@ mod tests {
         config.notify.webhook_url = url.map(str::to_string);
         config.notify.secret = secret.to_string();
         config.validate().expect("a valid config");
-        let state = AppState::new(
-            index,
-            Store::open_in_memory().expect("state file"),
-            &config,
-            Thresholds::default(),
-        )
-        .expect("state");
+        let state = AppState::new(index, Store::open_in_memory().expect("state file"), &config)
+            .expect("state");
         if let Some(n) = &state.notifier {
             n.start();
         }
@@ -4457,12 +4418,7 @@ mod tests {
         let live_critical = |state: &Arc<AppState>| {
             state
                 .snapshot()
-                .filtered_with(
-                    &Filter::default(),
-                    &state.thresholds,
-                    &state.book(),
-                    OffsetDateTime::now_utc(),
-                )
+                .filtered_with(&Filter::default(), &state.book(), OffsetDateTime::now_utc())
                 .summary
                 .critical
         };
@@ -4650,5 +4606,65 @@ mod tests {
         .await;
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// A machine an override picks says so wherever the API sends it — by
+    /// name, with the thresholds it supplied — and the snapshot carries the
+    /// rules beside the fleet-wide values. Built from the config by
+    /// `AppState::new`, which is how `serve` and the service both get it.
+    #[tokio::test]
+    async fn a_machine_an_override_picks_names_it_in_the_api() {
+        let config: Config = toml::from_str(
+            "[[thresholds.overrides]]
+name = \"Edinburgh, measured monthly\"
+             tags = { site = \"edinburgh\" }
+stale_days = 30
+",
+        )
+        .expect("config");
+        config.validate().expect("valid");
+        let state = state_for(&config);
+
+        // The fixtures are more than 30 days old, so stale on this line
+        // whatever day the test runs.
+        let key = key_of(&state, "FLEET-LNX-01").await;
+        let page = get(&state, &format!("/api/machine/{key}"), None).await;
+        assert_eq!(page.status, StatusCode::OK);
+        let page = page.json();
+        let by = &page["machine"]["overridden_by"];
+        assert_eq!(by[0]["name"], "Edinburgh, measured monthly", "{by}");
+        assert_eq!(by[0]["set"]["stale_days"], 30.0, "{by}");
+        let codes: Vec<&str> = page["flags"]
+            .as_array()
+            .expect("flags")
+            .iter()
+            .filter_map(|f| f["code"].as_str())
+            .collect();
+        assert!(codes.contains(&"stale"), "{codes:?}");
+        assert!(
+            page["machine"].get("thresholds").is_none(),
+            "the resolved lines stay server-side; overridden_by says what differs"
+        );
+
+        let key = key_of(&state, "FLEET-WIN-01").await;
+        let page = get(&state, &format!("/api/machine/{key}"), None)
+            .await
+            .json();
+        assert_eq!(
+            page["machine"]["overridden_by"],
+            serde_json::json!([]),
+            "Glasgow is not picked"
+        );
+
+        let snap = get(&state, "/api/snapshot", None).await.json();
+        assert_eq!(
+            snap["thresholds"]["stale_days"], 90.0,
+            "fleet-wide, unchanged"
+        );
+        assert_eq!(
+            snap["threshold_overrides"][0]["name"],
+            "Edinburgh, measured monthly"
+        );
+        assert_eq!(snap["threshold_overrides"][0]["tags"]["site"], "edinburgh");
+        assert_eq!(snap["threshold_overrides"][0]["set"]["stale_days"], 30.0);
     }
 }

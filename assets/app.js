@@ -171,6 +171,40 @@ function powerFact(m) {
   return parts.join(' · ') + (held ? ` — held back by ${held}` : '');
 }
 
+/** Each threshold an override can set, as the line it draws. Plain numbers:
+ *  these are the values in the config file, and `regression_frac` the one
+ *  fraction among them. */
+const LINE_WORDS = {
+  regression_frac: (v) => `regressed from ${+(v * 100).toFixed(2)}% down`,
+  stale_days: (v) => `stale after ${v} days`,
+  battery_health_pct: (v) => `battery worn under ${v}%`,
+  unstable_cpu_subtests: (v) => `run unstable from ${v} shaky CPU subtests`,
+  drive_wear_pct: (v) => `drive worn from ${v}% used`,
+  drive_spare_pct: (v) => `drive worn under ${v}% spare`,
+  disk_free_pct: (v) => `disk nearly full under ${v}% free`,
+  disk_free_critical_pct: (v) => `critical under ${v}% free`,
+  firmware_behind_days: (v) => `firmware behind from ${v} days`,
+  firmware_old_years: (v) => `firmware old after ${v} years`,
+  replace_age_years: (v) => `old from ${v} years`,
+};
+
+/** "lab machines: stale after 365 days" per override that changed how a
+ *  machine was judged, or null when none did. A machine with 8% free and no
+ *  finding has to be able to say it is judged against another line. */
+function thresholdsFact(m) {
+  const by = m.overridden_by || [];
+  if (!by.length) return null;
+  return by.map((o) => `${o.name}: ${Object.entries(o.set)
+    .map(([k, v]) => (LINE_WORDS[k] ? LINE_WORDS[k](v) : `${k} ${v}`)).join(', ')}`).join(' · ')
+    + ' — set in the configuration, in place of the fleet-wide lines';
+}
+
+/** How many machines in view an override gives their own value of one
+ *  threshold — what a sentence quoting the fleet-wide value has to admit. */
+function overriddenCount(snap, field) {
+  return (snap.machines || []).filter((m) => (m.overridden_by || []).some((o) => field in o.set)).length;
+}
+
 function debounce(fn, ms) {
   let t;
   return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
@@ -1627,7 +1661,9 @@ export async function renderOverview(main) {
       s.newest_run ? `latest ${day(s.newest_run)}` : ''),
     tile('Measurement caveats', nf0.format(s.thermally_limited + s.partial),
       `${s.thermally_limited} throttled, ${s.partial} partial`),
-    tile('Stale', nf0.format(s.stale), `not measured in ${nf0.format(state.snap.thresholds.stale_days)} days`),
+    tile('Stale', nf0.format(s.stale), `not measured in ${nf0.format(state.snap.thresholds.stale_days)} days`
+      + (overriddenCount(state.snap, 'stale_days')
+        ? ` — ${nf0.format(overriddenCount(state.snap, 'stale_days'))} machine(s) on a line of their own` : '')),
     tile('Weak identity', nf0.format(s.weak_identity), 'identifier resets on reimage'),
     s.lifecycle ? tile('To replace', nf0.format(s.lifecycle.replace),
       `${s.lifecycle.repair} to repair, ${s.lifecycle.investigate} to investigate · see Lifecycle`) : null,
@@ -2448,7 +2484,11 @@ export function renderLifecycle(main) {
         + 'Age alone is never a reason to buy: an old machine that performs and whose parts are sound is watched, '
         + 'not replaced. Grades are against the reference baseline, so an F means inadequate against that '
         + 'reference, which an estate with modest needs may reasonably disagree with. A decision marked '
-        + '“re-measure first” rests on a run that was throttled, on battery, held back or incomplete.',
+        + '“re-measure first” rests on a run that was throttled, on battery, held back or incomplete.'
+        + (overriddenCount(snap, 'replace_age_years')
+          ? ` ${nf0.format(overriddenCount(snap, 'replace_age_years'))} machine(s) in view are old from another age, `
+            + 'set for them in the configuration; each one’s page says which.'
+          : ''),
     }),
   ]);
 
@@ -2474,7 +2514,9 @@ export function renderLifecycle(main) {
   const scatterCard = chartCard({
     title: 'Age against score',
     subtitle: `Each machine’s best-estimate age against its overall score. The line is ${years} years, from `
-      + 'where a machine counts as old. Select a mark to open the machine.',
+      + 'where a machine counts as old'
+      + (overriddenCount(snap, 'replace_age_years') ? ' unless the configuration sets another for it' : '')
+      + '. Select a mark to open the machine.',
     note: [
       'Hollow marks are upper bounds from the CPU’s launch: the machine is at most that old, so its true place is '
         + 'on or left of its mark. Filled marks are dated by firmware that looks original.',
@@ -2665,6 +2707,7 @@ export async function renderMachine(main, key) {
     ['CPU', m.cpu_model],
     ['Age', age.built || 'unknown — the CPU isn’t in the launch table'],
     ...(lifecycleFact(m) ? [['Lifecycle', lifecycleFact(m)]] : []),
+    ...(thresholdsFact(m) ? [['Judged by', thresholdsFact(m)]] : []),
     ...(age.firmware ? [['Firmware', age.firmware]] : []),
     ...(age.drive ? [['Drive', age.drive]] : []),
     ...(fullest ? [['Fullest volume', fullest]] : []),

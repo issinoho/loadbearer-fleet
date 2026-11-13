@@ -25,7 +25,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -542,9 +542,9 @@ for (const [label, points, width] of [
  * check exercises the same JSON the browser gets and cannot quietly drift from
  * it. Pass --snapshot <file> to use a captured one instead.
  */
-function realSnapshot() {
+function realSnapshot(config = null) {
   const argIdx = process.argv.indexOf('--snapshot');
-  if (argIdx > -1) return JSON.parse(readFileSync(process.argv[argIdx + 1], 'utf8'));
+  if (argIdx > -1 && !config) return JSON.parse(readFileSync(process.argv[argIdx + 1], 'utf8'));
 
   // CARGO_TARGET_DIR is honoured, so this still works for anyone who moves
   // their build output somewhere else. CI sets nothing and gets ./target.
@@ -559,9 +559,14 @@ function realSnapshot() {
 ${exe} is not built. Run: cargo build`);
     process.exit(1);
   }
-  const db = join(tmpdir(), `lbf-check-${process.pid}.db`);
+  const db = join(tmpdir(), `lbf-check-${process.pid}${config ? '-cfg' : ''}.db`);
+  // A configuration, when given, goes through the binary's own reader like
+  // anything else: `report` builds its thresholds from it as the server does.
+  const cfg = join(tmpdir(), `lbf-check-${process.pid}.toml`);
+  if (config) writeFileSync(cfg, config);
   const run = (args) => {
-    const r = spawnSync(exe, ['--index', db, '--log-level', 'warn', ...args], { encoding: 'utf8' });
+    const r = spawnSync(exe, ['--index', db, '--log-level', 'warn', ...(config ? ['--config', cfg] : []), ...args],
+      { encoding: 'utf8' });
     if (r.status !== 0) {
       console.error(`
 ${exe} ${args.join(' ')} failed:
@@ -576,6 +581,9 @@ ${r.stderr || r.stdout}`);
   } finally {
     for (const suffix of ['', '-wal', '-shm']) {
       try { rmSync(db + suffix); } catch { /* already gone */ }
+    }
+    if (config) {
+      try { rmSync(cfg); } catch { /* already gone */ }
     }
   }
 }
@@ -1130,9 +1138,73 @@ async function renderGroupsWith(name, grouping) {
     check('machine', !text.includes('undefined'), 'the word "undefined" reached the page');
     check('machine', !text.includes('NaN'), 'the word "NaN" reached the page');
     notes.push(`machine: ${auditTree('machine', h)} chart(s), ${text.length} chars of text`);
+    check('machine', !text.includes('Judged by'), 'a machine on the fleet-wide lines claims an override');
   } catch (err) {
     failures.push(`machine: threw ${err.message}`);
   }
+}
+
+// Machines an override judges against other lines, from a snapshot the binary
+// built with a [thresholds] section. "64 days old, nothing stale" has to read
+// as judged against 30 days rather than as fine by the fleet's 90, so the
+// drilldown says which rule and which line, and every view that quotes a
+// fleet-wide value admits the machines on another.
+{
+  const judged = realSnapshot([
+    '[[thresholds.overrides]]',
+    'name = "Edinburgh, measured monthly"',
+    'tags = { site = "edinburgh" }',
+    'stale_days = 30',
+    'disk_free_pct = 7.5',
+    '[[thresholds.overrides]]',
+    'tags = { site = "glasgow" }',
+    'replace_age_years = 3',
+    '',
+  ].join('\n'));
+  const m = judged.machines.find((x) => x.hostname === 'FLEET-LNX-01');
+  check('machine/override', m && m.overridden_by?.[0]?.name === 'Edinburgh, measured monthly',
+    `FLEET-LNX-01 was not judged by the override: ${JSON.stringify(m?.overridden_by)}`);
+  check('machine/override', judged.threshold_overrides?.length === 2, 'the snapshot does not carry the rules');
+  if (m) {
+    globalThis.fetch = () => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        machine: m, flags: judged.flags.filter((f) => f.machine_key === m.key), cohort: null, history: [], subtests: [],
+      }),
+      text: () => Promise.resolve(''),
+    });
+    const h = host(1200);
+    try {
+      await mod.renderMachine(h, m.key);
+      const text = textOf(h);
+      check('machine/override', text.includes('Judged by')
+        && text.includes('Edinburgh, measured monthly: disk nearly full under 7.5% free, stale after 30 days'),
+      'the drilldown does not say which override judged it, or against what');
+      check('machine/override', !text.includes('undefined') && !text.includes('NaN'), 'undefined or NaN reached the page');
+    } catch (err) {
+      failures.push(`machine/override: threw ${err.message}`);
+    }
+  }
+
+  globalThis.fetch = () => Promise.reject(new Error('no network in the geometry check'));
+  mod.state.snap = judged;
+  for (const [name, render, want] of [
+    ['overview/override', (h) => mod.renderOverview(h), '2 machine(s) on a line of their own'],
+    ['lifecycle/override', (h) => mod.renderLifecycle(h), 'old from another age'],
+  ]) {
+    const h = host(1200);
+    try {
+      await render(h);
+      const text = textOf(h);
+      check(name, text.includes(want), `the fleet-wide value is quoted without admitting the override (${want})`);
+      check(name, !text.includes('undefined') && !text.includes('NaN'), 'undefined or NaN reached the page');
+    } catch (err) {
+      failures.push(`${name}: threw ${err.message}`);
+    }
+  }
+  mod.state.snap = snapshot;
+  notes.push(`override: ${judged.machines.filter((x) => x.overridden_by.length).length} machine(s) judged by `
+    + `${judged.threshold_overrides.length} rule(s)`);
 }
 
 // A machine that has never been reached: the empty-state path.

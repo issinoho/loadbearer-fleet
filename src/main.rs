@@ -38,7 +38,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use time::OffsetDateTime;
 
-use analytics::{FlagKind, Severity, Thresholds};
+use analytics::{FlagKind, Severity};
 use config::{Config, LogFormat};
 
 #[derive(Parser, Debug)]
@@ -727,7 +727,9 @@ fn main() -> Result<()> {
             lifecycle,
         } => {
             let idx = index::Index::open_existing(&config.server.index)?;
-            let th = Thresholds::default();
+            // From the config, exactly as the server builds it, so a report
+            // and the dashboard judge the fleet by the same lines.
+            let th = config.tuning()?;
             let now = OffsetDateTime::now_utc();
             let snap = analytics::snapshot(idx.conn(), &th, now)?;
             // What people have said about the findings, applied exactly as the
@@ -743,7 +745,7 @@ fn main() -> Result<()> {
                 }
                 None => state::Book::default(),
             };
-            let snap = snap.filtered_with(&analytics::Filter::default(), &th, &book, now);
+            let snap = snap.filtered_with(&analytics::Filter::default(), &book, now);
             if *lifecycle {
                 let report = analytics::lifecycle_report(&snap);
                 if *json {
@@ -855,7 +857,7 @@ fn main() -> Result<()> {
             // empty, and serving with every acknowledgement silently gone is
             // worse than not serving. service.rs opens both the same way.
             let store = state::Store::open(&config.server.state_path())?;
-            let state = web::AppState::new(idx, store, &config, Thresholds::default())?;
+            let state = web::AppState::new(idx, store, &config)?;
             if config.server.collection_dir.is_some() && !*no_scan {
                 // Through the same path the timer and the button use, so the
                 // startup scan is counted and stamped like any other. It used
@@ -1000,6 +1002,29 @@ fn print_report(snap: &analytics::Snapshot, show_all: bool) {
         "  {} machine(s) need attention — {} critical, {} warning, {} informational",
         s.machines_flagged, s.critical, s.warnings, s.info
     );
+    // Said whenever an override changed anything, because a machine judged
+    // against other lines looks, in a list of findings, like one judged
+    // against the same lines and found fine.
+    let overridden = snap
+        .machines
+        .iter()
+        .filter(|m| !m.overridden_by.is_empty())
+        .count();
+    if overridden > 0 {
+        println!(
+            "  {overridden} machine(s) judged against other lines by a [thresholds] override: {}",
+            snap.threshold_overrides
+                .iter()
+                .filter(|o| {
+                    snap.machines
+                        .iter()
+                        .any(|m| m.overridden_by.iter().any(|a| a.name == o.name))
+                })
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // Comparability first, because it bounds how much of the rest means
     // anything: a fleet split across configurations can't be ranked as one.
@@ -1321,6 +1346,12 @@ fn print_lifecycle(r: &analytics::LifecycleReport, show_watch: bool) {
                 m.hostname.as_deref().unwrap_or(&m.machine_key),
                 m.lifecycle.reasons.join("; ")
             );
+            if !m.overridden_by.is_empty() {
+                println!(
+                    "      judged by the threshold override(s) {}",
+                    m.overridden_by.join(", ")
+                );
+            }
             if m.lifecycle.uncertain {
                 println!(
                     "      re-measure before acting: {}",

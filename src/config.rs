@@ -63,7 +63,349 @@ pub struct Config {
     #[serde(default)]
     pub notify: Notify,
     #[serde(default)]
+    pub thresholds: ThresholdSettings,
+    #[serde(default)]
     pub log: Log,
+}
+
+/// `[thresholds]`: the lines the findings are drawn against. Every value is
+/// optional and an unset one keeps the built-in default, so a file without the
+/// section judges exactly as before it existed.
+///
+/// Read through a table rather than derived, because the values and the
+/// `overrides` list share one TOML table and serde cannot refuse unknown keys
+/// across a flattened struct. Refusing them matters as much here as anywhere:
+/// `stale_day = 365` silently ignored is a lab that stays stale.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(try_from = "toml::Table")]
+pub struct ThresholdSettings {
+    #[serde(flatten)]
+    pub values: ThresholdValues,
+    /// Tried in file order; see `analytics::thresholds` for how a machine's
+    /// lines are chosen from them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<ThresholdOverride>,
+}
+
+/// One value per threshold, each optional. The names and meanings are
+/// `analytics::Thresholds`', where each is documented with its reasoning.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThresholdValues {
+    pub min_cohort: Option<usize>,
+    pub cohort_z: Option<f64>,
+    pub cohort_min_shortfall: Option<f64>,
+    pub mad_floor_frac: Option<f64>,
+    pub regression_frac: Option<f64>,
+    pub stale_days: Option<f64>,
+    pub battery_health_pct: Option<f64>,
+    pub unstable_cpu_subtests: Option<i64>,
+    pub drive_wear_pct: Option<f64>,
+    pub drive_spare_pct: Option<f64>,
+    pub disk_free_pct: Option<f64>,
+    pub disk_free_critical_pct: Option<f64>,
+    pub firmware_behind_days: Option<f64>,
+    pub firmware_old_years: Option<f64>,
+    pub replace_age_years: Option<f64>,
+}
+
+impl ThresholdValues {
+    /// The values that are set, by name, in `analytics::FIELDS`' order.
+    pub fn entries(&self) -> Vec<(&'static str, f64)> {
+        [
+            ("min_cohort", self.min_cohort.map(|v| v as f64)),
+            ("cohort_z", self.cohort_z),
+            ("cohort_min_shortfall", self.cohort_min_shortfall),
+            ("mad_floor_frac", self.mad_floor_frac),
+            ("regression_frac", self.regression_frac),
+            ("stale_days", self.stale_days),
+            ("battery_health_pct", self.battery_health_pct),
+            (
+                "unstable_cpu_subtests",
+                self.unstable_cpu_subtests.map(|v| v as f64),
+            ),
+            ("drive_wear_pct", self.drive_wear_pct),
+            ("drive_spare_pct", self.drive_spare_pct),
+            ("disk_free_pct", self.disk_free_pct),
+            ("disk_free_critical_pct", self.disk_free_critical_pct),
+            ("firmware_behind_days", self.firmware_behind_days),
+            ("firmware_old_years", self.firmware_old_years),
+            ("replace_age_years", self.replace_age_years),
+        ]
+        .into_iter()
+        .filter_map(|(name, v)| v.map(|v| (name, v)))
+        .collect()
+    }
+
+    /// The rest of a table once its other keys are taken out. A key that is
+    /// not a threshold is refused here, with the list, rather than by serde,
+    /// whose message cannot mention the keys taken out first.
+    fn from_rest(rest: toml::Table, at: &str, others: &str) -> Result<Self, String> {
+        for (key, value) in &rest {
+            let Some(f) = crate::analytics::field(key) else {
+                return Err(format!(
+                    "{at}{key} is not a setting here. It takes {others}any of: {}",
+                    crate::analytics::FIELDS
+                        .iter()
+                        .map(|f| f.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            };
+            // Said here, by name: serde's own message for a value of the
+            // wrong type does not say which key it was.
+            match value {
+                toml::Value::Integer(_) => {}
+                toml::Value::Float(_) if !f.whole() => {}
+                toml::Value::Float(v) => {
+                    return Err(format!(
+                        "{at}{key} is {v}; it is a count, so a whole number"
+                    ));
+                }
+                other => return Err(format!("{at}{key} is {other}; it wants a number")),
+            }
+        }
+        toml::Value::Table(rest)
+            .try_into()
+            .map_err(|e| format!("{at}{}", e.message()))
+    }
+}
+
+/// A `[[thresholds.overrides]]` rule: different lines for the machines it
+/// picks.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(try_from = "toml::Table")]
+pub struct ThresholdOverride {
+    /// What people see — on the machine page and in the snapshot. Unset, it
+    /// is made from the selector: `site=lab`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Every one of these must be among the machine's tags, matched exactly as
+    /// a grant's tags are.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<BTreeMap<String, String>>,
+    /// Exactly as the machine reports it, and as the Groups view lists it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_model: Option<String>,
+    #[serde(flatten)]
+    pub values: ThresholdValues,
+}
+
+/// One optional key out of a table, as `T`, the error naming the key.
+fn take<T: serde::de::DeserializeOwned>(
+    t: &mut toml::Table,
+    key: &str,
+    at: &str,
+) -> Result<Option<T>, String> {
+    t.remove(key)
+        .map(|v| {
+            v.try_into()
+                .map_err(|e| format!("{at}{key}: {}", e.message()))
+        })
+        .transpose()
+}
+
+impl TryFrom<toml::Table> for ThresholdSettings {
+    type Error = String;
+
+    fn try_from(mut t: toml::Table) -> Result<Self, String> {
+        let overrides = take(&mut t, "overrides", "thresholds.")?.unwrap_or_default();
+        Ok(Self {
+            values: ThresholdValues::from_rest(t, "thresholds.", "overrides and ")?,
+            overrides,
+        })
+    }
+}
+
+impl TryFrom<toml::Table> for ThresholdOverride {
+    type Error = String;
+
+    fn try_from(mut t: toml::Table) -> Result<Self, String> {
+        const AT: &str = "[[thresholds.overrides]] ";
+        Ok(Self {
+            name: take(&mut t, "name", AT)?,
+            tags: take(&mut t, "tags", AT)?,
+            system_model: take(&mut t, "system_model", AT)?,
+            cpu_model: take(&mut t, "cpu_model", AT)?,
+            values: ThresholdValues::from_rest(t, AT, "name, tags, system_model, cpu_model, and ")?,
+        })
+    }
+}
+
+impl ThresholdSettings {
+    /// The thresholds the engine runs with, or the first thing wrong with the
+    /// section, named by setting. `validate` calls this, so on a loaded config
+    /// it cannot fail.
+    pub fn tuning(&self) -> Result<crate::analytics::Tuning> {
+        use crate::analytics::{Override, Thresholds, Tuning, field};
+
+        let mut fleet = Thresholds::default();
+        for (name, value) in self.values.entries() {
+            let f = field(name).expect("entries names only thresholds");
+            if let Err(why) = f.check(value) {
+                bail!("thresholds.{name} {why}");
+            }
+            f.apply(&mut fleet, value);
+        }
+        if fleet.disk_free_critical_pct > fleet.disk_free_pct {
+            bail!(
+                "thresholds.disk_free_critical_pct ({}) is above disk_free_pct ({}). Critical is \
+                 the lower line — a disk under it is under both — so with these values every \
+                 nearly full disk would be critical and none a warning",
+                fleet.disk_free_critical_pct,
+                fleet.disk_free_pct
+            );
+        }
+
+        let mut overrides: Vec<Override> = Vec::new();
+        for (i, o) in self.overrides.iter().enumerate() {
+            let tags = o.tags.clone().unwrap_or_default();
+            let derived =
+                Override::describe(&tags, o.system_model.as_deref(), o.cpu_model.as_deref());
+            let at = format!(
+                "thresholds.overrides[{i}] ({:?})",
+                o.name.as_deref().unwrap_or(&derived)
+            );
+            if o.tags.as_ref().is_some_and(BTreeMap::is_empty) {
+                bail!(
+                    "{at} has an empty tags table, which would pick every machine. Give the tags \
+                     it should pick, or put the values in [thresholds] if they are for the whole \
+                     fleet"
+                );
+            }
+            if o.tags.is_none() && o.system_model.is_none() && o.cpu_model.is_none() {
+                bail!(
+                    "{at} picks no machines: give it tags, a system_model or a cpu_model. Values \
+                     for the whole fleet belong in [thresholds] itself"
+                );
+            }
+            for (field_name, value) in [
+                ("system_model", o.system_model.as_deref()),
+                ("cpu_model", o.cpu_model.as_deref()),
+                ("name", o.name.as_deref()),
+            ] {
+                if let Some(v) = value {
+                    if v.trim().is_empty() {
+                        bail!(
+                            "{at} has an empty {field_name}. Leave it out instead{}",
+                            if field_name == "name" {
+                                " — the rule is then named after what it picks"
+                            } else {
+                                ": a machine with no value for it is never picked by one"
+                            }
+                        );
+                    }
+                    check_placeholder(&format!("{at} {field_name}"), v)?;
+                }
+            }
+            for (k, v) in &tags {
+                if k.trim().is_empty() || v.trim().is_empty() {
+                    bail!("{at} has an empty tag key or value, which no machine carries");
+                }
+                check_placeholder(&format!("{at} tags.{k}"), v)?;
+            }
+
+            let mut set = BTreeMap::new();
+            for (name, value) in o.values.entries() {
+                let f = field(name).expect("entries names only thresholds");
+                if !f.per_machine {
+                    bail!(
+                        "{at} sets {name}, which is fleet-wide only. min_cohort, cohort_z, \
+                         cohort_min_shortfall and mad_floor_frac describe the comparison of a \
+                         machine with every identical machine in the index — whether there are \
+                         enough of them, and how spread they are — so a value for some machines \
+                         would be a different calculation over the same cohort. Set it in \
+                         [thresholds] itself"
+                    );
+                }
+                if let Err(why) = f.check(value) {
+                    bail!("{at} {name} {why}");
+                }
+                set.insert(f.name, value);
+            }
+            if set.is_empty() {
+                bail!("{at} sets no thresholds, so it would change nothing");
+            }
+            let name = o.name.clone().unwrap_or(derived);
+            if let Some(same) = overrides.iter().position(|p| p.name == name) {
+                bail!(
+                    "thresholds.overrides[{same}] and [{i}] are both named {name:?}. Names are what \
+                     a machine's page shows as the reason it is judged differently, so they must \
+                     tell the rules apart{}",
+                    if o.name.is_none() {
+                        " — two rules that pick the same machines are better merged into one"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            overrides.push(Override {
+                name,
+                tags,
+                system_model: o.system_model.clone(),
+                cpu_model: o.cpu_model.clone(),
+                set,
+            });
+        }
+
+        // Critical has to stay at or below nearly full for every machine, and
+        // a machine can take the two from different places: one rule's
+        // critical line and a later rule's, or the fleet's, nearly-full line.
+        // So every pairing some machine could end up with is checked. A rule
+        // that sets a line keeps any later source of that line away from the
+        // machines it picks, and two rules that ask for different values of
+        // the same tag or model never pick the same machine. Other rules in
+        // between are not considered, so this can refuse a pairing that one of
+        // them would in fact hide; it never lets an impossible line through.
+        let sets =
+            |o: Option<usize>, name: &str| o.is_some_and(|i| overrides[i].set.contains_key(name));
+        let line = |o: Option<usize>, name: &str, fleet_value: f64| match o {
+            Some(i) => overrides[i].set.get(name).copied(),
+            None => Some(fleet_value),
+        };
+        let sources: Vec<Option<usize>> = std::iter::once(None)
+            .chain((0..overrides.len()).map(Some))
+            .collect();
+        for &a in &sources {
+            let Some(crit) = line(a, "disk_free_critical_pct", fleet.disk_free_critical_pct) else {
+                continue;
+            };
+            for &b in &sources {
+                let Some(free) = line(b, "disk_free_pct", fleet.disk_free_pct) else {
+                    continue;
+                };
+                let together = match (a, b) {
+                    (None, None) => false, // checked above, with a plainer message
+                    (None, Some(_)) => !sets(b, "disk_free_critical_pct"),
+                    (Some(_), None) => !sets(a, "disk_free_pct"),
+                    (Some(i), Some(j)) if i == j => true,
+                    (Some(i), Some(j)) => {
+                        !overrides[i].disjoint(&overrides[j])
+                            && (!sets(b, "disk_free_critical_pct") || i < j)
+                            && (!sets(a, "disk_free_pct") || j < i)
+                    }
+                };
+                if together && crit > free {
+                    let whose = |o: Option<usize>| match o {
+                        Some(i) => format!("the override {:?}", overrides[i].name),
+                        None => "[thresholds]".to_string(),
+                    };
+                    bail!(
+                        "disk_free_critical_pct {crit} from {} is above disk_free_pct {free} from \
+                         {}, and a machine could be judged by both. Critical is the lower line, so \
+                         with these values every nearly full disk on it would be critical and none \
+                         a warning. Set both in the override, or lower its critical line",
+                        whose(a),
+                        whose(b)
+                    );
+                }
+            }
+        }
+
+        Ok(Tuning { fleet, overrides })
+    }
 }
 
 /// Outbound notifications: one JSON POST to a URL the operator chooses. Off
@@ -683,6 +1025,18 @@ impl Config {
         self.server.public_url.starts_with("https://")
     }
 
+    /// The thresholds the analysis runs with, as every entry point builds
+    /// them — `serve`, the Windows service and `report` — so the server and
+    /// the command line judge the fleet by the same lines. Warns, once per
+    /// start, about an override that can never change anything.
+    pub fn tuning(&self) -> Result<crate::analytics::Tuning> {
+        let tuning = self.thresholds.tuning()?;
+        for warning in tuning.shadowed() {
+            tracing::warn!("{warning}");
+        }
+        Ok(tuning)
+    }
+
     pub fn redirect_url(&self) -> String {
         format!(
             "{}/auth/callback",
@@ -727,6 +1081,7 @@ impl Config {
         check_placeholder_path("log.file", self.log.file.as_deref())?;
         check_placeholder_path("auth.ca_bundle", self.auth.ca_bundle.as_deref())?;
         self.validate_notify()?;
+        self.thresholds.tuning()?;
 
         // An upload has to become a file the next scan will find, or it lives
         // only in the index — and this documentation tells people the index is
@@ -1153,6 +1508,56 @@ critical = true
 # running at that minute the digest is skipped, not sent late.
 digest = "off"
 digest_at = "08:00"
+
+[thresholds]
+# The lines the findings are drawn against. Every one is optional: unset, it
+# keeps the default shown here, so a file that leaves this section alone judges
+# the fleet exactly as the README describes. Changing one re-judges the past as
+# well as the present - the history is reconstructed with today's lines - and
+# a finding a change makes go away counts as resolved, so an acknowledgement or
+# snooze of it is spent.
+#
+# The cohort comparison - a machine against every identical machine measured
+# the same way. Fleet-wide only: an override below cannot set these four.
+# min_cohort = 4                # machines a cohort needs to be compared against; at least 3
+# cohort_z = 3.5                # modified z-score at which a member is an outlier
+# cohort_min_shortfall = 0.10   # a shortfall smaller than this is never named
+# mad_floor_frac = 0.03         # the spread is floored at this fraction of the median
+#
+# One machine against a line. These can also be set for some machines below.
+# regression_frac = 0.15        # a drop against its own earlier runs that is a regression
+# stale_days = 90               # after this, a result is history rather than inventory
+# battery_health_pct = 70       # capacity, % of design, below which the battery is worn
+# unstable_cpu_subtests = 2     # low-confidence CPU subtests at which a run is too shaky to read
+# drive_wear_pct = 80           # rated endurance used, %, at which a drive is worn
+# drive_spare_pct = 20          # spare blocks left, %, below which a drive is worn
+# disk_free_pct = 10            # free space on the fullest volume, %, below which it is nearly full
+# disk_free_critical_pct = 5    # ... and below which that is critical; not above disk_free_pct
+# firmware_behind_days = 90     # how far behind the newest firmware on its model before it is named
+# firmware_old_years = 4        # firmware older than this when measured is named anyway
+# replace_age_years = 5         # from this age a machine is old, for the lifecycle verdict
+
+# Different lines for some machines. A rule picks machines by tags - every one
+# given must be on the machine, as on a grant - and by system_model and
+# cpu_model, exactly as the machine reports them (the Groups view lists them).
+# Everything given must match, and a rule must give at least one of them.
+#
+# For each threshold, a machine takes the value from the first rule in this
+# file that picks it and sets that threshold; otherwise the value above;
+# otherwise the default. First match wins, threshold by threshold, so a later
+# rule still supplies what an earlier one leaves alone. Each machine's page
+# names the rules that changed how it was judged.
+#
+# [[thresholds.overrides]]
+# name = "lab machines"         # optional: what the machine page shows
+# tags = { site = "lab" }
+# stale_days = 365              # measured once a year, on purpose
+#
+# [[thresholds.overrides]]
+# name = "kiosks"
+# system_model = "PUT-THE-SYSTEM-MODEL-OF-YOUR-KIOSKS-HERE"
+# disk_free_pct = 5             # a small fixed image, mostly full by design
+# disk_free_critical_pct = 2
 
 # Who gets in, and over how much of the estate.
 #
@@ -1893,6 +2298,337 @@ mod tests {
         let err = toml::from_str::<Config>("[notify]\ndigest = \"hourly\"\n")
             .expect_err("not a schedule");
         assert!(err.to_string().contains("hourly"), "{err}");
+    }
+
+    /// `[thresholds]` and its overrides through the reader and `validate`, as
+    /// `Config::load` takes them.
+    fn thresholds_from(text: &str) -> Result<crate::analytics::Tuning> {
+        let c: Config = toml::from_str(text)?;
+        c.validate()?;
+        c.thresholds.tuning()
+    }
+
+    fn refused(text: &str) -> String {
+        format!(
+            "{:#}",
+            thresholds_from(text).expect_err(&format!("should be refused:\n{text}"))
+        )
+    }
+
+    /// The doc comment on `Thresholds` promised a config change; a file that
+    /// does not make one must change nothing.
+    #[test]
+    fn without_a_thresholds_section_the_engine_runs_on_the_defaults() {
+        let t = thresholds_from("").expect("an empty file");
+        assert_eq!(t, crate::analytics::Tuning::default());
+        assert_eq!(t.fleet, crate::analytics::Thresholds::default());
+        assert!(t.overrides.is_empty());
+        assert_eq!(
+            thresholds_from("[thresholds]\n").expect("an empty section"),
+            crate::analytics::Tuning::default()
+        );
+        assert_eq!(
+            Config::default().tuning().expect("default"),
+            crate::analytics::Tuning::default()
+        );
+    }
+
+    #[test]
+    fn every_threshold_can_be_set_for_the_fleet() {
+        let t = thresholds_from(
+            "[thresholds]\nmin_cohort = 6\ncohort_z = 3\ncohort_min_shortfall = 0.12\n\
+             mad_floor_frac = 0.05\nregression_frac = 0.2\nstale_days = 365\n\
+             battery_health_pct = 60\nunstable_cpu_subtests = 3\ndrive_wear_pct = 90\n\
+             drive_spare_pct = 15\ndisk_free_pct = 15\ndisk_free_critical_pct = 7.5\n\
+             firmware_behind_days = 180\nfirmware_old_years = 5\nreplace_age_years = 6\n",
+        )
+        .expect("valid");
+        let f = &t.fleet;
+        assert_eq!(f.min_cohort, 6);
+        assert_eq!(f.cohort_z, 3.0, "an integer is read as a number");
+        assert_eq!(f.cohort_min_shortfall, 0.12);
+        assert_eq!(f.mad_floor_frac, 0.05);
+        assert_eq!(f.regression_frac, 0.2);
+        assert_eq!(f.stale_days, 365.0);
+        assert_eq!(f.battery_health_pct, 60.0);
+        assert_eq!(f.unstable_cpu_subtests, 3);
+        assert_eq!(f.drive_wear_pct, 90.0);
+        assert_eq!(f.drive_spare_pct, 15.0);
+        assert_eq!(f.disk_free_pct, 15.0);
+        assert_eq!(f.disk_free_critical_pct, 7.5);
+        assert_eq!(f.firmware_behind_days, 180.0);
+        assert_eq!(f.firmware_old_years, 5.0);
+        assert_eq!(f.replace_age_years, 6.0);
+        // Every one of `FIELDS`, so a threshold added to the struct and the
+        // table but not to the file is caught here.
+        assert_eq!(
+            ThresholdValues::default().entries().len(),
+            0,
+            "nothing set is nothing listed"
+        );
+        let all: Config = toml::from_str(&format!(
+            "[thresholds]\n{}",
+            crate::analytics::FIELDS
+                .iter()
+                .map(|f| format!(
+                    "{} = {}\n",
+                    f.name,
+                    if f.name == "min_cohort" { 4 } else { 1 }
+                ))
+                .collect::<String>()
+        ))
+        .expect("every field is a key");
+        assert_eq!(
+            all.thresholds.values.entries().len(),
+            crate::analytics::FIELDS.len()
+        );
+    }
+
+    #[test]
+    fn an_override_is_read_with_its_selector_and_name() {
+        let t = thresholds_from(
+            "[thresholds]\nstale_days = 120\n\
+             [[thresholds.overrides]]\nname = \"lab machines\"\ntags = { site = \"lab\" }\n\
+             stale_days = 365\n\
+             [[thresholds.overrides]]\nsystem_model = \"Dell Inc. OptiPlex 3000\"\n\
+             cpu_model = \"Intel(R) Core(TM) i5-12500\"\ndisk_free_pct = 5\n",
+        )
+        .expect("valid");
+        assert_eq!(t.fleet.stale_days, 120.0);
+        assert_eq!(t.overrides.len(), 2);
+        assert_eq!(t.overrides[0].name, "lab machines");
+        assert_eq!(t.overrides[0].tags["site"], "lab");
+        assert_eq!(t.overrides[0].set["stale_days"], 365.0);
+        assert_eq!(
+            t.overrides[1].name,
+            "system_model=Dell Inc. OptiPlex 3000, cpu_model=Intel(R) Core(TM) i5-12500",
+            "unnamed, it is named after what it picks"
+        );
+        assert!(t.shadowed().is_empty());
+    }
+
+    /// The cohort statistics describe a calculation across machines, so a
+    /// value for some machines is refused — with the reason, not as an
+    /// unknown key.
+    #[test]
+    fn a_cohort_statistic_in_an_override_is_refused_with_the_reason() {
+        for (field, value) in [
+            ("min_cohort", "6"),
+            ("cohort_z", "3"),
+            ("cohort_min_shortfall", "0.2"),
+            ("mad_floor_frac", "0.05"),
+        ] {
+            let err = refused(&format!(
+                "[[thresholds.overrides]]\ntags = {{ site = \"lab\" }}\n{field} = {value}\n"
+            ));
+            assert!(err.contains(field), "{err}");
+            assert!(err.contains("fleet-wide only"), "{err}");
+            assert!(
+                err.contains("[thresholds] itself"),
+                "and says where it goes: {err}"
+            );
+            // And fine in [thresholds].
+            thresholds_from(&format!("[thresholds]\n{field} = {value}\n"))
+                .unwrap_or_else(|e| panic!("{field} fleet-wide: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn a_threshold_out_of_range_is_refused_naming_the_setting() {
+        for (setting, want) in [
+            ("disk_free_pct = 120", "percentage"),
+            ("battery_health_pct = -1", "percentage"),
+            ("regression_frac = 15", "fraction"),
+            ("cohort_min_shortfall = 0", "fraction"),
+            ("mad_floor_frac = 1", "fraction"),
+            ("stale_days = 0", "more than zero"),
+            ("replace_age_years = -5", "more than zero"),
+            ("cohort_z = 0", "more than zero"),
+            ("stale_days = nan", "finite"),
+            ("firmware_old_years = inf", "finite"),
+            ("unstable_cpu_subtests = 0", "at least 1"),
+            ("min_cohort = 2", "at least 3"),
+            ("min_cohort = 3.5", "whole number"),
+            ("unstable_cpu_subtests = 2.5", "whole number"),
+            ("stale_days = \"two\"", "a number"),
+        ] {
+            let name = setting.split(' ').next().unwrap();
+            let err = refused(&format!("[thresholds]\n{setting}\n"));
+            assert!(err.contains(name), "{setting}: {err}");
+            assert!(err.contains(want), "{setting}: {err}");
+
+            // The same check in an override, for the ones it may set.
+            if crate::analytics::field(name).is_some_and(|f| f.per_machine) {
+                let err = refused(&format!(
+                    "[[thresholds.overrides]]\nname = \"lab\"\ntags = {{ site = \"lab\" }}\n{setting}\n"
+                ));
+                assert!(err.contains(name) && err.contains(want), "{setting}: {err}");
+            }
+        }
+        thresholds_from("[thresholds]\ndisk_free_pct = 0\ndisk_free_critical_pct = 0\n")
+            .expect("0% is a line: nothing is ever under it");
+    }
+
+    /// Critical has to be the lower line, wherever a machine's two values
+    /// come from.
+    #[test]
+    fn a_critical_disk_line_above_the_warning_line_is_refused() {
+        let err = refused("[thresholds]\ndisk_free_pct = 4\n");
+        assert!(
+            err.contains("disk_free_critical_pct (5) is above disk_free_pct (4)"),
+            "{err}"
+        );
+
+        // An override's critical line against the fleet's warning line.
+        let err = refused(
+            "[[thresholds.overrides]]\nname = \"lab\"\ntags = { site = \"lab\" }\n\
+             disk_free_critical_pct = 12\n",
+        );
+        assert!(
+            err.contains("the override \"lab\"") && err.contains("[thresholds]"),
+            "{err}"
+        );
+
+        // Two overrides that a machine could match both of.
+        let two = |second: &str| {
+            format!(
+                "[[thresholds.overrides]]\nname = \"crit\"\ntags = {{ site = \"lab\" }}\n\
+                 disk_free_critical_pct = 8\n\
+                 [[thresholds.overrides]]\nname = \"free\"\n{second}\ndisk_free_pct = 6\n"
+            )
+        };
+        let err = refused(&two("tags = { ring = \"pilot\" }"));
+        assert!(
+            err.contains("\"crit\"") && err.contains("\"free\""),
+            "a lab machine in the pilot ring takes 8 from one and 6 from the other: {err}"
+        );
+        // Not when no machine can match both.
+        thresholds_from(&two("tags = { site = \"office\" }"))
+            .expect("a machine is in one site or the other");
+        // A rule that sets both lines keeps a later rule's away from the
+        // machines it picks.
+        thresholds_from(
+            "[[thresholds.overrides]]\nname = \"lab\"\ntags = { site = \"lab\" }\n\
+             disk_free_critical_pct = 8\ndisk_free_pct = 9\n\
+             [[thresholds.overrides]]\nname = \"pilot\"\ntags = { ring = \"pilot\" }\n\
+             disk_free_pct = 6\ndisk_free_critical_pct = 3\n",
+        )
+        .expect("a lab machine in the pilot ring takes both lines from the lab rule");
+        // An override that sets both, consistently, is fine.
+        thresholds_from(
+            "[[thresholds.overrides]]\ntags = { site = \"kiosk\" }\ndisk_free_pct = 3\n\
+             disk_free_critical_pct = 1\n",
+        )
+        .expect("both lines lowered together");
+    }
+
+    #[test]
+    fn an_override_that_cannot_mean_what_it_says_is_refused() {
+        for (rule, want) in [
+            ("stale_days = 365", "picks no machines"),
+            ("tags = {}\nstale_days = 365", "empty tags table"),
+            (
+                "system_model = \"\"\nstale_days = 365",
+                "empty system_model",
+            ),
+            ("cpu_model = \"  \"\nstale_days = 365", "empty cpu_model"),
+            (
+                "name = \"\"\ntags = { site = \"lab\" }\nstale_days = 365",
+                "empty name",
+            ),
+            ("tags = { site = \"\" }\nstale_days = 365", "empty tag"),
+            ("tags = { site = \"lab\" }", "sets no thresholds"),
+            (
+                "tags = { site = \"PUT-THE-SITE-HERE\" }\nstale_days = 365",
+                "placeholder",
+            ),
+            (
+                "tags = { site = \"lab\" }\nstale_day = 365",
+                "stale_day is not a setting",
+            ),
+            ("tags = \"site=lab\"\nstale_days = 365", "tags"),
+            (
+                "tags = { site = \"lab\" }\noverrides = []",
+                "overrides is not a setting",
+            ),
+        ] {
+            let err = refused(&format!("[[thresholds.overrides]]\n{rule}\n"));
+            assert!(err.contains(want), "{rule}: {err}");
+        }
+    }
+
+    #[test]
+    fn two_overrides_of_one_name_are_refused() {
+        let err = refused(
+            "[[thresholds.overrides]]\nname = \"lab\"\ntags = { site = \"lab\" }\nstale_days = 365\n\
+             [[thresholds.overrides]]\nname = \"lab\"\ntags = { site = \"lab2\" }\nstale_days = 365\n",
+        );
+        assert!(err.contains("both named \"lab\""), "{err}");
+        // Two unnamed rules with the same selector get the same name, and are
+        // better written as one.
+        let err = refused(
+            "[[thresholds.overrides]]\ntags = { site = \"lab\" }\nstale_days = 365\n\
+             [[thresholds.overrides]]\ntags = { site = \"lab\" }\ndisk_free_pct = 5\n",
+        );
+        assert!(err.contains("merged"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_threshold_is_an_error_not_a_shrug() {
+        let err = refused("[thresholds]\nstale_day = 365\n");
+        assert!(
+            err.contains("thresholds.stale_day is not a setting"),
+            "{err}"
+        );
+        assert!(
+            err.contains("stale_days"),
+            "the list names the real ones: {err}"
+        );
+        let err = refused("[thresholds]\nname = \"lab\"\n");
+        assert!(err.contains("thresholds.name"), "{err}");
+    }
+
+    /// The starter's override examples are written to be uncommented: the
+    /// lab rule works as it stands, and the kiosk rule refuses until its
+    /// placeholder is filled in.
+    #[test]
+    fn the_starter_files_threshold_examples_work_once_uncommented() {
+        let starter = Config::starter();
+        let at = starter.find("[thresholds]").expect("the section");
+        let end = starter[at..]
+            .find("\n[[auth.grants]]")
+            .expect("ends before the grants")
+            + at;
+        // Uncomment the settings and headers; drop the prose around them.
+        let setting = |l: &str| {
+            l.starts_with("[[")
+                || l.split_once(" = ").is_some_and(|(k, _)| {
+                    !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                })
+        };
+        let section: String = starter[at..end]
+            .lines()
+            .filter_map(|l| match l.strip_prefix("# ") {
+                Some(rest) if setting(rest) => Some(rest),
+                Some(_) => None,
+                None if l.starts_with('#') => None,
+                None => Some(l),
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let err = format!("{:#}", thresholds_from(&section).expect_err("placeholder"));
+        assert!(err.contains("placeholder"), "{err}\n{section}");
+        let t = thresholds_from(&section.replace(
+            "PUT-THE-SYSTEM-MODEL-OF-YOUR-KIOSKS-HERE",
+            "HP t640 Thin Client",
+        ))
+        .unwrap_or_else(|e| panic!("{e:#}\n{section}"));
+        assert_eq!(
+            t.fleet,
+            crate::analytics::Thresholds::default(),
+            "{section}"
+        );
+        assert_eq!(t.overrides.len(), 2);
     }
 
     #[test]
