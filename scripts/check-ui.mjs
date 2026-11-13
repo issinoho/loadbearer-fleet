@@ -25,7 +25,9 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -1769,6 +1771,215 @@ function heatRows(h) {
     failures.push(`upload: threw ${err.message}`);
   }
   globalThis.document.querySelector = () => null;
+}
+
+/* ---------------------------------------------------------- printed report */
+
+/*
+ * The report view lays the estate out as a document from the calls the tabs
+ * make. Rendered from what the binary says — the snapshot, `report --changes
+ * 4 --json` and `report --by tag:site --json` over the fixtures — then from an
+ * empty estate the binary indexed from an empty folder, then from a synthetic
+ * estate long enough to hit the caps. What is asserted is the structure: the
+ * sections, in order, the period and the filter stated, the caps said in
+ * words, and no control left in the document that print would show.
+ */
+function realEmpty() {
+  const target = process.env.CARGO_TARGET_DIR || 'target';
+  const exe = join(target, 'debug', process.platform === 'win32' ? 'loadbearer-fleet.exe' : 'loadbearer-fleet');
+  const dir = join(tmpdir(), `lbf-check-empty-${process.pid}`);
+  const db = `${dir}.db`;
+  mkdirSync(dir, { recursive: true });
+  const run = (a) => {
+    const r = spawnSync(exe, ['--index', db, '--log-level', 'warn', ...a], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      console.error(`\n${exe} ${a.join(' ')} failed:\n${r.stderr || r.stdout}`);
+      process.exit(1);
+    }
+    return r.stdout;
+  };
+  try {
+    run(['scan', dir]);
+    return {
+      snap: JSON.parse(run(['report', '--json'])),
+      changes: JSON.parse(run(['report', '--changes', '4', '--json'])),
+    };
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try { rmSync(db + suffix); } catch { /* already gone */ }
+    }
+    try { rmSync(dir, { recursive: true }); } catch { /* already gone */ }
+  }
+}
+
+async function renderReportWith(name, { snap, changes, timeline, grouping = null, settings = {} }) {
+  const seen = [];
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    seen.push(u);
+    const body = u.startsWith('/api/changes') ? changes
+      : u.startsWith('/api/timeline') ? timeline
+        : u.startsWith('/api/groups') ? grouping : null;
+    if (body instanceof Error) return Promise.resolve({ ok: false, text: () => Promise.resolve(body.message) });
+    return Promise.resolve(body
+      ? { ok: true, json: () => Promise.resolve(body), text: () => Promise.resolve('') }
+      : { ok: false, text: () => Promise.resolve('unexpected request') });
+  };
+  globalThis.location = { hash: '', origin: 'http://fleet.example' };
+  Object.assign(mod.state, { snap, filter: {}, reportWindow: 4, reportBy: null, ...settings });
+  const h = host(820);
+  try {
+    await mod.renderReport(h);
+  } catch (err) {
+    failures.push(`${name}: threw ${err.message}`);
+    return null;
+  }
+  const text = textOf(h);
+  check(name, !text.includes('undefined'), 'the word "undefined" reached the page');
+  check(name, !text.includes('NaN'), 'the word "NaN" reached the page');
+  check(name, !text.includes('[object'), 'an object reached the page as text');
+  check(name, !text.includes('Loading…'), 'a placeholder was left behind');
+  check(name, !text.includes('Show all'), 'a list collapsed behind a button, which paper cannot press');
+  // Every section, in the order the brief for a review asks for them.
+  const order = ['Fleet report', 'Summary', 'What changed in', 'Findings to act on', 'What to do about each machine',
+    ...(settings.reportBy ? ['By '] : []), 'Over time', 'Generated '];
+  let at = -1;
+  for (const heading of order) {
+    const i = text.indexOf(heading, at + 1);
+    check(name, i > at, `"${heading}" is missing or out of order`);
+    if (i > at) at = i;
+  }
+  // The same calls the tabs make, and only those: nothing re-derived.
+  check(name, seen.some((u) => u.startsWith(`/api/changes?`) && u.includes(`window=${settings.reportWindow || 4}`)),
+    `"What changed" was not asked for the report's period: ${seen.join(' ')}`);
+  check(name, seen.some((u) => u.startsWith('/api/timeline')), 'the timeline was not asked for');
+  check(name, seen.some((u) => u.startsWith('/api/groups')) === !!settings.reportBy,
+    `groups were ${settings.reportBy ? 'not ' : ''}asked for: ${seen.join(' ')}`);
+  // The only controls a printed page could show are in the toolbar, which
+  // print drops, or are `.btn`s, which print drops too; a machine's name is
+  // a link-button, which prints as its text.
+  const bar = new Set();
+  walk(h, (n) => { if (n.className === 'report-toolbar') walk(n, (k) => bar.add(k)); });
+  walk(h, (n) => {
+    const cls = String(n.className || '');
+    if ((n.tagName === 'button' || n.tagName === 'select') && !bar.has(n)
+      && !cls.includes('link-button') && !cls.split(' ').includes('btn')) {
+      failures.push(`${name}: a ${n.tagName} "${textOf(n).slice(0, 40)}" would print`);
+    }
+  });
+  notes.push(`${name}: ${auditTree(name, h)} chart(s), ${text.length} chars of text`);
+  return { h, text };
+}
+
+{
+  const fixtures = await renderReportWith('report/fixtures', {
+    snap: snapshot, changes: realChanges(4), timeline: weeksOf(27),
+  });
+  if (fixtures) {
+    const { text } = fixtures;
+    check('report/fixtures', text.includes('Every machine, no filter applied.'), 'the filter is not stated');
+    check('report/fixtures', text.includes('http://fleet.example') && text.includes(`loadbearer-fleet ${snapshot.version}`),
+      'the source and the build are not stated');
+    const live = snapshot.flags.filter((f) => !f.triage && f.severity !== 'info');
+    check('report/fixtures', text.includes(`${live.length} live critical or warning finding(s)`),
+      'the live findings are not counted as the snapshot counts them');
+    for (const f of live) {
+      check('report/fixtures', text.includes(f.detail), `a live finding's detail is missing: ${f.code}`);
+    }
+    for (const f of snapshot.flags.filter((x) => x.severity === 'info')) {
+      check('report/fixtures', !text.includes(f.detail), `an informational finding was listed: ${f.code}`);
+    }
+    check('report/fixtures', text.includes(`${snapshot.summary.info} informational`), 'informational ones are not counted');
+    check('report/fixtures', text.includes('Fleet size and grade mix'), 'the over-time charts are missing');
+  }
+
+  const grouped = await renderReportWith('report/grouped', {
+    snap: snapshot, changes: realChanges(13), timeline: weeksOf(27), grouping: realGrouping('tag:site'),
+    settings: { reportBy: 'tag:site', reportWindow: 13, filter: {} },
+  });
+  if (grouped) {
+    check('report/grouped', grouped.text.includes('By tag: site') && grouped.text.includes('glasgow'),
+      'the groups are not laid out');
+    check('report/grouped', grouped.text.includes('What changed in 13 weeks'), 'the period is not stated');
+  }
+
+  const empty = realEmpty();
+  check('report/empty', empty.snap.machines.length === 0, 'the empty folder produced machines');
+  const none = await renderReportWith('report/empty', {
+    snap: empty.snap, changes: empty.changes, timeline: { generated_at: empty.snap.generated_at, weeks: 26, points: [] },
+  });
+  if (none) {
+    for (const want of ['0 machine(s)', 'Nothing at warning or above in view.',
+      'Nothing in view to replace, repair or investigate.', 'No data in view yet.']) {
+      check('report/empty', none.text.includes(want), `missing ${JSON.stringify(want)}`);
+    }
+  }
+
+  // Past the cap: the list stops at REPORT_ROWS and says how many it left off,
+  // and where they are. Built from the fixtures' own findings and machines.
+  const many = structuredClone(snapshot);
+  const template = snapshot.flags.find((f) => f.severity !== 'info') || snapshot.flags[0];
+  const base = snapshot.machines[0];
+  many.machines = Array.from({ length: 70 }, (_, i) => ({
+    ...base, key: `K-${i}`, hostname: `PC-${String(i).padStart(3, '0')}`,
+    lifecycle: { ...base.lifecycle, verdict: ['replace', 'repair', 'investigate'][i % 3], reasons: [`reason ${i}`] },
+  }));
+  many.flags = many.machines.map((m, i) => ({
+    ...template, machine_key: m.key, hostname: m.hostname, severity: i % 2 ? 'warning' : 'critical', triage: null,
+    detail: `detail ${i}`,
+  }));
+  const capped = await renderReportWith('report/capped', {
+    snap: many, changes: realChanges(4), timeline: weeksOf(27), settings: { filter: { tags: 'site=glasgow', q: 'PC' } },
+  });
+  if (capped) {
+    const more = 70 - mod.REPORT_ROWS;
+    check('report/capped', capped.text.includes(`And ${more} more — see the findings CSV.`), 'the findings cap is not said');
+    check('report/capped', capped.text.includes(`And ${more} more — see the Lifecycle tab, or the machines CSV.`),
+      'the lifecycle cap is not said');
+    check('report/capped', capped.text.includes(`detail ${mod.REPORT_ROWS - 1}`)
+      && !capped.text.includes(`detail ${mod.REPORT_ROWS}`), 'the cap is not where it says');
+    check('report/capped', capped.text.includes('tagged site=glasgow') && capped.text.includes('matching “PC”'),
+      'the filter is not stated');
+    let rows = 0;
+    walk(capped.h, (n) => { if (n.tagName === 'tbody') rows = Math.max(rows, n.children.length); });
+    check('report/capped', rows === mod.REPORT_ROWS, `a table holds ${rows} rows, not ${mod.REPORT_ROWS}`);
+  }
+  mod.state.snap = snapshot;
+  mod.state.filter = {};
+}
+
+/*
+ * The CSV links carry the filter the page was drawn with, so the file is the
+ * view on screen: the machine table's and the queue's, and the overview's
+ * link to the report, which carries it too.
+ */
+{
+  const hrefs = (h) => {
+    const out = [];
+    walk(h, (n) => { if (n.tagName === 'a') out.push(n.attrs.href); });
+    return out;
+  };
+  mod.state.filter = { tags: 'site=edinburgh', lifecycle: 'watch' };
+  const machines = host(1200);
+  mod.renderMachines(machines);
+  check('csv/machines', hrefs(machines).includes('/api/machines.csv?tags=site%3Dedinburgh&lifecycle=watch'),
+    `the download does not carry the filter: ${hrefs(machines).join(' ')}`);
+  let download = false;
+  walk(machines, (n) => { if (n.tagName === 'a' && 'download' in n.attrs) download = true; });
+  check('csv/machines', download, 'the link is not a download');
+
+  globalThis.fetch = () => Promise.resolve({ ok: false, text: () => Promise.resolve('not in this check') });
+  const overview = host(1200);
+  await mod.renderOverview(overview);
+  const links = hrefs(overview);
+  check('csv/findings', links.includes('/api/findings.csv?tags=site%3Dedinburgh&lifecycle=watch'),
+    `the queue's download does not carry the filter: ${links.join(' ')}`);
+  check('csv/findings', textOf(overview).includes('snoozed and suppressed ones too'),
+    'the queue does not say the file holds what it hides');
+  check('report/link', links.includes('#/report?tags=site%3Dedinburgh&lifecycle=watch'),
+    `the overview's report link does not carry the filter: ${links.join(' ')}`);
+  notes.push(`csv: ${links.length} link(s) on the overview, the machine table's download carries the filter`);
+  mod.state.filter = {};
 }
 
 /* ------------------------------------------------------------------ report */

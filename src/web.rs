@@ -53,6 +53,7 @@ use crate::analytics::{
 use crate::auth::{self, Authenticator, Caller, IngestTokens, Submitter, token_matches};
 use crate::compare;
 use crate::config::{AuthMode, Config, DigestSchedule, Metrics as MetricsConfig};
+use crate::export;
 use crate::index::{Index, ScanReport};
 use crate::metrics::{self, Runtime, ScanStamp};
 use crate::notify::{self, Notifier};
@@ -139,6 +140,9 @@ pub struct AppState {
     /// The webhook, when one is configured. Fed after every rebuild of the
     /// analysis and by the digest timer; sends from a task of its own.
     notifier: Option<Notifier>,
+    /// Where people reach this dashboard, as configured: what a printed
+    /// report names as its source, since a sheet of paper has no address bar.
+    public_url: String,
 }
 
 impl AppState {
@@ -173,11 +177,16 @@ impl AppState {
             metrics_config: config.metrics.clone(),
             runtime: Mutex::new(runtime),
             notifier,
+            public_url: config.server.public_url.trim_end_matches('/').to_string(),
         }))
     }
 
     pub fn auth(&self) -> &Authenticator {
         &self.authenticator
+    }
+
+    pub fn public_url(&self) -> &str {
+        &self.public_url
     }
 
     pub fn ingest(&self) -> &IngestTokens {
@@ -786,6 +795,49 @@ async fn get_heatmap(
     let h = analytics::heatmap(&view, encoding, &sort, descending, analytics::HEATMAP_ROWS)
         .map_err(AppError::bad_request)?;
     Ok(Json(h))
+}
+
+/// The machines in view as a spreadsheet: `/api/machines.csv`.
+async fn get_machines_csv(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Query(filter): Query<FilterParams>,
+) -> Response {
+    csv_download(export::Table::Machines, &visible(&state, &caller, filter))
+}
+
+/// Every finding on the machines in view, quieted ones included with their
+/// state: `/api/findings.csv`.
+async fn get_findings_csv(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Query(filter): Query<FilterParams>,
+) -> Response {
+    csv_download(export::Table::Findings, &visible(&state, &caller, filter))
+}
+
+/// A table of the caller's view as a file to save.
+///
+/// Projected through `visible` like every other read, so the filter, the
+/// scope and triage are exactly the snapshot's: the file is the view, in
+/// another shape. With a byte-order mark, unlike `report --csv`, because the
+/// likeliest thing to open a browser download is Excel on Windows — which
+/// reads BOM-less UTF-8 as the ANSI code page — and the one consumer that
+/// minds a BOM, a script, has `report` and the JSON. `no-store`, because
+/// this is the estate in a file and no shared cache needs a copy.
+fn csv_download(table: export::Table, view: &Snapshot) -> Response {
+    let now = OffsetDateTime::now_utc();
+    let body = format!("{}{}", export::BOM, table.render(view));
+    let disposition = format!("attachment; filename=\"{}\"", table.filename(now));
+    (
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Everything the drilldown needs for one machine, in one round trip.
@@ -1615,6 +1667,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/changes", get(get_changes))
         .route("/api/distribution", get(get_distribution))
         .route("/api/heatmap", get(get_heatmap))
+        .route("/api/machines.csv", get(get_machines_csv))
+        .route("/api/findings.csv", get(get_findings_csv))
         .route("/api/machine/{key}", get(get_machine))
         .route("/api/compare", get(get_compare))
         .route("/api/rescan", post(post_rescan))
@@ -3337,6 +3391,396 @@ mod tests {
         .await;
         assert_eq!(chosen.status, StatusCode::OK, "{}", chosen.body);
         assert_eq!(chosen.json()["config"], key.as_str());
+    }
+
+    // --- CSV ---------------------------------------------------------------
+
+    /// A CSV reply read back: the header, and each row by column name. Fails
+    /// on anything but the BOM, CRLF line ends and RFC 4180 quoting, so every
+    /// test that reads one also checks the encoding.
+    fn csv_of(reply: &Reply) -> (Vec<String>, Vec<BTreeMap<String, String>>) {
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let body = reply
+            .body
+            .strip_prefix(export::BOM)
+            .expect("a download starts with the byte-order mark");
+        let mut rows = export::parse(body).into_iter();
+        let head = rows.next().expect("a header row");
+        let rows = rows
+            .map(|r| {
+                assert_eq!(r.len(), head.len(), "a ragged row: {r:?}");
+                head.iter().cloned().zip(r).collect()
+            })
+            .collect();
+        (head, rows)
+    }
+
+    /// The four fixtures, and a fifth machine whose hostname and only tag are
+    /// what a hostile or careless deployment might write: a formula, and a
+    /// tag key nobody else carries.
+    fn state_with_a_hostile_machine(config: &Config) -> Arc<AppState> {
+        let state = state_for(config);
+        let text = std::fs::read_to_string(fixtures().join("low-end.json")).expect("fixture");
+        let mut doc: serde_json::Value = serde_json::from_str(&text).expect("json");
+        doc["machine"]["hostname"] = serde_json::json!("-2+3,\"CALC\"");
+        doc["machine"]["identity"] = serde_json::json!({ "machine_id": "hostile-0001" });
+        doc["tags"] = serde_json::json!({ "dept": "=HYPERLINK(\"http://x\")" });
+        state
+            .index
+            .lock()
+            .expect("index")
+            .ingest_text(&doc.to_string(), &fixtures().join("hostile.json"))
+            .expect("ingested");
+        state.recompute().expect("recomputed");
+        state
+    }
+
+    /// Both downloads are the snapshot in another shape: one row per machine
+    /// and per finding the snapshot holds, in a fixed column order, each
+    /// figure the one the snapshot carries — and labelled as what they are.
+    #[tokio::test]
+    async fn the_csv_downloads_hold_what_the_snapshot_holds() {
+        let state = state_for(&Config::default());
+        let snap = get(&state, "/api/snapshot", None).await.json();
+        let today = OffsetDateTime::now_utc().date();
+
+        let reply = get(&state, "/api/machines.csv", None).await;
+        assert_eq!(
+            reply.header(header::CONTENT_TYPE).as_deref(),
+            Some("text/csv; charset=utf-8")
+        );
+        assert_eq!(
+            reply.header(header::CONTENT_DISPOSITION),
+            Some(format!(
+                "attachment; filename=\"loadbearer-fleet-machines-{today}.csv\""
+            ))
+        );
+        assert_eq!(
+            reply.header(header::CACHE_CONTROL).as_deref(),
+            Some("no-store")
+        );
+        let (head, rows) = csv_of(&reply);
+        let mut want: Vec<String> = export::MACHINE_COLUMNS
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        want.extend(["tag:ring".to_string(), "tag:site".to_string()]);
+        assert_eq!(head, want, "fixed columns, then one per tag key, sorted");
+        let machines = snap["machines"].as_array().expect("machines");
+        assert_eq!(rows.len(), machines.len());
+        let hosts: Vec<&str> = rows.iter().map(|r| r["hostname"].as_str()).collect();
+        assert_eq!(
+            hosts,
+            [
+                "FLEET-LNX-01",
+                "FLEET-LNX-02",
+                "FLEET-OLD-01",
+                "FLEET-WIN-01"
+            ]
+        );
+        for m in machines {
+            let row = rows
+                .iter()
+                .find(|r| r["machine_key"] == m["key"].as_str().unwrap())
+                .expect("every machine has a row");
+            let figure = |col: &str| row[col].parse::<f64>().ok();
+            assert_eq!(figure("score"), m["score"].as_f64(), "{row:?}");
+            assert_eq!(figure("cohort_delta_pct"), m["cohort_delta_pct"].as_f64());
+            assert_eq!(figure("trend_pct"), m["trend_pct"].as_f64());
+            assert_eq!(figure("age_days"), m["age_days"].as_f64());
+            assert_eq!(figure("ram_bytes"), m["ram_bytes"].as_f64());
+            assert_eq!(row["grade"], m["grade"].as_str().unwrap());
+            assert_eq!(row["cpu_model"], m["cpu_model"].as_str().unwrap());
+            assert_eq!(
+                row["lifecycle"],
+                m["lifecycle"]["verdict"].as_str().unwrap()
+            );
+            assert_eq!(
+                row["lifecycle_reason"],
+                m["lifecycle"]["reasons"][0].as_str().unwrap_or_default()
+            );
+            assert_eq!(
+                row["tag:site"],
+                m["tags"]["site"].as_str().unwrap_or_default()
+            );
+            // RFC 3339 in UTC, to the second: the same instant, written
+            // the way a spreadsheet reads it.
+            let at = |s: &str| {
+                OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                    .expect("RFC 3339")
+                    .unix_timestamp()
+            };
+            assert!(row["taken_at"].ends_with('Z'), "{}", row["taken_at"]);
+            assert_eq!(at(&row["taken_at"]), at(m["taken_at"].as_str().unwrap()));
+            let live = |sev: &str| {
+                snap["flags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|f| f["machine_key"] == m["key"] && f["severity"] == sev)
+                    .filter(|f| f["triage"].is_null())
+                    .count()
+                    .to_string()
+            };
+            assert_eq!(row["live_critical"], live("critical"));
+            assert_eq!(row["live_warning"], live("warning"));
+            // Empty for missing, never a dash.
+            assert!(row.values().all(|v| v != "—" && v != "null"), "{row:?}");
+        }
+
+        let reply = get(&state, "/api/findings.csv", None).await;
+        assert_eq!(
+            reply.header(header::CONTENT_DISPOSITION),
+            Some(format!(
+                "attachment; filename=\"loadbearer-fleet-findings-{today}.csv\""
+            ))
+        );
+        let (head, rows) = csv_of(&reply);
+        assert_eq!(
+            &head[..export::FINDING_COLUMNS.len()],
+            export::FINDING_COLUMNS
+        );
+        let flags = snap["flags"].as_array().expect("flags");
+        assert_eq!(rows.len(), flags.len(), "informational findings included");
+        for (row, f) in rows.iter().zip(flags) {
+            for col in ["severity", "code", "machine_key", "headline", "detail"] {
+                assert_eq!(
+                    row[col],
+                    f[col].as_str().unwrap(),
+                    "{col}, in the same order"
+                );
+            }
+            assert_eq!(row["queue"], f["kind"].as_str().unwrap());
+            assert_eq!(row["state"], "live");
+            assert_eq!(row["triage_by"], "");
+        }
+    }
+
+    /// The download is the caller's view like any other: a scoped viewer's
+    /// file holds their machines and their findings and nothing else, and the
+    /// filter narrows it and cannot widen it.
+    #[tokio::test]
+    async fn a_scoped_viewer_downloads_only_their_own_machines_and_findings() {
+        let state = state_for(&oidc_config());
+        let admin = session(&state, Role::Admin, &[]);
+        let edinburgh = session(&state, Role::Viewer, &[&[("site", "edinburgh")]]);
+
+        let (_, all) = csv_of(&get(&state, "/api/machines.csv", Some(&admin)).await);
+        assert_eq!(all.len(), 4);
+        let mine = get(&state, "/api/machines.csv", Some(&edinburgh)).await;
+        assert!(!mine.body.contains("FLEET-WIN-01"), "{}", mine.body);
+        let (head, mine) = csv_of(&mine);
+        assert_eq!(mine.len(), 2);
+        assert!(mine.iter().all(|r| r["tag:site"] == "edinburgh"));
+        let mine_keys: Vec<&str> = mine.iter().map(|r| r["machine_key"].as_str()).collect();
+
+        let findings = get(&state, "/api/findings.csv", Some(&edinburgh)).await;
+        assert!(!findings.body.contains("FLEET-WIN-01"), "{}", findings.body);
+        assert!(!findings.body.contains("FLEET-OLD-01"), "{}", findings.body);
+        let (_, findings) = csv_of(&findings);
+        assert!(!findings.is_empty());
+        assert!(
+            findings
+                .iter()
+                .all(|r| mine_keys.contains(&r["machine_key"].as_str()))
+        );
+        // The same rows the caller's snapshot holds.
+        let snap = get(&state, "/api/snapshot", Some(&edinburgh)).await.json();
+        assert_eq!(findings.len(), snap["flags"].as_array().unwrap().len());
+
+        // Narrowed by the filter; another site's filter is nothing, not more.
+        let (_, one) =
+            csv_of(&get(&state, "/api/machines.csv?q=FLEET-LNX-02", Some(&edinburgh)).await);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0]["hostname"], "FLEET-LNX-02");
+        let (glasgow_head, glasgow) = csv_of(
+            &get(
+                &state,
+                "/api/machines.csv?tags=site%3Dglasgow",
+                Some(&edinburgh),
+            )
+            .await,
+        );
+        assert!(glasgow.is_empty());
+        assert!(
+            !glasgow_head.iter().any(|c| c.starts_with("tag:")),
+            "no tag column names a key from outside the view: {glasgow_head:?}"
+        );
+        let (_, nothing) = csv_of(
+            &get(
+                &state,
+                "/api/findings.csv?tags=site%3Dglasgow",
+                Some(&edinburgh),
+            )
+            .await,
+        );
+        assert!(nothing.is_empty());
+        assert!(head.contains(&"tag:ring".to_string()));
+
+        // And nobody without a session gets a file at all.
+        let anonymous = get(&state, "/api/machines.csv", None).await;
+        assert_ne!(anonymous.status, StatusCode::OK);
+        assert!(!anonymous.body.contains("FLEET-"), "{}", anonymous.body);
+    }
+
+    /// A filter value the snapshot would refuse is refused here too, rather
+    /// than answered with a file that reads as the whole fleet or as nothing.
+    #[tokio::test]
+    async fn an_unknown_filter_value_is_a_bad_request_for_a_download_too() {
+        let state = state_for(&Config::default());
+        for uri in [
+            "/api/machines.csv?lifecycle=soon",
+            "/api/machines.csv?since_days=lately",
+            "/api/findings.csv?lifecycle=retire",
+            "/api/findings.csv?since_days=lately",
+        ] {
+            let r = get(&state, uri, None).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.body);
+            assert!(!r.body.is_empty(), "{uri} should say why");
+        }
+        let (_, replace) = csv_of(&get(&state, "/api/machines.csv?lifecycle=keep", None).await);
+        assert!(replace.iter().all(|r| r["lifecycle"] == "keep"));
+    }
+
+    /// Quieted findings are in the file, each with who quieted it, when, how
+    /// and what they said — and a note holding a comma, a quote and a line
+    /// break, starting with a minus, reads back as itself behind the `'`.
+    #[tokio::test]
+    async fn a_quieted_finding_is_downloaded_with_its_state() {
+        let mut config = Config::default();
+        config.server.collection_dir = None;
+        let state = state_for(&config);
+        let key = key_of(&state, "FLEET-LNX-01").await;
+        let note = "-fan, \"the loud one\"\nordered";
+        record(&state, |store| {
+            store
+                .put_mark(&Mark {
+                    code: "thermal_limited".to_string(),
+                    note: Some(note.to_string()),
+                    ..mark(
+                        &key,
+                        TriageState::Acknowledged,
+                        analytics::Severity::Warning,
+                    )
+                })
+                .expect("acknowledged");
+            store
+                .add_suppression(&Suppression {
+                    id: 0,
+                    code: "no_peer_group".to_string(),
+                    machine_key: None,
+                    tags: None,
+                    note: None,
+                    by: "Test".to_string(),
+                    by_subject: "test".to_string(),
+                    at: "2026-11-12T09:30:00+01:00".to_string(),
+                })
+                .expect("suppressed");
+        });
+
+        let reply = get(&state, "/api/findings.csv", None).await;
+        assert!(
+            reply
+                .body
+                .contains("\"'-fan, \"\"the loud one\"\"\nordered\""),
+            "defused, then quoted with the quotes doubled: {}",
+            reply.body
+        );
+        let (_, rows) = csv_of(&reply);
+        let snap = get(&state, "/api/snapshot", None).await.json();
+        assert_eq!(rows.len(), snap["flags"].as_array().unwrap().len());
+        let acked = rows
+            .iter()
+            .find(|r| r["machine_key"] == key && r["code"] == "thermal_limited")
+            .expect("the acknowledged finding is still in the file");
+        assert_eq!(acked["state"], "acknowledged");
+        assert_eq!(acked["triage_by"], "Test");
+        assert_eq!(acked["triage_note"], format!("'{note}"));
+        assert_eq!(acked["severity_when_quieted"], "warning");
+        assert!(acked["triage_at"].ends_with('Z'), "{acked:?}");
+        let suppressed: Vec<_> = rows
+            .iter()
+            .filter(|r| r["code"] == "no_peer_group")
+            .collect();
+        assert_eq!(suppressed.len(), 4, "every machine's, though none is news");
+        for r in suppressed {
+            assert_eq!(r["state"], "suppressed");
+            assert_eq!(r["suppression_reach"], "fleet");
+            assert!(r["suppression_rule"].parse::<i64>().is_ok(), "{r:?}");
+            assert_eq!(r["triage_at"], "2026-11-12T08:30:00Z", "in UTC");
+        }
+        // The machine table counts it as the snapshot does: no longer live.
+        let (_, machines) = csv_of(&get(&state, "/api/machines.csv", None).await);
+        let lnx = machines.iter().find(|r| r["machine_key"] == key).unwrap();
+        assert_eq!(lnx["live_warning"], "1", "partial_run alone is live now");
+    }
+
+    /// What a machine or a deployment tool wrote cannot become a formula in
+    /// somebody's spreadsheet, a figure is never prefixed, and a tag key one
+    /// machine carries is a column with the others' cells empty.
+    #[tokio::test]
+    async fn a_hostile_hostname_or_tag_is_text_and_tag_columns_cover_every_key() {
+        let state = state_with_a_hostile_machine(&Config::default());
+        let reply = get(&state, "/api/machines.csv", None).await;
+        let (head, rows) = csv_of(&reply);
+        let tags: Vec<&str> = head
+            .iter()
+            .skip(export::MACHINE_COLUMNS.len())
+            .map(String::as_str)
+            .collect();
+        assert_eq!(tags, ["tag:dept", "tag:ring", "tag:site"]);
+        assert_eq!(rows.len(), 5);
+        let hostile = rows
+            .iter()
+            .find(|r| r["machine_key"] == "hostile-0001")
+            .expect("the fifth machine");
+        assert_eq!(hostile["hostname"], "'-2+3,\"CALC\"");
+        assert_eq!(hostile["tag:dept"], "'=HYPERLINK(\"http://x\")");
+        assert_eq!(hostile["tag:site"], "");
+        for r in rows.iter().filter(|r| r["machine_key"] != "hostile-0001") {
+            assert_eq!(r["tag:dept"], "", "{r:?}");
+        }
+        // No raw cell anywhere in the file begins with a formula character
+        // unless it is a figure.
+        let numeric = [
+            "cpu_cores",
+            "ram_bytes",
+            "score",
+            "cohort_delta_pct",
+            "trend_pct",
+            "age_estimate_months",
+            "live_critical",
+            "live_warning",
+            "age_days",
+            "runs",
+            "worst_drive_wear_pct",
+            "drive_power_on_hours",
+            "disk_low_free_pct",
+            "disk_low_free_bytes",
+        ];
+        for r in &rows {
+            for (col, v) in r {
+                if numeric.contains(&col.as_str()) {
+                    assert!(v.is_empty() || v.parse::<f64>().is_ok(), "{col}: {v:?}");
+                } else {
+                    assert!(
+                        !v.starts_with(['=', '+', '-', '@', '\t', '\r']),
+                        "{col}: {v:?}"
+                    );
+                }
+            }
+        }
+
+        let (_, findings) = csv_of(&get(&state, "/api/findings.csv", None).await);
+        let theirs: Vec<_> = findings
+            .iter()
+            .filter(|r| r["machine_key"] == "hostile-0001")
+            .collect();
+        assert!(!theirs.is_empty());
+        for r in theirs {
+            assert_eq!(r["hostname"], "'-2+3,\"CALC\"");
+            assert_eq!(r["tag:dept"], "'=HYPERLINK(\"http://x\")");
+        }
     }
 
     /// The timeline and the changes are projected onto the caller's current

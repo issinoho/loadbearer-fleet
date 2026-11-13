@@ -17,7 +17,9 @@
  *   - **Only elements that opted in scroll inside themselves** — the tab strip
  *     and a wide table may, a card may not.
  *
- * Plus, under touch emulation, that the controls are big enough to hit.
+ * Plus, under touch emulation, that the controls are big enough to hit — and,
+ * under print media at the width of an A4 page, that no header, filter or
+ * button would print and that the printed report fits the page.
  *
  * Like `check-ui.mjs`, deliberately not part of `cargo test`: it needs Node and
  * a Chrome. It says so and exits 0 if there is no browser to drive, so it can
@@ -69,13 +71,25 @@ const SIZES = [
 // as the fleet has components. `components-split` is the same view with a
 // subtest chosen, split by site, a bin listed and the grid in grades — every
 // card it can show at once.
+//
+// `report` is the printable report, grouped by site so every section it can
+// hold is there: a document rather than a tab, reached from the overview.
 const VIEWS = ['overview', 'overview-quarter', 'cohorts', 'groups', 'components', 'components-split',
-  'lifecycle', 'lifecycle-keep', 'machines', 'drilled', 'machine', 'compare'];
+  'lifecycle', 'lifecycle-keep', 'machines', 'drilled', 'machine', 'compare', 'report'];
 
 /** The tab each view should mark as current. */
 const TAB_OF = {
   'overview-quarter': 'overview', 'lifecycle-keep': 'lifecycle', 'components-split': 'components', drilled: 'machines', machine: 'machines',
+  report: 'overview',
 };
+
+// The printed page as the browser lays it out: A4 portrait, the narrower of
+// A4 and Letter, less the 12mm side margins app.css asks for — 186mm at 96
+// pixels to the inch. Every view is laid out at that width under print media
+// and must drop its chrome; the views here must also fit the page, the report
+// above all, since paper cannot scroll sideways.
+const PRINT = { width: 703, height: 1123 };
+const PRINT_FITS = ['report', 'overview', 'lifecycle', 'machine'];
 
 // A control smaller than this is a control you miss. 40px is the floor here
 // rather than Apple's 44 because the theme toggle is square and 44 looks
@@ -357,6 +371,76 @@ check('fixtures', snapshot.machines.length > 0, 'the fixtures produced no machin
   }
 }
 
+/** Where each view lives. */
+function hashOf(view) {
+  if (view === 'machine') return `machine/${encodeURIComponent(machineKey)}`;
+  // A comparison with nothing chosen is only the picker, which is not the
+  // layout worth checking — the table is.
+  if (view === 'compare') return `compare/${compareRuns.join(',')}`;
+  if (view === 'drilled') return `machines?cpu=${encodeURIComponent(longestCpu)}`;
+  if (view === 'overview-quarter') return 'overview?changes=13';
+  if (view === 'lifecycle-keep') return 'lifecycle?decision=keep';
+  if (view === 'components-split') {
+    return 'components?measure=disk%2Fseq_read&split=tag%3Asite&bin=0&encoding=grade&sort=disk&dir=desc';
+  }
+  if (view === 'report') return 'report?by=tag%3Asite';
+  return view;
+}
+
+/*
+ * Waited for rather than slept through: a fixed delay is a flaky check on a
+ * loaded CI runner, and the page says when it is done — `main` is filled by
+ * the render and `loading` comes off at the end of it. Then one frame for the
+ * layout to settle after the last insertion.
+ */
+async function painted() {
+  const ready = `(() => {
+    const m = document.querySelector('main');
+    return !!m && !m.classList.contains('loading') && m.innerText.length > 200;
+  })()`;
+  for (let i = 0; i < 60; i++) {
+    const probe = await cdp.send('Runtime.evaluate', { expression: ready, returnByValue: true });
+    if (probe.result.value === true) {
+      await sleep(100);
+      return true;
+    }
+    await sleep(250);
+  }
+  return false;
+}
+
+/*
+ * Runs in the browser under print media. Every control and every piece of
+ * chrome must have no box at all; and what is drawn must sit inside the page,
+ * with no exemption for a scroller — paper does not scroll.
+ */
+const PRINTED = `(() => {
+  const de = document.documentElement;
+  const describe = (el) => el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
+    (typeof el.className === 'string' && el.className.trim()
+      ? '.' + el.className.trim().split(/\\s+/).join('.') : '');
+  const chrome = '.topbar, .filters, .btn, .card-actions, .triage, .report-toolbar, .view-actions, #footer-note';
+  const shown = [];
+  let hidden = 0;
+  for (const el of document.querySelectorAll(chrome)) {
+    if (el.getClientRects().length) shown.push(describe(el)); else hidden += 1;
+  }
+  const past = [];
+  for (const el of document.querySelectorAll('body *')) {
+    if (!el.getClientRects().length) continue;
+    const over = Math.round(el.getBoundingClientRect().right - de.clientWidth);
+    if (over > 1 && !past.some((p) => p.node.contains(el))) past.push({ node: el, sel: describe(el), over });
+  }
+  return JSON.stringify({
+    viewport: de.clientWidth,
+    documentWidth: Math.max(de.scrollWidth, document.body.scrollWidth),
+    shown: [...new Set(shown)],
+    hidden,
+    past: past.map(({ sel, over }) => ({ sel, over })),
+    text: document.body.innerText.length,
+  });
+})()`;
+
 /* ----------------------------------------------------------------- the runs */
 
 const profile = join(work, 'chrome');
@@ -390,38 +474,13 @@ try {
     });
 
     for (const view of VIEWS) {
-      let hash = view;
-      if (view === 'machine') hash = `machine/${encodeURIComponent(machineKey)}`;
-      // A comparison with nothing chosen is only the picker, which is not the
-      // layout worth checking — the table is.
-      if (view === 'compare') hash = `compare/${compareRuns.join(',')}`;
-      if (view === 'drilled') hash = `machines?cpu=${encodeURIComponent(longestCpu)}`;
-      if (view === 'overview-quarter') hash = 'overview?changes=13';
-      if (view === 'lifecycle-keep') hash = 'lifecycle?decision=keep';
-      if (view === 'components-split') {
-        hash = 'components?measure=disk%2Fseq_read&split=tag%3Asite&bin=0&encoding=grade&sort=disk&dir=desc';
-      }
       const where = `${size.name}/${view}`;
       // A fresh navigation rather than a hash change, so each measurement is of
       // a page that laid itself out at this size from the start.
-      await cdp.send('Page.navigate', { url: `${origin}/#/${hash}` });
-      // Waited for rather than slept through: a fixed delay is a flaky check
-      // on a loaded CI runner, and the page says when it is done — `main` is
-      // filled by the render and `loading` comes off at the end of it.
-      const ready = `(() => {
-        const m = document.querySelector('main');
-        return !!m && !m.classList.contains('loading') && m.innerText.length > 200;
-      })()`;
-      let painted = false;
-      for (let i = 0; i < 60 && !painted; i++) {
-        const probe = await cdp.send('Runtime.evaluate', { expression: ready, returnByValue: true });
-        painted = probe.result.value === true;
-        if (!painted) await sleep(250);
-      }
-      check(where, painted, 'the view never finished rendering');
-      if (!painted) continue;
-      // One frame for the layout to settle after the last insertion.
-      await sleep(100);
+      await cdp.send('Page.navigate', { url: `${origin}/#/${hashOf(view)}` });
+      const done = await painted();
+      check(where, done, 'the view never finished rendering');
+      if (!done) continue;
 
       const result = await cdp.send('Runtime.evaluate', {
         expression: MEASURE, returnByValue: true,
@@ -536,6 +595,40 @@ try {
       }
     }
   }
+
+  // Print. Each view laid out at the page's width with print media emulated:
+  // no header, filter row, button or triage control may be drawn, and on the
+  // views in PRINT_FITS nothing may reach past the page's edge.
+  await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false, maxTouchPoints: 1 });
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: PRINT.width, height: PRINT.height, deviceScaleFactor: 1, mobile: false,
+  });
+  for (const view of VIEWS) {
+    const where = `print/${view}`;
+    await cdp.send('Emulation.setEmulatedMedia', { media: '' });
+    await cdp.send('Page.navigate', { url: `${origin}/#/${hashOf(view)}` });
+    if (!(await painted())) {
+      check(where, false, 'the view never finished rendering');
+      continue;
+    }
+    await cdp.send('Emulation.setEmulatedMedia', { media: 'print' });
+    await sleep(150);
+    const result = await cdp.send('Runtime.evaluate', { expression: PRINTED, returnByValue: true });
+    if (result.exceptionDetails) {
+      check(where, false, `the page threw: ${result.exceptionDetails.text}`);
+      continue;
+    }
+    const m = JSON.parse(result.result.value);
+    for (const sel of m.shown) check(where, false, `${sel} is drawn in print`);
+    check(where, m.text > 200, `printed almost nothing (${m.text} chars)`);
+    if (PRINT_FITS.includes(view)) {
+      check(where, m.documentWidth <= m.viewport + 1,
+        `the printed page is ${m.documentWidth}px wide on a ${m.viewport}px page`);
+      for (const el of m.past) check(where, false, `${el.sel} reaches ${el.over}px past the page's edge`);
+    }
+    notes.push(`${where}: ${m.documentWidth}px on a ${m.viewport}px page, ${m.hidden} control(s) dropped`);
+  }
+  await cdp.send('Emulation.setEmulatedMedia', { media: '' });
 } finally {
   cdp?.close();
   browser.kill();

@@ -75,7 +75,7 @@ pub enum TriageState {
 }
 
 impl TriageState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Acknowledged => "acknowledged",
             Self::Snoozed => "snoozed",

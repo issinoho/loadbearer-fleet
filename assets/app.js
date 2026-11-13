@@ -1149,7 +1149,7 @@ function chartCard({ title, subtitle, note, span = 'col-6', draw, table }) {
     entry.render();
   });
 
-  const card = el('div', { class: `card ${span}` }, [
+  const card = el('div', { class: `card chart-card ${span}` }, [
     el('div', { class: 'card-head' }, [
       el('h3', { text: title }),
       el('div', { class: 'card-actions' }, [table ? toggle : null]),
@@ -1226,6 +1226,11 @@ function lifecycleFact(m) {
 // standing between a typo in here and a blank panel in production.
 export const state = {
   snap: null, me: null, view: 'overview', key: null, filter: {}, showInfo: false,
+  /// The printed report's period in weeks, and the dimension it groups by —
+  /// null for no groups section. Its own, so printing does not move the
+  /// overview's comparison or the Groups tab's dimension.
+  reportWindow: 4,
+  reportBy: null,
   /// Whether the queue shows snoozed and suppressed findings too. Acknowledged
   /// ones are always shown, drawn quieter: in hand is still worth seeing.
   showQuiet: false,
@@ -1266,7 +1271,8 @@ function parseHash() {
     const v = params.get(k);
     if (v) filter[k] = v;
   }
-  const named = ['overview', 'cohorts', 'groups', 'components', 'lifecycle', 'machines', 'compare'];
+  // `report` is a view without a tab: a document reached from the overview.
+  const named = ['overview', 'cohorts', 'groups', 'components', 'lifecycle', 'machines', 'compare', 'report'];
   const view = parts[0] === 'machine'
     ? 'machine'
     : (named.includes(parts[0]) ? parts[0] : 'overview');
@@ -1285,6 +1291,9 @@ function parseHash() {
     // The same, for the overview's comparison. Passed to the server as it
     // is, so a hand-edited window is refused there, with its reason.
     window: Number(params.get('changes')) || 1,
+    // The printed report's period, which defaults to four weeks rather than
+    // one: a report is read at a review, and a review is rarely weekly.
+    reportWindow: Number(params.get('changes')) || REPORT_WEEKS,
     // The Lifecycle view's tile, which picks the rows of its table. Not the
     // `lifecycle` filter: that narrows the whole fleet, the tiles' own counts
     // included, so choosing a tile through it would zero every other tile.
@@ -1311,6 +1320,10 @@ function writeHash({
   if (view === 'groups' && by) params.set('by', by);
   if (view === 'lifecycle' && decision) params.set('decision', decision);
   if (view === 'overview' && weeks && weeks !== 1) params.set('changes', String(weeks));
+  if (view === 'report') {
+    if (state.reportWindow && state.reportWindow !== REPORT_WEEKS) params.set('changes', String(state.reportWindow));
+    if (state.reportBy) params.set('by', state.reportBy);
+  }
   if (view === 'components') {
     for (const [k, v] of [['measure', state.measure], ['config', state.config], ['split', state.split],
       ['bin', state.bin], ['encoding', state.encoding], ['sort', state.hsort], ['dir', state.hdir]]) {
@@ -1353,9 +1366,9 @@ async function fetchSnapshot() {
 
 /** The machines in view, grouped — through the same filter, so the same
  *  machines the snapshot holds and nothing the caller's scope excludes. */
-async function fetchGroups() {
+async function fetchGroups(by = state.by) {
   const params = new URLSearchParams(state.filter);
-  if (state.by) params.set('by', state.by);
+  if (by) params.set('by', by);
   const q = params.toString();
   return fetchJson(`/api/groups${q ? `?${q}` : ''}`);
 }
@@ -1367,10 +1380,10 @@ async function fetchTimeline() {
   return fetchJson(`/api/timeline${q ? `?${q}` : ''}`);
 }
 
-/** What changed in that view since `state.window` weeks ago. */
-async function fetchChanges() {
+/** What changed in that view since `weeks` weeks ago. */
+async function fetchChanges(weeks = state.window) {
   const params = new URLSearchParams(state.filter);
-  params.set('window', String(state.window));
+  params.set('window', String(weeks));
   return fetchJson(`/api/changes?${params}`);
 }
 
@@ -1977,12 +1990,17 @@ export async function renderOverview(main) {
           'aria-pressed': state.showQuiet ? 'true' : 'false',
           onclick: () => { state.showQuiet = !state.showQuiet; render(); },
         }) : null,
+        csvLink('findings'),
       ]),
     ]),
     el('p', {
       class: 'card-sub',
       text: 'Most severe first. Every finding says what it is evidence of and what usually causes it.'
-        + (quieted ? ` Quieted: ${quieted}.` : ''),
+        + (quieted ? ` Quieted: ${quieted}.` : '')
+        // Said, because the file and the list differ on purpose: a
+        // spreadsheet can filter a row out, and cannot filter one back in.
+        + ' The CSV holds every finding in view — informational, snoozed and suppressed ones too, each with '
+        + 'its state — whatever this list is showing.',
     }),
     shown.length
       ? el('div', {}, shown.slice(0, 14).map((f) => findingRow(f, machinesByKey)))
@@ -2015,7 +2033,11 @@ export async function renderOverview(main) {
   ]);
   const overTimeSlot = el('div', { class: 'grid col-12', dataset: { card: 'over-time' } });
 
-  main.append(el('div', { class: 'grid' }, [
+  const actions = el('div', { class: 'view-actions' }, [
+    el('a', { class: 'btn', href: reportHash(), text: 'Print report' }),
+  ]);
+
+  main.append(actions, el('div', { class: 'grid' }, [
     hero, tiles, changesSlot, gradeCard, findingsCard, spreadCard, list, configs, overTimeSlot,
   ]));
 
@@ -2081,15 +2103,17 @@ const severityLabel = (sev) => SEVERITIES.find((s) => s.key === sev)?.label || s
  * the comparing; this lays out the headline and the lists, news first: new and
  * worse findings, then machines added, grades, and what went away.
  */
-export function changesCard(c, machinesByKey) {
-  const picker = el('select', {
+export function changesCard(c, machinesByKey, { picker: withPicker = true, list = collapsible } = {}) {
+  // The printed report lays this card out too, with its own period chosen
+  // elsewhere and every list capped rather than collapsed: hence the options.
+  const picker = withPicker ? el('select', {
     'aria-label': 'Compare with',
     onchange: (e) => { state.window = Number(e.target.value); writeHash({ view: 'overview' }); },
-  }, WINDOWS.map(([w, label]) => el('option', { value: String(w), text: `${label} ago` })));
-  picker.value = String(state.window);
+  }, WINDOWS.map(([w, label]) => el('option', { value: String(w), text: `${label} ago` }))) : null;
+  if (picker) picker.value = String(state.window);
   const head = el('div', { class: 'card-head' }, [
     el('h3', { text: 'What changed' }),
-    el('div', { class: 'card-actions' }, [el('label', { class: 'field' }, [picker])]),
+    picker ? el('div', { class: 'card-actions' }, [el('label', { class: 'field' }, [picker])]) : null,
   ]);
 
   if (c instanceof Error) {
@@ -2171,7 +2195,7 @@ export function changesCard(c, machinesByKey) {
 
   return [head, sub, figures, ...sections.flatMap(([title, rows]) => [
     el('p', { class: 'card-sub change-section', text: `${title} · ${rows.length}` }),
-    collapsible(rows),
+    list(rows),
   ])];
 }
 
@@ -3315,8 +3339,16 @@ export function renderMachines(main) {
   }));
 
   main.append(el('div', { class: 'grid' }, [el('div', { class: 'card col-12' }, [
-    el('div', { class: 'card-head' }, [el('h3', { text: `${state.snap.summary.machines} machine(s)` })]),
-    el('p', { class: 'card-sub', text: 'Click a column to sort, or a machine to drill in.' }),
+    el('div', { class: 'card-head' }, [
+      el('h3', { text: `${state.snap.summary.machines} machine(s)` }),
+      el('div', { class: 'card-actions' }, [csvLink('machines')]),
+    ]),
+    el('p', {
+      class: 'card-sub',
+      text: 'Click a column to sort, or a machine to drill in. The CSV holds these machines, in this filter, with '
+        + 'more columns than fit here: serial, asset tag, the decision and its reason, firmware, drive wear and '
+        + 'free space, and every tag.',
+    }),
     dataTable({
       columns: [{ label: 'Machine' }, { label: 'CPU' }, { label: 'Score', num: true }, { label: 'Grade' },
         { label: 'vs peers', num: true }, { label: 'vs own history', num: true },
@@ -3805,6 +3837,299 @@ export async function renderCompare(main, runs) {
   main.append(el('div', { class: 'grid' }, cards));
 }
 
+/* ------------------------------------------------------------------ report */
+
+/*
+ * The estate as a document, for the people who will read it on paper or as a
+ * PDF: a review meeting, a budget request. Printing is the browser's own —
+ * Print, or Save as PDF — so there is no PDF library and nothing new to trust,
+ * and the print stylesheet in app.css is what turns the page into pages.
+ *
+ * Every figure comes from the calls the tabs make — the snapshot already in
+ * hand, `/api/changes`, `/api/timeline`, `/api/groups` — through the same
+ * filter, so the report cannot disagree with the dashboard. What it adds is
+ * order and a cap: a review needs the things to act on, not the whole queue,
+ * and the CSV is there for the rest.
+ */
+
+/** The report's default period: four weeks back. */
+const REPORT_WEEKS = 4;
+
+/** The most rows a list in the report prints. Past this a printed list is a
+ *  stack of paper nobody reads, and the CSV holds every row. */
+export const REPORT_ROWS = 50;
+
+/** The decisions the report lists: the three that call for someone to act. */
+const REPORT_DECISIONS = ['replace', 'repair', 'investigate'];
+
+/** The filter in words, for the top of the page — paper has no filter row. */
+function filterWords(filter) {
+  const said = [];
+  if (filter.since_days) said.push(`measured in the last ${filter.since_days} days`);
+  if (filter.tags) said.push(`tagged ${filter.tags.split(',').join(' and ')}`);
+  if (filter.model) said.push(`system model ${filter.model}`);
+  if (filter.cpu) said.push(`CPU ${filter.cpu}`);
+  if (filter.os) said.push(`OS ${filter.os}`);
+  if (filter.cohort) said.push(`cohort ${filter.cohort}`);
+  if (filter.flag) said.push(`carrying ${codeWords(filter.flag)}`);
+  if (filter.lifecycle) said.push(`decided ${decisionOf(filter.lifecycle).label.toLowerCase()}`);
+  if (filter.q) said.push(`matching “${filter.q}”`);
+  return said.length ? `Machines ${said.join(', ')}.` : 'Every machine, no filter applied.';
+}
+
+/** The report's address, from the view the reader is on: the same filter,
+ *  and the overview's comparison if they chose one. */
+function reportHash() {
+  const params = new URLSearchParams(state.filter);
+  if (state.window && state.window !== 1) params.set('changes', String(state.window));
+  const q = params.toString();
+  return `#/report${q ? `?${q}` : ''}`;
+}
+
+/** Where a table of the current view downloads from: the filter the page was
+ *  drawn with, so the file holds the machines on screen. */
+function csvHref(table) {
+  const q = new URLSearchParams(state.filter).toString();
+  return `/api/${table}.csv${q ? `?${q}` : ''}`;
+}
+
+/** A plain link to the download, so the browser saves the file itself and
+ *  the server names it. */
+function csvLink(table, label = 'Download CSV') {
+  return el('a', {
+    class: 'btn btn-quiet', href: csvHref(table), download: true, text: label,
+    'aria-label': `Download the ${table} in view as CSV`,
+  });
+}
+
+/** One list of the report, capped, with what was left off said in words. */
+function cappedTable(columns, rows, more) {
+  const shown = rows.slice(0, REPORT_ROWS);
+  return [
+    dataTable({ columns, rows: shown }),
+    rows.length > shown.length
+      ? el('p', { class: 'card-note', text: `And ${nf0.format(rows.length - shown.length)} more — ${more}.` })
+      : null,
+  ];
+}
+
+function reportSection(title, kids) {
+  return el('section', { class: 'report-section' }, [el('h2', { text: title }), ...kids]);
+}
+
+export async function renderReport(main) {
+  const snap = state.snap;
+  const s = snap.summary;
+  const me = state.me || {};
+  const machinesByKey = new Map(snap.machines.map((m) => [m.key, m]));
+  const weeks = state.reportWindow || REPORT_WEEKS;
+  const by = state.reportBy;
+  const now = new Date();
+
+  const [changes, timeline, grouping] = await Promise.all([
+    fetchChanges(weeks).catch((err) => err),
+    fetchTimeline().catch((err) => err),
+    by ? fetchGroups(by).catch((err) => err) : null,
+  ]);
+
+  // Who, when, where from and over what: the questions a page passed round a
+  // meeting gets asked, answered before anything else.
+  const build = snap.build && snap.build !== 'unknown' ? ` (${snap.build})` : '';
+  // `public_url` is checked at startup only when sign-in is configured; without
+  // it the setting may be the default, which is not where this page was read.
+  const source = me.sign_in_enabled && me.public_url ? me.public_url : location.origin;
+  const scopes = me.scopes || [];
+  const head = el('header', { class: 'report-head' }, [
+    el('h1', { text: 'Fleet report' }),
+    el('p', { class: 'report-meta', text: filterWords(state.filter) }),
+    scopes.length ? el('p', {
+      class: 'report-meta',
+      text: `Limited by sign-in to the machines tagged ${scopes
+        .map((sc) => Object.entries(sc).map(([k, v]) => `${k}=${v}`).join(' and ')).join(', or ')}.`,
+    }) : null,
+    el('p', {
+      class: 'report-meta',
+      text: `${nf0.format(s.machines)} machine(s) · generated ${when(now.toISOString())}`
+        + (me.authenticated && me.name ? ` by ${me.name}` : '')
+        + ` · results as read ${when(snap.generated_at)}`,
+    }),
+    el('p', { class: 'report-meta', text: `${source} · loadbearer-fleet ${snap.version}${build}` }),
+  ]);
+
+  // On screen only: the print stylesheet drops all of it.
+  const windowPicker = el('select', {
+    'aria-label': 'What changed since',
+    onchange: (e) => { state.reportWindow = Number(e.target.value); writeHash({ view: 'report' }); },
+  }, WINDOWS.map(([w, label]) => el('option', { value: String(w), text: `${label} ago` })));
+  windowPicker.value = String(weeks);
+  const dims = ['model', 'cpu', 'os', ...tagKeysOf(snap.machines).map((k) => `tag:${k}`)];
+  if (by && !dims.includes(by)) dims.push(by);
+  const byPicker = el('select', {
+    'aria-label': 'Group by',
+    onchange: (e) => { state.reportBy = e.target.value || null; writeHash({ view: 'report' }); },
+  }, [el('option', { value: '', text: 'No groups' }),
+    ...dims.map((d) => el('option', { value: d, text: dimensionLabel(d) }))]);
+  byPicker.value = by || '';
+  const toolbar = el('div', { class: 'report-toolbar' }, [
+    el('button', { type: 'button', class: 'btn', text: 'Print', onclick: () => window.print() }),
+    el('label', { class: 'field' }, [el('span', { class: 'field-label', text: 'Changes since' }), windowPicker]),
+    el('label', { class: 'field' }, [el('span', { class: 'field-label', text: 'Groups' }), byPicker]),
+    csvLink('machines', 'Machines CSV'),
+    csvLink('findings', 'Findings CSV'),
+  ]);
+
+  // 1. The headline.
+  const grades = s.grades.filter((g) => g[0] !== 'unrecognised' || g[1] > 0);
+  const figure = (label, value, sub) => el('div', { class: 'card' }, [
+    el('div', { class: 'tile-label', text: label }),
+    el('div', { class: 'tile-value', text: value }),
+    el('div', { class: 'tile-sub', text: sub || '' }),
+  ]);
+  const quieted = quietedWords(s.quieted);
+  const quietTotal = s.quieted ? s.quieted.acknowledged + s.quieted.snoozed + s.quieted.suppressed : 0;
+  const summary = reportSection('Summary', [
+    el('div', { class: 'tiles' }, [
+      figure('Machines', nf0.format(s.machines),
+        s.median_score === null ? '' : `median score ${nf0.format(s.median_score)}`),
+      figure('Need attention', nf0.format(s.machines_flagged), 'with a live critical or warning finding'),
+      figure('Live findings', nf0.format(s.critical + s.warnings + s.info),
+        `${s.critical} critical · ${s.warnings} warning · ${s.info} informational`),
+      figure('Quieted', nf0.format(quietTotal), quieted || 'nothing acknowledged, snoozed or suppressed'),
+    ]),
+    el('h3', { class: 'report-sub', text: 'Grades against the reference baseline' }),
+    grades.length
+      ? dataTable({
+        columns: grades.map(([g]) => ({ label: g, num: true })),
+        rows: [{ cells: grades.map(([, n]) => n) }],
+      })
+      : el('p', { class: 'empty', text: 'No machines in view.' }),
+  ]);
+
+  // 2. What changed, laid out by the overview's own card without its picker
+  // and with each list capped rather than collapsed — a collapsed list on
+  // paper is a list with rows silently missing.
+  const changed = reportSection(`What changed in ${WINDOWS.find(([w]) => w === weeks)?.[1] || `${weeks} weeks`}`,
+    changesCard(changes, machinesByKey, {
+      picker: false,
+      list: (rows) => {
+        const shown = rows.slice(0, REPORT_ROWS);
+        return el('div', {}, [
+          el('div', { class: 'finding-list' }, shown),
+          rows.length > shown.length
+            ? el('p', { class: 'card-note', text: `And ${nf0.format(rows.length - shown.length)} more — see the dashboard.` })
+            : null,
+        ]);
+      },
+    }).slice(1));
+
+  // 3. What to act on: live critical and warning findings, in the server's
+  // order. Informational and quieted ones are counted, not listed.
+  const live = snap.flags.filter((f) => !f.triage && f.severity !== 'info');
+  const findings = reportSection('Findings to act on', [
+    el('p', {
+      class: 'card-sub',
+      text: `${nf0.format(live.length)} live critical or warning finding(s), most severe first. Not listed: `
+        + `${nf0.format(s.info)} informational, and ${nf0.format(quietTotal)} quieted`
+        + `${quieted ? ` (${quieted})` : ''} — the findings CSV has every one, with its state.`,
+    }),
+    ...(live.length
+      ? cappedTable(
+        [{ label: 'Machine' }, { label: 'Severity' }, { label: 'Finding', wrap: true }, { label: 'Detail', wrap: true }],
+        live.map((f) => {
+          const m = machinesByKey.get(f.machine_key);
+          return {
+            cells: [m ? machineLink(m) : (f.hostname || f.machine_key), severityChip(f.severity),
+              `${f.headline} · ${QUEUES[f.kind] || f.kind}`, f.detail],
+          };
+        }),
+        'see the findings CSV',
+      )
+      : [el('p', { class: 'empty', text: 'Nothing at warning or above in view.' })]),
+  ]);
+
+  // 4. What each machine calls for: the three decisions that need someone.
+  const candidates = snap.machines
+    .filter((m) => m.lifecycle && REPORT_DECISIONS.includes(m.lifecycle.verdict))
+    .sort((a, b) => decisionRank(a.lifecycle.verdict) - decisionRank(b.lifecycle.verdict)
+      || (a.hostname || a.key).localeCompare(b.hostname || b.key));
+  const counts = s.lifecycle || {};
+  const lifecycle = reportSection('What to do about each machine', [
+    el('p', {
+      class: 'card-sub',
+      text: `${DECISIONS.map((d) => `${nf0.format(counts[d.key] ?? 0)} to ${d.key}`).join(' · ')}. `
+        + 'Replace, repair and investigate are listed, each with the reasons the decision rests on.',
+    }),
+    ...(candidates.length
+      ? cappedTable(
+        [{ label: 'Machine' }, { label: 'Decision' }, { label: 'Reasons', wrap: true }, { label: 'Age' },
+          { label: 'Grade' }, { label: 'System model', wrap: true }],
+        candidates.map((m) => ({
+          cells: [machineLink(m),
+            decisionOf(m.lifecycle.verdict).label + (m.lifecycle.uncertain ? ' — re-measure first' : ''),
+            m.lifecycle.reasons.join(' · ') || '—', ageWords(m.age_estimate) || '—', m.grade || '—',
+            m.system_model || '—'],
+        })),
+        'see the Lifecycle tab, or the machines CSV',
+      )
+      : [el('p', { class: 'empty', text: 'Nothing in view to replace, repair or investigate.' })]),
+  ]);
+
+  // 5. Groups, only when the address names a dimension.
+  let groups = null;
+  if (by && grouping instanceof Error) {
+    groups = reportSection('Groups', [el('div', { class: 'banner' }, [el('span', { text: grouping.message })])]);
+  } else if (by) {
+    groups = reportSection(`By ${dimensionLabel(grouping.by).toLowerCase()}`, [
+      el('p', {
+        class: 'card-sub',
+        text: 'Compared by the median of each group’s machines against identical machines — the same CPU, '
+          + 'measured the same way — rather than by raw score, which mostly measures the age of the hardware.',
+      }),
+      dataTable({
+        columns: [{ label: 'Group', wrap: true }, { label: 'Machines', num: true }, { label: 'Flagged', num: true },
+          { label: 'Critical', num: true }, { label: 'Replace', num: true }, { label: 'Repair', num: true },
+          { label: 'Median score', num: true }, { label: 'vs identical', num: true }],
+        rows: grouping.groups.map((g) => ({
+          cells: [groupLabel(g, grouping.by), g.machines, `${g.flagged} (${pct(share(g.flagged, g.machines))})`,
+            g.machines_critical, g.replace ?? '—', g.repair ?? '—', num(g.median_score, 0), vsIdentical(g)],
+        })),
+      }),
+    ]);
+  }
+
+  // 6. The charts, as the overview draws them, under the overview's own
+  // heading for them.
+  const overTime = el('section', { class: 'report-section' }, [el('div', { class: 'grid' }, overTimeCards(timeline))]);
+
+  main.append(el('article', { class: 'report' }, [
+    head, toolbar, summary, changed, findings, lifecycle, groups, overTime,
+    el('p', {
+      class: 'report-foot',
+      text: `Generated ${now.toISOString().replace(/\.\d+Z$/, 'Z')} by loadbearer-fleet ${snap.version}${build}`
+        + ` from ${source}. The filter and the sign-in scope apply to every figure; cohort medians are drawn `
+        + 'from the whole fleet.',
+    }),
+  ]));
+}
+
+/*
+ * Charts carry resolved colours, so a dark-themed page would print light ink
+ * on white paper. Print is always the light theme: switched just before the
+ * browser lays out the pages and put back after, with a redraw each way. The
+ * stylesheet forces the light surface; this is what reaches the marks.
+ */
+let themeBeforePrint;
+window.addEventListener('beforeprint', () => {
+  themeBeforePrint = document.documentElement.dataset.theme;
+  document.documentElement.dataset.theme = 'light';
+  for (const e of redraws) if (e.host.isConnected && e.mode === 'chart') e.render();
+});
+window.addEventListener('afterprint', () => {
+  if (themeBeforePrint) document.documentElement.dataset.theme = themeBeforePrint;
+  else delete document.documentElement.dataset.theme;
+  for (const e of redraws) if (e.host.isConnected && e.mode === 'chart') e.render();
+});
+
 /* -------------------------------------------------------------------- boot */
 
 function render() {
@@ -3813,7 +4138,8 @@ function render() {
   main.replaceChildren();
   for (const tab of document.querySelectorAll('.tab')) {
     const on = tab.dataset.view === state.view
-      || (state.view === 'machine' && tab.dataset.view === 'machines');
+      || (state.view === 'machine' && tab.dataset.view === 'machines')
+      || (state.view === 'report' && tab.dataset.view === 'overview');
     if (on) tab.setAttribute('aria-current', 'page'); else tab.removeAttribute('aria-current');
   }
   syncTabStrip(true);
@@ -3823,13 +4149,15 @@ function render() {
   // control while it still applied would be the confusing half of both.
   $('#filters').hidden = state.view === 'machine';
 
-  const notice = scopeNotice();
+  // The report states the scope in its own heading, where it prints.
+  const notice = state.view === 'report' ? null : scopeNotice();
   if (notice) main.append(notice);
 
   if (state.view === 'machine') { renderMachine(main, state.key); return; }
   if (state.view === 'compare') { renderCompare(main, state.runs); return; }
   if (state.view === 'groups') return renderGroups(main);
   if (state.view === 'components') return renderComponents(main);
+  if (state.view === 'report') return renderReport(main);
   if (state.view === 'lifecycle') renderLifecycle(main);
   else if (state.view === 'cohorts') renderCohorts(main);
   else if (state.view === 'machines') renderMachines(main);
@@ -3838,7 +4166,7 @@ function render() {
 
 async function route() {
   const {
-    view, key, filter, runs, by, window: weeks, decision, ...rest
+    view, key, filter, runs, by, window: weeks, decision, reportWindow, ...rest
   } = parseHash();
   state.view = view;
   state.key = key;
@@ -3849,6 +4177,10 @@ async function route() {
   if (view === 'groups') state.by = by;
   if (view === 'overview') state.window = weeks;
   if (view === 'lifecycle') state.decision = decision;
+  if (view === 'report') {
+    state.reportWindow = reportWindow;
+    state.reportBy = by;
+  }
   if (view === 'components') Object.assign(state, rest);
   const main = $('#main');
   main.classList.add('loading');

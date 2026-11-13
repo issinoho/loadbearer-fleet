@@ -444,6 +444,7 @@ loadbearer-fleet report --changes 4                # what changed in the last 4 
 loadbearer-fleet report --lifecycle                # what to replace, repair or investigate, and why
 loadbearer-fleet report --distribution disk        # how one measure is spread, one configuration at a time
 loadbearer-fleet report --heatmap                  # every machine against every component
+loadbearer-fleet report --csv machines > fleet.csv # the machine table (or findings) for a spreadsheet
 loadbearer-fleet serve \\fileserver\loadbearer     # the dashboard, on http://127.0.0.1:8787
 loadbearer-fleet init-config > fleet.toml          # a starter config, placeholders included
 loadbearer-fleet serve --config fleet.toml         # with single sign-on
@@ -524,6 +525,8 @@ resets when they're reimaged" is something an estate owner should know.
       from runs measured the same way, and every machine against every
       component — see [How each component is spread, and which machines are
       weak where](#how-each-component-is-spread-and-which-machines-are-weak-where)
+- [x] A printable fleet report, and CSV for the machine and findings tables —
+      see [For people without the dashboard](#for-people-without-the-dashboard-csv-and-a-printed-report)
 
 ## Analysis
 
@@ -882,7 +885,9 @@ subtest of its latest run, and — where a [threshold
 override](#thresholds-and-different-lines-for-some-machines) applies — the
 lines it was judged against instead. On a phone the seven tabs scroll sideways inside
 their strip, with the current one kept in view and a fade on the edge where
-more are hidden.
+more are hidden. The machine table and the findings queue download as CSV, and
+the overview prints as a report — see [For people without the
+dashboard](#for-people-without-the-dashboard-csv-and-a-printed-report).
 
 ### Which site is in the worst shape
 
@@ -1152,6 +1157,85 @@ naming the five rather than answered with an empty fleet. Every endpoint, the
 filter parameters they share with the dashboard, and how authorization is
 applied are in
 [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API).
+`GET /api/machines.csv` and `GET /api/findings.csv` are the two CSV
+downloads below, taking the same filter parameters as the snapshot, scoped the
+same way, and refusing an unknown filter value with the same 400.
+
+### For people without the dashboard: CSV and a printed report
+
+An estate gets handed to people who will never open the dashboard: a
+spreadsheet for procurement, a PDF for a review meeting. Both come out of the
+same projection as every view — the filter row and the sign-in scope apply,
+and nothing is worked out again — so neither can disagree with the screen.
+
+**CSV.** **Download CSV** on the Machines tab and on the overview's findings
+queue saves `loadbearer-fleet-machines-<date>.csv` or
+`loadbearer-fleet-findings-<date>.csv`, the date in UTC, for the machines in
+view under the filter on screen. `report --csv machines` and
+`report --csv findings` print the same rows at a prompt, over the whole index.
+
+The machine file has one row per machine, by hostname, with these columns in
+this order: `hostname`, `machine_key`, `key_kind` (which identifier the key
+is), `serial`, `asset_tag`, `system_model`, `cpu_model`, `cpu_cores`,
+`ram_bytes`, `os`, `arch`, `grade`, `score`, `cohort`, `cohort_delta_pct`,
+`trend_pct`, `lifecycle` (the decision), `lifecycle_reason` (the first reason
+it rests on), `lifecycle_remeasure_first` (`true` when it rests on a doubtful
+run), `age_estimate_months` and `age_estimate_basis` (`upper_bound` from the
+CPU's launch, or `firmware`), `live_critical` and `live_warning` (findings
+nobody has quieted), `taken_at` (the latest run), `age_days` (days since it),
+`runs`, `bios_version`, `bios_date`, `worst_drive_wear_pct`,
+`drive_power_on_hours`, `disk_low_mount`, `disk_low_free_pct`,
+`disk_low_free_bytes` (the fullest fixed volume), and `overridden_by` (the
+[threshold overrides](#thresholds-and-different-lines-for-some-machines) that
+apply, separated by `; `). Then one `tag:<key>` column per tag key any machine
+in the file carries, sorted by key; the prefix means a tag can never be
+mistaken for a fixed column.
+
+The findings file has one row per finding, most severe first: `severity`,
+`queue` (`machine`, `measurement` or `coverage`), `code`, `hostname`,
+`machine_key`, `headline`, `detail`, `state` (`live`, `acknowledged`,
+`snoozed` or `suppressed`), `triage_by`, `triage_at`, `triage_until`,
+`triage_note`, `suppression_rule` and `suppression_reach` for a suppressed
+one, and `severity_when_quieted`; then the machine's `tag:<key>` columns.
+**It holds every finding in view** — informational, acknowledged, snoozed and
+suppressed ones too, each with its state — whatever the queue on screen is
+showing: a spreadsheet can filter a row out, and a file that left one out
+cannot have it filtered back in.
+
+Both are written to be read by a program as well as a person: a header row,
+the column order fixed, numbers as plain decimals (no thousands separator, a
+`.` point), an empty cell for a missing value, times in RFC 3339 UTC to the
+second, and RFC 4180 quoting — a field with a comma, quote or line break in
+quotes, quotes doubled — with CRLF line ends on every platform. UTF-8
+throughout; the download starts with a byte-order mark, because Excel on
+Windows reads UTF-8 without one as the local code page and mangles any
+non-ASCII hostname, and `report --csv` does not, because the programs it is
+piped into do not want one. **A text cell that begins with `=`, `+`, `-`,
+`@`, a tab or a carriage return is written with a `'` in front**, so a
+hostname, tag, note or finding cannot run as a formula in Excel or Sheets;
+the `'` shows in the cell, and a script reading the file should strip it.
+Numbers are never prefixed — a negative `cohort_delta_pct` stays a number.
+
+The Lifecycle tab's list is the machine file filtered by decision
+(`lifecycle=replace` in the URL); the heatmap has no CSV of its own.
+
+**A printed report.** **Print report** on the overview opens `#/report`: the
+machines in view laid out as a document, under the same filter, for the
+browser's own Print or Save as PDF — there is no PDF library. It states the
+filter, the sign-in scope if there is one, when it was generated and by whom,
+the server and the build, and then, in order: the headline figures (machines,
+grade mix, machines needing attention, live findings by severity, quieted
+counts); what changed over the period, four weeks unless chosen otherwise;
+the live critical and warning findings as a table, with a one-line count of
+the informational and quieted ones rather than a list; the machines to
+replace, repair or investigate, with their reasons; groups by one dimension,
+if one is chosen; and the over-time charts. A list stops at 50 rows and says
+how many more there are and where to find them. Printing uses the light theme
+whatever the dashboard shows, drops the header, filters and every button,
+keeps a table row and a chart whole and a heading with what follows, repeats
+a table's header on each page, and sets no page size, so A4 and Letter both
+work. Any other tab prints too, without the chrome, though only the report is
+laid out for paper.
 
 ### No build step, no CDN, one binary
 
@@ -1184,7 +1268,9 @@ screen — and a dashboard gets read on a phone whether or not it was designed
 for one. `node scripts/check-mobile.mjs` starts the binary and lays the real
 page out in headless Chrome at 390, 320, 768 and 1440 pixels wide, failing if
 anything scrolls sideways, is painted past the right edge, clips instead of
-scrolling, or is too small to tap.
+scrolling, or is too small to tap — and once more as print lays it out on an
+A4 page, failing if the header, the filters or a button would print, or if
+the report reaches past the page's edge.
 
 ## Checks
 
