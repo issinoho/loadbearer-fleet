@@ -220,6 +220,9 @@ a { color: inherit; }
 }
 
 .field { display: flex; flex-direction: column; gap: 3px; }
+/* The same trap as `.filters[hidden]`: the Security select is hidden until a
+   machine in view has opted in, and `display: flex` would show it anyway. */
+.field[hidden] { display: none; }
 .field-grow { flex: 1 1 220px; min-width: 180px; }
 
 .field-label {

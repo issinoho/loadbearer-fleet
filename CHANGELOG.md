@@ -29,6 +29,34 @@ notes, so each one has to stand on its own.
   content hash. An existing index gains the columns and a `memory_module`
   table on open, with no format change; `scan --reindex` fills them in for the
   runs it already holds.
+- **Uptime, elevation and security posture, where a run asked for them** with
+  `--collect uptime,elevation,security` (a loadbearer release after 1.8.1).
+  Each fact is kept in three states everywhere: not asked (the category is not
+  in `run.collect` — every older run), asked but not readable, and read. A
+  machine whose run did not ask shows nothing of it, never "off"; if another
+  machine in the caller's own view did, one quiet line says which `--collect`
+  adds it. Otherwise the machine page gains a **Security** line (`UEFI ·
+  Secure Boot on · TPM 2.0 · disk encryption not read on Windows`), an
+  **Uptime** line as of the run (`up 4h 01m at the time of the run · last
+  restarted …`), and whether the run was elevated on the **Measured** line,
+  which on an unelevated Linux run also says that is why its drive health,
+  serial or memory layout is missing. A legacy-BIOS boot reads "Secure Boot
+  does not apply"; `none_detected` reads as no dm-crypt under `/`, never
+  "unencrypted"; Windows, where the CLI cannot read BitLocker, is never shown
+  as unencrypted. A **Security** select in the filter row, and `posture=` in
+  the URL and the API (`secure_boot_off`, `secure_boot_on`, `legacy_bios`,
+  `tpm_absent`, `tpm_present`, `tpm_1.2`, `disk_none_detected`,
+  `disk_encrypted`), find the machines where that fact was **read** — a
+  machine not asked matches neither side — scoped like every filter, linkable
+  and saveable; any other value is a 400. The snapshot and the drilldown carry
+  `run_collect`, `run_elevated`, `booted_at`, `uptime_secs`,
+  `firmware_mode`, `secure_boot`, `tpm_present`, `tpm_version`,
+  `disk_encryption` and `disk_encryption_method`; the machines CSV gains ten
+  columns for them before the tags, empty for not asked, `unknown` for asked
+  and unreadable, `not_applicable` where the fact cannot exist. No findings,
+  metrics or notifications are drawn from any of it, and SECURITY.md says how
+  sensitive it is. An existing index gains the columns on open with no format
+  change; `scan --reindex` fills them in.
 
 ## 0.11.0 - Fri, 13 Nov 2026
 

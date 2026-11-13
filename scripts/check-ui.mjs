@@ -1598,6 +1598,166 @@ function heatRows(h) {
   Object.assign(mod.state, before);
 }
 
+// What a run made with `--collect` adds — uptime, elevation, security — in
+// each of its states, none of which the fixtures carry: every shape the CLI
+// writes, asked and unreadable, a value this build has never heard of, and
+// not asked at all, with and without another machine in view that did ask.
+// "Not asked" must leave no trace on the page but the one hint, and that hint
+// is drawn only from the snapshot the caller was given.
+{
+  const win = snapshot.machines.find((x) => (x.os || '').startsWith('Windows 11')) || snapshot.machines[0];
+  const lin = snapshot.machines.find((x) => (x.os || '').startsWith('Linux')) || snapshot.machines[0];
+  const NONE = {
+    run_collect: [], run_elevated: null, booted_at: null, uptime_secs: null, firmware_mode: null, secure_boot: null,
+    tpm_present: null, tpm_version: null, disk_encryption: null, disk_encryption_method: null,
+  };
+  const ALL = ['elevation', 'security', 'uptime'];
+  const NEVER = ['unencrypted', 'not encrypted', 'undefined', 'NaN', 'null'];
+  const cases = [
+    {
+      name: 'machine/optin-windows',
+      machine: {
+        ...win, ...NONE, run_collect: ALL, run_elevated: false, booted_at: '2026-09-09T10:41:28Z', uptime_secs: 14492,
+        firmware_mode: 'uefi', secure_boot: true, tpm_present: true, tpm_version: '2.0',
+      },
+      want: ['UEFI · Secure Boot on · TPM 2.0 · disk encryption not read on Windows', 'up 4h 01m at the time of the run',
+        'last restarted', 'not elevated'],
+      not: ['Secure Boot off', 'booted ', 'could not be read', '--collect'],
+      dts: ['Security', 'Uptime'],
+    },
+    {
+      name: 'machine/optin-linux-luks',
+      machine: {
+        ...lin, ...NONE, run_collect: ALL, run_elevated: true, booted_at: '2026-09-06T08:00:00Z', uptime_secs: 266400,
+        firmware_mode: 'uefi', secure_boot: false, tpm_present: true, tpm_version: '2.0',
+        disk_encryption: 'encrypted', disk_encryption_method: 'luks2',
+      },
+      want: ['UEFI · Secure Boot off · TPM 2.0 · root filesystem on dm-crypt (LUKS2)', 'up 3d 2h at the time of the run',
+        'booted ', ' · elevated'],
+      not: ['last restarted', 'not elevated', 'not read on Windows', 'elevation not reported'],
+      dts: ['Security', 'Uptime'],
+    },
+    {
+      // Only security asked: no Uptime row, nothing about elevation.
+      name: 'machine/optin-none-detected',
+      machine: {
+        ...lin, ...NONE, run_collect: ['security'], firmware_mode: 'uefi', secure_boot: true, tpm_present: false,
+        disk_encryption: 'none_detected',
+      },
+      want: ['Secure Boot on', 'no TPM exposed to the OS',
+        'no dm-crypt detected under / (other kinds of disk encryption are not looked for)'],
+      not: ['elevat', 'up ', 'Secure Boot off'],
+      dts: ['Security'],
+      noDts: ['Uptime'],
+    },
+    {
+      name: 'machine/optin-legacy-bios',
+      machine: {
+        ...lin, ...NONE, run_collect: ['security', 'uptime'], firmware_mode: 'bios', tpm_present: true, tpm_version: '1.2',
+        disk_encryption: 'none_detected', booted_at: '2026-08-30T07:15:00Z', uptime_secs: 958000,
+      },
+      want: ['legacy BIOS boot · Secure Boot does not apply · TPM 1.2', 'up 11d 2h at the time of the run'],
+      not: ['Secure Boot off', 'Secure Boot on', 'Secure Boot not reported', 'elevat'],
+      dts: ['Security', 'Uptime'],
+    },
+    {
+      // All three asked, nothing readable: each says so, and none is "off".
+      name: 'machine/optin-unreadable',
+      machine: { ...lin, ...NONE, run_collect: ALL },
+      want: ['asked for, but none of it could be read', 'not reported', 'elevation not reported'],
+      not: ['Secure Boot off', 'no TPM', 'none_detected', 'not elevated'],
+      dts: ['Security', 'Uptime'],
+    },
+    {
+      // Unelevated Linux, without the root-only reads: the one sentence that
+      // says why they are missing.
+      name: 'machine/optin-unelevated-linux',
+      machine: {
+        ...lin, ...NONE, run_collect: ['elevation'], run_elevated: false, serial: null, memory_slots: null,
+        memory_populated: null,
+      },
+      want: ['not elevated, so drive health, the serial and the memory layout — root-only on Linux — could not be read'],
+      not: ['UEFI', 'Secure Boot'],
+      noDts: ['Security', 'Uptime'],
+    },
+    {
+      // Values this build has never heard of are shown as themselves.
+      name: 'machine/optin-future',
+      machine: {
+        ...lin, ...NONE, run_collect: ['network', 'security'], firmware_mode: 'coreboot', secure_boot: true,
+        tpm_present: true, tpm_version: '3.0', disk_encryption: 'partial', disk_encryption_method: 'zfs',
+      },
+      want: ['firmware coreboot · Secure Boot on · TPM 3.0 · root filesystem: partial'],
+      not: ['ZFS', 'dm-crypt'],
+      dts: ['Security'],
+    },
+    {
+      // Never asked, and nobody else in view asked either: nothing at all.
+      name: 'machine/not-asked',
+      machine: { ...win, ...NONE },
+      others: [],
+      want: [],
+      not: ['--collect', 'UEFI', 'Secure Boot', 'TPM', 'elevat', 'not collected', 'uptime', 'up '],
+      noDts: ['Security', 'Uptime'],
+    },
+    {
+      // Never asked, while another machine in view did: the one quiet line.
+      name: 'machine/not-asked-hint',
+      machine: { ...win, ...NONE },
+      others: [{ ...lin, ...NONE, key: 'OTHER-IN-VIEW', run_collect: ['security', 'uptime'] }],
+      want: ['Other machines in view also report their security posture and uptime.',
+        '--collect security,uptime on the loadbearer command line adds them to a run.'],
+      not: ['Secure Boot', 'TPM', 'not collected', 'elevat'],
+      noDts: ['Security', 'Uptime'],
+      hint: 1,
+    },
+  ];
+  const before = { snap: mod.state.snap, view: mod.state.view };
+  const dtsOf = (h) => findAll(h, (n) => n.tagName === 'dt').map((n) => n.textContent);
+  for (const c of cases) {
+    // The hint reads the snapshot in hand; without `others` it is the real
+    // one, where none of the fixtures asked for anything.
+    mod.state.snap = { ...snapshot, machines: [c.machine, ...(c.others || snapshot.machines.filter((x) => x.key !== c.machine.key))] };
+    globalThis.fetch = () => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        machine: c.machine, flags: [], cohort: null, history: [], subtests: [], drives: [], memory_modules: [],
+      }),
+      text: () => Promise.resolve(''),
+    });
+    mod.state.view = 'machine';
+    const h = host(1200);
+    try {
+      await mod.renderMachine(h, c.machine.key);
+      const text = textOf(h);
+      const dts = dtsOf(h);
+      for (const w of c.want) check(c.name, text.includes(w), `"${w}" is missing`);
+      for (const w of [...c.not, ...NEVER]) check(c.name, !text.includes(w), `"${w}" should not be there`);
+      for (const d of c.dts || []) check(c.name, dts.includes(d), `no ${d} row`);
+      for (const d of c.noDts || []) check(c.name, !dts.includes(d), `a ${d} row for something not asked`);
+      const hints = findAll(h, (n) => n.dataset?.hint === 'collect').length;
+      check(c.name, hints === (c.hint || 0), `${hints} collect hint(s), not ${c.hint || 0}`);
+      auditTree(c.name, h);
+    } catch (err) {
+      failures.push(`${c.name}: threw ${err.message}`);
+    }
+  }
+  Object.assign(mod.state, before);
+
+  // A posture filter that matches nothing says what it can and cannot match,
+  // rather than that it names something no longer in the fleet.
+  const saved = { snap: mod.state.snap, filter: mod.state.filter, view: mod.state.view };
+  mod.state.snap = { ...snapshot, machines: [], flags: [], summary: { ...snapshot.summary, machines: 0 } };
+  mod.state.filter = { posture: 'secure_boot_off' };
+  mod.state.view = 'machines';
+  const notice = mod.emptyFilterNotice();
+  check('posture/empty', !!notice && textOf(notice).includes('whose latest run read: Secure Boot off')
+    && textOf(notice).includes('are on neither side of it') && !textOf(notice).includes('no longer in the fleet'),
+  `the empty posture view does not say why: ${notice ? textOf(notice) : 'no notice'}`);
+  Object.assign(mod.state, saved);
+  notes.push(`opt-in: ${cases.length} machine page states`);
+}
+
 // Machines an override judges against other lines, from a snapshot the binary
 // built with a [thresholds] section. "64 days old, nothing stale" has to read
 // as judged against 30 days rather than as fine by the fleet's 90, so the
@@ -2091,6 +2251,27 @@ async function renderReportWith(name, { snap, changes, timeline, grouping = null
     check('report/fixtures', text.includes('Fleet size and grade mix'), 'the over-time charts are missing');
   }
 
+  // Every machine opted in, posture and all: the report carries none of it.
+  // It is a document for a review meeting, and a printed list of which
+  // machines lack Secure Boot is what the CLI's opt-in exists to keep from
+  // lying around.
+  const opted = {
+    ...snapshot,
+    machines: snapshot.machines.map((m) => ({
+      ...m, run_collect: ['elevation', 'security', 'uptime'], run_elevated: false, booted_at: '2026-09-09T10:41:28Z',
+      uptime_secs: 14492, firmware_mode: 'uefi', secure_boot: false, tpm_present: false, tpm_version: null,
+      disk_encryption: 'none_detected', disk_encryption_method: null,
+    })),
+  };
+  const postured = await renderReportWith('report/opted-in', {
+    snap: opted, changes: realChanges(4), timeline: weeksOf(27),
+  });
+  if (postured) {
+    for (const w of ['Secure Boot', 'TPM', 'dm-crypt', 'UEFI', 'elevat', 'uptime', 'Uptime', '--collect']) {
+      check('report/opted-in', !postured.text.includes(w), `"${w}" reached the printed report`);
+    }
+  }
+
   const grouped = await renderReportWith('report/grouped', {
     snap: snapshot, changes: realChanges(13), timeline: weeksOf(27), grouping: realGrouping('tag:site'),
     settings: { reportBy: 'tag:site', reportWindow: 13, filter: {} },
@@ -2220,6 +2401,7 @@ function viewFacts(v) {
     },
     { view: 'lifecycle', filter: { lifecycle: 'watch' }, decision: 'watch', sorts: { decisions: '-age', age: 'score' }, tables: ['age'] },
     { view: 'machines', filter: { flag: 'stale_result', cohort: 'X|y' }, sorts: { machines: 'tag:site' } },
+    { view: 'machines', filter: { tags: 'site=glasgow', posture: 'tpm_1.2' } },
     { view: 'machine', key: 'SN WIN/01', sorts: { measurements: '-score' }, tables: ['history'] },
     { view: 'compare', runs: [3, 1, 2], filter: { tags: 'site=glasgow' } },
     { view: 'report', filter: { model: 'Latitude 7440' }, reportWindow: 13, reportBy: 'tag:site', tables: ['median'] },

@@ -1199,6 +1199,65 @@ mod tests {
         .unwrap()
     }
 
+    /// A fleet whose every machine opted in to `--collect`, several without
+    /// Secure Boot: neither payload says a word of it. A webhook goes to a
+    /// chat channel, which is exactly where a list of unprotected machines
+    /// should not end up.
+    #[test]
+    fn no_payload_carries_the_opt_in_facts() {
+        use crate::schema::samples;
+        let mut index = Index::open_in_memory().unwrap();
+        for (f, enrich) in [
+            (
+                "win-modern.json",
+                samples::optin_windows as fn(&mut serde_json::Value),
+            ),
+            ("linux-throttled.json", samples::optin_linux_luks),
+            ("low-end.json", samples::optin_legacy_bios),
+            ("legacy-1.2.4.json", samples::optin_linux_none_detected),
+        ] {
+            let mut doc = samples::fixture(f);
+            enrich(&mut doc);
+            index.ingest_text(&doc.to_string(), Path::new(f)).unwrap();
+        }
+        let snap = crate::analytics::snapshot(
+            index.conn(),
+            &Tuning::default(),
+            datetime!(2026-09-12 12:00 UTC),
+        )
+        .unwrap();
+        assert!(snap.machines.iter().any(|m| m.secure_boot == Some(false)));
+        let all: Vec<&Flag> = snap.flags.iter().collect();
+        for out in [
+            digest_event(
+                "https://fleet.example.com",
+                DigestSchedule::Daily,
+                &snap,
+                None,
+                datetime!(2026-11-12 08:00 UTC),
+            ),
+            critical_event(
+                "https://fleet.example.com",
+                &all,
+                datetime!(2026-11-12 08:00 UTC),
+            ),
+        ] {
+            let text = String::from_utf8(out.body).expect("UTF-8").to_lowercase();
+            for word in [
+                "secure",
+                "tpm",
+                "encrypt",
+                "firmware_mode",
+                "uefi",
+                "elevat",
+                "uptime",
+                "boot",
+            ] {
+                assert!(!text.contains(word), "{word} in a {:?} payload", out.event);
+            }
+        }
+    }
+
     /// The digest, from a real snapshot: its counts are the summary's, and its
     /// field names are pinned like the critical event's.
     #[test]

@@ -627,6 +627,35 @@ pub struct MachineView {
     /// how long its benchmarks took.
     pub run_uuid: Option<String>,
     pub run_duration_secs: Option<f64>,
+    /// What the latest run was asked to collect with `--collect` — `uptime`,
+    /// `elevation`, `security`, sorted — and empty for a run that asked for
+    /// nothing, which every run from an older loadbearer is. **This is what
+    /// gives every field below its meaning**: one that is `None` is "not
+    /// asked" when its category is missing here and "asked, could not be
+    /// read" when it is listed. Neither is ever "off" or "no".
+    pub run_collect: Vec<String>,
+    /// Whether the latest run had administrator / root rights (`elevation`).
+    pub run_elevated: Option<bool>,
+    /// `uptime`: when the machine last booted and how long it had been up,
+    /// **as of the run** — not now. On Windows with Fast Startup, since the
+    /// last restart.
+    pub booted_at: Option<String>,
+    pub uptime_secs: Option<i64>,
+    /// `security`: `uefi` / `bios` or a value this build has not heard of.
+    pub firmware_mode: Option<String>,
+    /// `None` with `firmware_mode` `bios` is a legacy-BIOS boot, where there
+    /// is no Secure Boot to be on or off.
+    pub secure_boot: Option<bool>,
+    /// `false` is "the OS exposes no TPM": none fitted, off in firmware, or no
+    /// driver. `tpm_version` is `2.0` / `1.2`, `None` where the OS didn't say.
+    pub tpm_present: Option<bool>,
+    pub tpm_version: Option<String>,
+    /// Linux only, root filesystem only: `encrypted` (dm-crypt, with the
+    /// cryptsetup type in `disk_encryption_method`) or `none_detected` — no
+    /// dm-crypt under `/`, which is **not** "unencrypted". Never set for
+    /// Windows, where the CLI cannot read BitLocker.
+    pub disk_encryption: Option<String>,
+    pub disk_encryption_method: Option<String>,
     /// Every drive of the latest run, for the rules. Not serialised: the
     /// snapshot ships every machine, and the drilldown, which wants these,
     /// gets them from `detail` instead.
@@ -793,6 +822,99 @@ impl std::str::FromStr for Verdict {
                 format!(
                     "{s:?} is not a lifecycle decision. Use replace, repair, investigate, watch \
                      or keep"
+                )
+            })
+    }
+}
+
+/// One security fact a machine's latest run **read**, for `posture=` — the
+/// question "which machines have Secure Boot off" asked of the estate.
+///
+/// Each value matches only machines where the fact was read: a machine whose
+/// run did not ask for `security`, or asked and could not read that part,
+/// matches neither `secure_boot_on` nor `secure_boot_off`. That is the point:
+/// "not collected" counted as "off" would turn a fleet that never opted in
+/// into a list of unprotected machines. A legacy-BIOS boot has no Secure Boot
+/// at all and is its own value rather than either side.
+///
+/// One value at a time, and deliberately no findings or metrics drawn from
+/// it — see the README's "Uptime, elevation and security posture".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Posture {
+    SecureBootOn,
+    SecureBootOff,
+    LegacyBios,
+    TpmPresent,
+    TpmAbsent,
+    Tpm12,
+    DiskEncrypted,
+    DiskNoneDetected,
+}
+
+impl Posture {
+    pub const ALL: [Posture; 8] = [
+        Posture::SecureBootOff,
+        Posture::SecureBootOn,
+        Posture::LegacyBios,
+        Posture::TpmAbsent,
+        Posture::TpmPresent,
+        Posture::Tpm12,
+        Posture::DiskNoneDetected,
+        Posture::DiskEncrypted,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Posture::SecureBootOn => "secure_boot_on",
+            Posture::SecureBootOff => "secure_boot_off",
+            Posture::LegacyBios => "legacy_bios",
+            Posture::TpmPresent => "tpm_present",
+            Posture::TpmAbsent => "tpm_absent",
+            Posture::Tpm12 => "tpm_1.2",
+            Posture::DiskEncrypted => "disk_encrypted",
+            Posture::DiskNoneDetected => "disk_none_detected",
+        }
+    }
+
+    /// Whether `m`'s latest run read this. Every arm needs a value the index
+    /// holds only for a run that asked for `security`, so none can match a
+    /// machine that was not asked.
+    pub fn holds(self, m: &MachineView) -> bool {
+        match self {
+            Posture::SecureBootOn => m.secure_boot == Some(true),
+            Posture::SecureBootOff => m.secure_boot == Some(false),
+            Posture::LegacyBios => m.firmware_mode.as_deref() == Some("bios"),
+            Posture::TpmPresent => m.tpm_present == Some(true),
+            Posture::TpmAbsent => m.tpm_present == Some(false),
+            Posture::Tpm12 => {
+                m.tpm_present != Some(false) && m.tpm_version.as_deref() == Some("1.2")
+            }
+            Posture::DiskEncrypted => m.disk_encryption.as_deref() == Some("encrypted"),
+            Posture::DiskNoneDetected => m.disk_encryption.as_deref() == Some("none_detected"),
+        }
+    }
+}
+
+impl std::fmt::Display for Posture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Posture {
+    type Err = String;
+
+    /// Refused rather than read as "no filter", as a lifecycle decision is:
+    /// a misspelt `secure_boot_of` answered with an empty fleet would read as
+    /// "every machine has Secure Boot on".
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Posture::ALL
+            .into_iter()
+            .find(|p| p.as_str() == s.trim())
+            .ok_or_else(|| {
+                format!(
+                    "{s:?} is not a security posture. Use {}",
+                    Posture::ALL.map(Posture::as_str).join(", ")
                 )
             })
     }
@@ -1535,7 +1657,9 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
                 drive_hours_undercounted, power_plan, power_mode, power_held_back,
                 bios_version, bios_date, disk_low_mount, disk_low_free_pct,
                 disk_low_free_bytes, os_distro, os_version, os_build, os_edition,
-                memory_slots, memory_populated, run_uuid, run_duration_secs
+                memory_slots, memory_populated, run_uuid, run_duration_secs, run_collect,
+                run_elevated, booted_at, uptime_secs, firmware_mode, secure_boot,
+                tpm_present, tpm_version, disk_encryption, disk_encryption_method
            FROM run WHERE id IN ({chosen}) ORDER BY machine_key"
     ))?;
 
@@ -1648,6 +1772,22 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
             memory_modules,
             run_uuid: r.get(49)?,
             run_duration_secs: r.get(50)?,
+            run_collect: r
+                .get::<_, Option<String>>(51)?
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .collect(),
+            run_elevated: r.get(52)?,
+            booted_at: r.get(53)?,
+            uptime_secs: r.get(54)?,
+            firmware_mode: r.get(55)?,
+            secure_boot: r.get(56)?,
+            tpm_present: r.get(57)?,
+            tpm_version: r.get(58)?,
+            disk_encryption: r.get(59)?,
+            disk_encryption_method: r.get(60)?,
             drives,
             low_confidence_cpu_subtests: low_conf.get(&run_id).copied().unwrap_or(0),
             tags: tags.remove(&run_id).unwrap_or_default(),
@@ -2469,6 +2609,10 @@ pub struct Filter {
     /// Only machines with this lifecycle verdict — what the Groups view's
     /// replace and repair counts drill into.
     pub lifecycle: Option<Verdict>,
+    /// Only machines whose latest run **read** this security fact — see
+    /// `Posture`. A machine that was not asked, or could not say, matches no
+    /// value: "not collected" is never "off".
+    pub posture: Option<Posture>,
     /// **Authorization**, not a preference: tag sets, any one of which a
     /// machine may match, or empty for the whole fleet. Set from the caller's
     /// session and never from the query string, which is what makes it
@@ -2515,6 +2659,11 @@ impl Filter {
         }
         if let Some(v) = self.lifecycle
             && m.lifecycle.verdict != v
+        {
+            return false;
+        }
+        if let Some(p) = self.posture
+            && !p.holds(m)
         {
             return false;
         }
@@ -4131,6 +4280,199 @@ mod tests {
         let d = detail(e.idx.conn(), &old.key, old.run_id).unwrap();
         assert_eq!(d.history[0].duration_secs, None);
         assert!(d.memory_modules.is_empty());
+    }
+
+    /// An estate with every shape of opt-in run, for the tests below: each
+    /// shape the CLI writes, on its own machine.
+    fn opted_in_estate() -> Estate {
+        use crate::schema::samples;
+        let mut e = Estate::new();
+        let at = "2026-09-01T10:00:00Z";
+        e.add_with("PC-WIN", 1000.0, at, samples::optin_windows);
+        e.add_with("PC-LUKS", 1000.0, at, samples::optin_linux_luks);
+        e.add_with("PC-NONE", 1000.0, at, samples::optin_linux_none_detected);
+        e.add_with("PC-BIOS", 1000.0, at, samples::optin_legacy_bios);
+        e.add_with("PC-UNREAD", 1000.0, at, samples::optin_unreadable);
+        e.add_with("PC-FUTURE", 1000.0, at, samples::optin_future);
+        e.add("PC-OLD", 1000.0, at);
+        e.add_with(
+            "PC-STRAY",
+            1000.0,
+            at,
+            samples::optin_blocks_without_collect,
+        );
+        e
+    }
+
+    /// What was asked, what was read and what was not, kept apart in the
+    /// view: a field is `None` both for "not asked" and for "asked, could
+    /// not be read", and `run_collect` is what tells the two apart.
+    #[test]
+    fn the_opt_in_facts_reach_the_view_in_their_three_states() {
+        let s = opted_in_estate().snap();
+        let all = ["elevation", "security", "uptime"];
+
+        let win = machine(&s, "PC-WIN");
+        assert_eq!(win.run_collect, all);
+        assert_eq!(win.run_elevated, Some(false));
+        assert_eq!(
+            (win.booted_at.as_deref(), win.uptime_secs),
+            (Some("2026-09-09T10:41:28Z"), Some(14492))
+        );
+        assert_eq!(win.firmware_mode.as_deref(), Some("uefi"));
+        assert_eq!((win.secure_boot, win.tpm_present), (Some(true), Some(true)));
+        assert_eq!(win.tpm_version.as_deref(), Some("2.0"));
+        assert_eq!(win.disk_encryption, None, "never read on Windows");
+
+        let luks = machine(&s, "PC-LUKS");
+        assert_eq!(luks.secure_boot, Some(false));
+        assert_eq!(
+            (
+                luks.disk_encryption.as_deref(),
+                luks.disk_encryption_method.as_deref()
+            ),
+            (Some("encrypted"), Some("luks2"))
+        );
+        assert_eq!(luks.run_elevated, Some(true));
+
+        let none = machine(&s, "PC-NONE");
+        assert_eq!(none.run_collect, ["security"]);
+        assert_eq!(none.disk_encryption.as_deref(), Some("none_detected"));
+        assert_eq!(none.tpm_present, Some(false));
+        assert_eq!((none.uptime_secs, none.run_elevated), (None, None));
+
+        let bios = machine(&s, "PC-BIOS");
+        assert_eq!(bios.firmware_mode.as_deref(), Some("bios"));
+        assert_eq!(bios.secure_boot, None);
+
+        let unread = machine(&s, "PC-UNREAD");
+        assert_eq!(unread.run_collect, all, "asked");
+        assert_eq!(
+            (unread.secure_boot, unread.tpm_present, unread.uptime_secs),
+            (None, None, None),
+            "and nothing read"
+        );
+
+        let future = machine(&s, "PC-FUTURE");
+        assert_eq!(future.run_collect, ["network", "security"]);
+        assert_eq!(future.firmware_mode.as_deref(), Some("coreboot"));
+
+        for host in ["PC-OLD", "PC-STRAY"] {
+            let m = machine(&s, host);
+            assert!(m.run_collect.is_empty(), "{host} was not asked");
+            assert_eq!(
+                (m.secure_boot, m.run_elevated, &m.booted_at),
+                (None, None, &None)
+            );
+        }
+
+        // No finding is drawn from any of it: every machine here is the same
+        // fixture, so each carries exactly the codes the one not asked does.
+        let codes = |host: &str| -> Vec<&str> {
+            let key = &machine(&s, host).key;
+            let mut c: Vec<&str> = s
+                .flags
+                .iter()
+                .filter(|f| &f.machine_key == key)
+                .map(|f| f.code)
+                .collect();
+            c.sort();
+            c
+        };
+        for host in ["PC-WIN", "PC-LUKS", "PC-NONE", "PC-BIOS", "PC-UNREAD"] {
+            assert_eq!(codes(host), codes("PC-OLD"), "{host}");
+        }
+    }
+
+    /// `posture=` matches only machines where the fact was read: neither
+    /// side of a question takes in a machine that was not asked, or could
+    /// not say — and a legacy-BIOS boot is on neither side of Secure Boot.
+    #[test]
+    fn the_posture_filter_matches_only_what_was_read() {
+        let all = opted_in_estate().snap();
+        let hosts = |p: Posture, scopes: Vec<BTreeMap<String, String>>| -> Vec<String> {
+            let mut h: Vec<_> = all
+                .filtered(&Filter {
+                    posture: Some(p),
+                    scopes,
+                    ..Default::default()
+                })
+                .machines
+                .iter()
+                .filter_map(|m| m.hostname.clone())
+                .collect();
+            h.sort();
+            h
+        };
+        let of = |p| hosts(p, Vec::new());
+        assert_eq!(of(Posture::SecureBootOff), ["PC-LUKS"]);
+        assert_eq!(
+            of(Posture::SecureBootOn),
+            ["PC-FUTURE", "PC-NONE", "PC-WIN"]
+        );
+        assert_eq!(of(Posture::LegacyBios), ["PC-BIOS"]);
+        assert_eq!(of(Posture::TpmAbsent), ["PC-NONE"]);
+        assert_eq!(
+            of(Posture::TpmPresent),
+            ["PC-BIOS", "PC-FUTURE", "PC-LUKS", "PC-WIN"]
+        );
+        assert_eq!(of(Posture::Tpm12), ["PC-BIOS"]);
+        assert_eq!(of(Posture::DiskEncrypted), ["PC-LUKS"]);
+        assert_eq!(of(Posture::DiskNoneDetected), ["PC-BIOS", "PC-NONE"]);
+        // The machines that were not asked or could not say are on neither
+        // side of any question, and Windows on neither side of encryption.
+        for p in Posture::ALL {
+            for host in ["PC-OLD", "PC-STRAY", "PC-UNREAD"] {
+                assert!(!of(p).iter().any(|h| h == host), "{host} matched {p}");
+            }
+        }
+        for p in [Posture::DiskEncrypted, Posture::DiskNoneDetected] {
+            assert!(!of(p).iter().any(|h| h == "PC-WIN"), "{p}");
+        }
+        // The summary agrees with the rows.
+        let filtered = all.filtered(&Filter {
+            posture: Some(Posture::SecureBootOff),
+            ..Default::default()
+        });
+        assert_eq!(filtered.summary.machines, 1);
+
+        // ANDed with the scope like everything else: a scope that takes in
+        // nothing here sees nothing, whatever the posture.
+        let elsewhere = vec![BTreeMap::from([(
+            "site".to_string(),
+            "nowhere".to_string(),
+        )])];
+        for p in Posture::ALL {
+            assert!(hosts(p, elsewhere.clone()).is_empty(), "{p}");
+        }
+
+        // Every value parses as it is spelled, and anything else is refused.
+        for p in Posture::ALL {
+            assert_eq!(p.as_str().parse::<Posture>(), Ok(p));
+        }
+        for bad in [
+            "secure_boot",
+            "SECURE_BOOT_OFF",
+            "off",
+            "unknown",
+            "tpm_2.0",
+        ] {
+            assert!(bad.parse::<Posture>().is_err(), "{bad}");
+        }
+    }
+
+    /// The posture is not searchable: a substring such as "off" or "none"
+    /// would read as an answer it is not. `posture=` is the way to ask.
+    #[test]
+    fn search_does_not_match_the_posture() {
+        let all = opted_in_estate().snap();
+        for q in ["luks2", "uefi", "coreboot", "none_detected", "encrypted"] {
+            let found = all.filtered(&Filter {
+                search: Some(q.into()),
+                ..Default::default()
+            });
+            assert_eq!(found.summary.machines, 0, "{q}");
+        }
     }
 
     /// `24H2`, `Enterprise`, a build or `DDR4` typed into the search box finds

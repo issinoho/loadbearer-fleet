@@ -275,6 +275,140 @@ function memoryFact(m, modules) {
   return [gib(m.ram_bytes), ...(layout.length ? layout : ['layout not reported'])].join(' · ');
 }
 
+/*
+ * What a run collects only when asked: `--collect uptime,elevation,security`
+ * on a loadbearer release after 1.8.1. Each fact has three states, and the
+ * page keeps them apart: not asked (the category is missing from
+ * `run_collect`, as on every older run) says nothing at all; asked and not
+ * readable says "not reported"; and a value is shown as what it means — no
+ * more. "Not asked" is never "off" and never "no".
+ */
+
+/** Whether the machine's latest run asked for this category. */
+function asked(m, category) {
+  return (m.run_collect || []).includes(category);
+}
+
+/** Whether `os` names Windows, the platform where the CLI never reads disk
+ *  encryption and where "booted" means the last restart. */
+function onWindows(m) {
+  return /^windows/i.test(m.os || '');
+}
+
+/** "3d 4h", "3h 05m", "12m", "40s" — as loadbearer's own summary says it. */
+function span(secs) {
+  const s = Math.max(0, Math.floor(secs));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+}
+
+const known = (v) => v !== null && v !== undefined;
+
+/** The Security line, or null where the run did not ask: "UEFI · Secure Boot
+ *  on · TPM 2.0 · disk encryption not read on Windows". Each part says exactly
+ *  what was read. "No dm-crypt under /" is not "unencrypted": ZFS native
+ *  encryption, fscrypt, eCryptfs and self-encrypting drives are not looked
+ *  for. And a legacy-BIOS boot has no Secure Boot to be on or off. */
+function securityFact(m) {
+  if (!asked(m, 'security')) return null;
+  const mode = m.firmware_mode;
+  const bios = mode === 'bios';
+  const parts = [
+    mode === 'uefi' ? 'UEFI' : bios ? 'legacy BIOS boot' : known(mode) ? `firmware ${mode}` : null,
+    m.secure_boot === true ? 'Secure Boot on'
+      : m.secure_boot === false ? 'Secure Boot off'
+        : bios ? 'Secure Boot does not apply' : null,
+    m.tpm_present === true ? (known(m.tpm_version) ? `TPM ${m.tpm_version}` : 'TPM present, version not reported')
+      : m.tpm_present === false ? 'no TPM exposed to the OS' : null,
+    m.disk_encryption === 'encrypted'
+      ? `root filesystem on dm-crypt${known(m.disk_encryption_method) ? ` (${m.disk_encryption_method.toUpperCase()})` : ''}`
+      : m.disk_encryption === 'none_detected'
+        ? 'no dm-crypt detected under / (other kinds of disk encryption are not looked for)'
+        : known(m.disk_encryption) ? `root filesystem: ${m.disk_encryption}`
+          : onWindows(m) ? 'disk encryption not read on Windows' : null,
+  ];
+  const unread = [
+    known(mode) ? null : 'firmware mode',
+    known(m.secure_boot) || bios ? null : 'Secure Boot',
+    known(m.tpm_present) ? null : 'TPM',
+    known(m.disk_encryption) || onWindows(m) ? null : 'disk encryption',
+  ].filter(Boolean);
+  const read = parts.filter(Boolean);
+  if (!read.length) return 'asked for, but none of it could be read';
+  return read.join(' · ') + (unread.length ? ` · ${unread.join(', ')} not reported` : '');
+}
+
+/** The Uptime line, or null where the run did not ask: how long the machine
+ *  had been up **when the run was made** — never a live count from
+ *  `booted_at`, which would be wrong by however long ago that was. On
+ *  Windows with Fast Startup a shutdown does not restart the kernel, so the
+ *  boot it counts from is the last restart, and the line says so. */
+function uptimeFact(m) {
+  if (!asked(m, 'uptime')) return null;
+  const since = known(m.booted_at) ? `${onWindows(m) ? 'last restarted' : 'booted'} ${when(m.booted_at)}` : null;
+  const up = known(m.uptime_secs) ? `up ${span(m.uptime_secs)} at the time of the run` : null;
+  return [up, since].filter(Boolean).join(' · ') || 'not reported';
+}
+
+/** Whether the run was elevated, for the Measured line, or null where it did
+ *  not ask. On Linux an unelevated run cannot read what is root-only there —
+ *  drive health, the serial, the memory layout — so where any of those is
+ *  missing the same phrase says why. */
+function elevationWords(m, drives, modules) {
+  if (!asked(m, 'elevation')) return null;
+  if (m.run_elevated === true) return 'elevated';
+  if (m.run_elevated !== false) return 'elevation not reported';
+  if (onWindows(m)) return 'not elevated';
+  const missing = [
+    drives.length ? null : 'drive health',
+    m.serial ? null : 'the serial',
+    modules.length || known(m.memory_slots) ? null : 'the memory layout',
+  ].filter(Boolean);
+  if (!missing.length) return 'not elevated';
+  const list = missing.length > 1 ? `${missing.slice(0, -1).join(', ')} and ${missing.at(-1)}` : missing[0];
+  return `not elevated, so ${list} — root-only on Linux — could not be read`;
+}
+
+/** What each category adds, for the one quiet line on a machine that did not
+ *  ask for it. */
+const COLLECT_WORDS = { security: 'security posture', uptime: 'uptime', elevation: 'whether the run was elevated' };
+
+/** The one line a machine whose run did not ask says about it — and only when
+ *  another machine **in the caller's own view** did, so the feature can be
+ *  found without every page listing what it lacks. Drawn from the snapshot
+ *  the caller was given, which their scope has already projected: it cannot
+ *  hint at a machine they may not see. */
+function collectHint(m) {
+  const others = (state.snap?.machines || []).filter((x) => x.key !== m.key);
+  const missing = Object.keys(COLLECT_WORDS)
+    .filter((c) => !asked(m, c) && others.some((x) => asked(x, c)));
+  if (!missing.length) return null;
+  const words = missing.map((c) => COLLECT_WORDS[c]);
+  const list = words.length > 1 ? `${words.slice(0, -1).join(', ')} and ${words.at(-1)}` : words[0];
+  return `Other machines in view also report their ${list}. `
+    + `--collect ${missing.join(',')} on the loadbearer command line adds ${missing.length > 1 ? 'them' : 'it'} to a run.`;
+}
+
+/** The `posture=` filter's values, as the server spells them, and what each
+ *  matches: only machines whose latest run read that fact. */
+const POSTURES = [
+  ['secure_boot_off', 'Secure Boot off'],
+  ['secure_boot_on', 'Secure Boot on'],
+  ['legacy_bios', 'Legacy BIOS boot (no Secure Boot)'],
+  ['tpm_absent', 'No TPM exposed'],
+  ['tpm_present', 'TPM present'],
+  ['tpm_1.2', 'TPM 1.2'],
+  ['disk_none_detected', 'No dm-crypt detected under / (Linux)'],
+  ['disk_encrypted', 'Root on dm-crypt (Linux)'],
+];
+
+/** A posture value in words; one this build does not know is shown as itself. */
+function postureWords(v) {
+  return (POSTURES.find(([k]) => k === v) || [v, v])[1];
+}
+
 /** Each threshold an override can set, as the line it draws. Plain numbers:
  *  these are the values in the config file, and `regression_frac` the one
  *  fraction among them. */
@@ -1433,7 +1567,7 @@ export const state = {
 };
 
 /** The filter fields the URL carries, all sent to the server as they are. */
-const FILTER_KEYS = ['since_days', 'tags', 'flag', 'q', 'cohort', 'model', 'cpu', 'os', 'lifecycle'];
+const FILTER_KEYS = ['since_days', 'tags', 'flag', 'q', 'cohort', 'model', 'cpu', 'os', 'lifecycle', 'posture'];
 
 /*
  * The URL is the whole view. Everything that changes what a tab shows — the
@@ -1749,7 +1883,10 @@ export function emptyFilterNotice() {
   return el('div', { class: 'banner', dataset: { notice: 'empty-filter' } }, [
     el('span', {
       text: `No machine in view matches this filter (${filterWords(state.filter).replace(/^Machines /, '').replace(/\.$/, '')}). `
-        + 'It may name a tag, a model or a cohort that is no longer in the fleet.',
+        + (state.filter.posture
+          ? 'Only machines whose runs were asked for their security posture, and could read it, can match a '
+            + 'security filter — the others are on neither side of it.'
+          : 'It may name a tag, a model or a cohort that is no longer in the fleet.'),
     }),
     ' ',
     el('button', {
@@ -1785,6 +1922,25 @@ function syncFilterControls() {
     ...codes.map((c) => el('option', { value: c, text: c.replace(/_/g, ' ') })),
   );
   flagSelect.value = flag;
+
+  // Security posture, offered only where somebody in view opted in to it —
+  // or a link set it — since for a fleet that never runs `--collect
+  // security` it could only ever answer "none". Every value matches only
+  // machines whose run read that fact; one this build does not know (a
+  // hand-edited link) is offered as itself, as a period is, and the server
+  // refuses it with the list.
+  const postureSelect = $('#f-posture');
+  if (postureSelect) {
+    const posture = state.filter.posture || '';
+    const offered = posture || (state.snap?.machines || []).some((m) => asked(m, 'security'));
+    postureSelect.closest('.field').hidden = !offered;
+    postureSelect.replaceChildren(
+      el('option', { value: '', text: 'Any' }),
+      ...POSTURES.map(([v, label]) => el('option', { value: v, text: label })),
+      ...(posture && !POSTURES.some(([v]) => v === posture) ? [el('option', { value: posture, text: posture })] : []),
+    );
+    postureSelect.value = posture;
+  }
 
   // Tag filters are built from what the fleet actually reports rather than
   // from a fixed list, because tags are whatever the deployment tool passed.
@@ -1880,6 +2036,7 @@ function applyFilter(patch) {
 function wireFilters() {
   $('#f-since').addEventListener('change', (e) => applyFilter({ since_days: e.target.value }));
   $('#f-flag').addEventListener('change', (e) => applyFilter({ flag: e.target.value }));
+  $('#f-posture')?.addEventListener('change', (e) => applyFilter({ posture: e.target.value }));
   $('#f-q').addEventListener('input', debounce((e) => applyFilter({ q: e.target.value }), 300));
   $('#f-reset').addEventListener('click', () => { state.filter = {}; writeHash({ filter: {} }); });
   $('#filters').addEventListener('submit', (e) => e.preventDefault());
@@ -3706,6 +3863,12 @@ export async function renderMachine(main, key) {
   // Likewise from a server older than the memory-module table.
   const modules = payload.memory_modules || [];
   const lasted = took(m.run_duration_secs);
+  // Each null where the run did not ask, so a machine that never opted in
+  // shows no row for any of them.
+  const security = securityFact(m);
+  const uptime = uptimeFact(m);
+  const elevation = elevationWords(m, drives, modules);
+  const hint = collectHint(m);
 
   const age = ageFacts(m);
   // The fixed volume with the least free space — what `disk_nearly_full`
@@ -3736,7 +3899,10 @@ export async function renderMachine(main, key) {
     ['Serial', m.serial || 'not reported'],
     ['Asset tag', m.asset_tag || 'not reported'],
     ['Attributed by', m.key_kind],
-    ['Measured', `${when(m.taken_at)} (${ago(m.age_days)})${lasted ? ` · took ${lasted}` : ''}`],
+    ...(security ? [['Security', security]] : []),
+    ...(uptime ? [['Uptime', uptime]] : []),
+    ['Measured', `${when(m.taken_at)} (${ago(m.age_days)})${lasted ? ` · took ${lasted}` : ''}`
+      + (elevation ? ` · ${elevation}` : '')],
     ...(m.run_uuid ? [['Run ID', m.run_uuid]] : []),
     ['loadbearer', m.tool_version],
     ['Configuration', `${m.comparability.preset} · ${m.comparability.profile} · ${m.comparability.baseline} · ${m.comparability.build_isa}`],
@@ -3756,6 +3922,7 @@ export async function renderMachine(main, key) {
       ]),
     ]),
     el('dl', { class: 'kv' }, facts.flatMap(([k, v]) => [el('dt', { text: k }), el('dd', { text: v })])),
+    ...(hint ? [el('p', { class: 'card-sub', dataset: { hint: 'collect' }, text: hint })] : []),
   ]);
 
   const heroCard = el('div', { class: 'card col-4' }, [el('div', { class: 'hero' }, [
@@ -4235,6 +4402,7 @@ function filterWords(filter) {
   if (filter.cohort) said.push(`cohort ${filter.cohort}`);
   if (filter.flag) said.push(`carrying ${codeWords(filter.flag)}`);
   if (filter.lifecycle) said.push(`decided ${decisionOf(filter.lifecycle).label.toLowerCase()}`);
+  if (filter.posture) said.push(`whose latest run read: ${postureWords(filter.posture)}`);
   if (filter.q) said.push(`matching “${filter.q}”`);
   return said.length ? `Machines ${said.join(', ')}.` : 'Every machine, no filter applied.';
 }

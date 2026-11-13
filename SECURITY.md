@@ -32,6 +32,20 @@ build and edition across an estate is also a list of which machines are
 behind on updates, so the index is as sensitive as a patch report. Treat the
 index, the archive and the state file as you would any other asset database.
 
+For machines whose runs opted in with loadbearer's `--collect`, it also holds
+their **security posture** — firmware mode, whether Secure Boot is on, whether
+there is a TPM and which version, and on Linux whether the root filesystem is
+on dm-crypt — and when each last booted and whether the run was elevated. A
+list of which machines lack Secure Boot, a TPM or disk encryption is **more
+sensitive than the hardware inventory**: it is a map of where to aim. It exists
+in the index, the archive, the backups, the machines CSV and the API — only for
+the machines whose runs asked for it, never for one that didn't — and it is
+scope-projected like everything else, so a scoped viewer cannot see another
+site's posture, filter by it, or count it. It is deliberately **not** in
+`/metrics` (not even as a fleet-wide count), the `[notify]` webhook payloads,
+the digest, or the printed report — which states a Security filter if it was
+printed under one, and shows no machine's posture either way.
+
 It:
 
 - serves HTTP on **`127.0.0.1:8787` by default**, and [refuses a wider
