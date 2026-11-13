@@ -5,7 +5,21 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
-## Unreleased
+## 0.12.0 - Fri, 13 Nov 2026
+
+**What loadbearer's next release collects, read and shown.** A loadbearer
+release after 1.8.1 records the OS build and edition, the memory layout and
+how long a run took; reads uptime, elevation and security posture where a run
+asks for them; and tells the server when a scheduled run is skipped. This
+release is the server side of all of it, and it comes first on purpose: a
+fleet older than this answers `400` to a skipped run's report. Every new
+field is optional, so results from loadbearer 1.8.1 and earlier read exactly
+as they did.
+
+**Upgrading:** nothing to change in the configuration. The index gains its new
+columns and tables when it is opened, with no format change, and
+`scan --reindex` fills them in for runs it already holds. The state file is
+as it was.
 
 ### Added
 
