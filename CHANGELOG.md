@@ -67,6 +67,12 @@ state file are as they were.
   clear itself, and a machine that has gone keeps the way back to the table.
 - **A browser that refuses storage** no longer stops the page from wiring up
   its controls at the theme toggle.
+- **Long group names stay inside their chart.** On Groups, a system model or
+  a CPU's full name ran out of the left of its card and across the one beside
+  it. The label column now grows with the card, and a name that still does
+  not fit is shortened in the middle, keeping both ends, with the whole name
+  on hover. The same for the split chart on Components.
+- **A difference that rounds to nothing** is written `0.0%`, not `-0.0%`.
 
 ## 0.10.0 - Fri, 13 Nov 2026
 

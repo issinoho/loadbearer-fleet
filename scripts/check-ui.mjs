@@ -397,6 +397,74 @@ function host(w = 700) {
     `the totals are not shown as shares: ${text}`);
 }
 
+// Groups are named by system model and by CPU, and those names are long. A
+// label is right-aligned against the plot, so one wider than its gutter ran
+// out of the left of the chart and across the card beside it — which the
+// geometry audit never saw, because the text's own x was inside the box. So:
+// every right-aligned label must start inside the chart, at the widths a
+// card on the Groups tab really has, and a shortened one keeps its whole
+// name in a title and both of its ends on show.
+{
+  const long = [
+    'Dell Inc. Dell Pro Precision 5 14S PW514260',
+    '11th Gen Intel(R) Core(TM) i7-1185G7 @ 3.00GHz',
+    'AMD Ryzen AI 9 HX PRO 375 w/ Radeon 890M',
+    '13th Gen Intel(R) Core(TM) i7-1365U',
+    '13th Gen Intel(R) Core(TM) i7-1370P',
+    '(not recorded)',
+  ];
+  const draw = {
+    stackedChart: (h) => mod.stackedChart(h, {
+      rows: long.map((label, i) => ({ label, values: { critical: i, warning: 10 * i } })),
+      series: [
+        { key: 'critical', label: 'Critical', colour: '#d03b3b' },
+        { key: 'warning', label: 'Warning', colour: '#fab219' },
+      ],
+      max: 100,
+      format: (v) => `${Math.round(v)}%`,
+    }),
+    divergingChart: (h) => mod.divergingChart(h, {
+      rows: long.map((label, i) => ({ label, value: i - 2, score: 1000 })),
+    }),
+    rangeChart: (h) => mod.rangeChart(h, {
+      rows: long.map((label, i) => ({ label, p10: 100 + i, median: 200 + i, p90: 300 + i, machines: 5 })),
+    }),
+  };
+  for (const [chart, render] of Object.entries(draw)) {
+    for (const width of [320, 520, 700, 1400]) {
+      const name = `${chart}/long labels at ${width}`;
+      const h = host(width);
+      render(h);
+      auditChart(name, h);
+      const shown = [];
+      walk(h, (n) => {
+        if (n.tagName !== 'text' || n.attrs['text-anchor'] !== 'end') return;
+        const own = n.children.filter((c) => c.tagName !== 'title').map(textOf).join('');
+        if (/^[-+\d.,%]+$/.test(own)) return; // an axis tick or a figure, not a name
+        const title = n.children.find((c) => c.tagName === 'title');
+        shown.push(own);
+        const left = Number(n.attrs.x) - mod.textWidth(own, Number(n.attrs['font-size']));
+        check(name, left >= 0, `${JSON.stringify(own)} starts ${Math.round(-left)}px left of the chart`);
+        const full = title ? textOf(title) : own;
+        check(name, long.includes(full), `${JSON.stringify(own)} does not carry its whole name`);
+        if (title) {
+          const [head, tail] = own.split('…');
+          check(name, tail !== undefined && full.startsWith(head) && full.endsWith(tail),
+            `${JSON.stringify(own)} is not ${JSON.stringify(full)} shortened in the middle`);
+        }
+      });
+      check(name, shown.length === long.length, `${shown.length} labels for ${long.length} rows`);
+      // The two 13th Gen parts differ only at the end: shortened, they must
+      // still be told apart.
+      check(name, new Set(shown).size === shown.length, `two rows read the same: ${shown.join(' | ')}`);
+    }
+  }
+  // Nothing rounds to a signed nothing.
+  const h = host(520);
+  mod.divergingChart(h, { rows: [{ label: 'PC-A', value: -0.04, score: 1000 }, { label: 'PC-B', value: 0.04, score: 1000 }] });
+  check('divergingChart/zero', !/[-+]0\.0%/.test(textOf(h)), `a value that rounds to zero is signed: ${textOf(h)}`);
+}
+
 // History: mixed comparability, a missing score, and two runs at the same
 // instant (t1 === t0), which is the divide-by-zero case on the time axis.
 {

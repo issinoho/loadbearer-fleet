@@ -76,7 +76,11 @@ function num(v, dp) {
 
 function signed(v, dp = 0) {
   if (v === null || v === undefined) return '—';
-  return (v > 0 ? '+' : '') + v.toFixed(dp) + '%';
+  // A value that rounds to nothing is written as nothing: "-0.0%" reads as a
+  // deficit, and it is one only in the digits that were dropped.
+  const text = v.toFixed(dp);
+  if (Number(text) === 0) return (0).toFixed(dp) + '%';
+  return (v > 0 ? '+' : '') + text + '%';
 }
 
 function gib(bytes) {
@@ -258,6 +262,45 @@ export function textWidth(str, px) {
   return String(str).length * px * 0.58;
 }
 
+/**
+ * How wide the label gutter of a horizontal bar chart is: as wide as its
+ * longest label, up to a share of the chart.
+ *
+ * The cap used to be a fixed number of pixels with the label still written in
+ * full, right-aligned against the plot — so a system model or a CPU's full
+ * name, which is what Groups is grouped by, ran out of the left of its card
+ * and across the one beside it. The gutter now grows with the card, and a
+ * label that still does not fit is shortened by `rowLabel`.
+ */
+function labelGutter(rows, width, min) {
+  const want = Math.max(min, ...rows.map((r) => textWidth(r.label, 12) + 12));
+  return Math.min(want, Math.max(min, Math.min(320, Math.floor(width * 0.42))));
+}
+
+/**
+ * A row's label, right-aligned in the gutter, shortened to fit it.
+ *
+ * Shortened in the middle: these names differ at their ends — "13th Gen
+ * Intel(R) Core(TM) i7-1365U" from "…i7-1370P", one vendor's models from
+ * another's — so cutting either end would leave rows that read the same. The
+ * whole name stays in a `<title>`, as well as in the row's tooltip.
+ */
+function rowLabel(label, gutter, cy) {
+  const full = String(label);
+  // `textWidth` is an estimate, so leave a little more than it asks for.
+  const room = gutter - 16;
+  let shown = full;
+  if (textWidth(full, 12) > room) {
+    const keep = Math.max(4, Math.floor(room / (12 * 0.58)) - 1);
+    const head = Math.ceil(keep / 2);
+    shown = `${full.slice(0, head).trimEnd()}…${full.slice(full.length - (keep - head)).trimStart()}`;
+  }
+  return svg('text', {
+    x: gutter - 10, y: cy + 4, 'text-anchor': 'end',
+    fill: ink('--text-primary'), 'font-size': 12,
+  }, [document.createTextNode(shown), ...(shown === full ? [] : [svg('title', {}, [document.createTextNode(full)])])]);
+}
+
 /* ---------------------------------------------------------------- tooltip */
 
 const tip = {
@@ -385,7 +428,7 @@ export function columnChart(host, { rows, fill, unit = '', tipTitle }) {
  */
 export function divergingChart(host, { rows, onSelect }) {
   const width = Math.max(320, host.clientWidth || 520);
-  const gutter = Math.min(190, Math.max(90, ...rows.map((r) => textWidth(r.label, 12) + 12)));
+  const gutter = labelGutter(rows, width, 90);
   const m = { top: 8, right: 54, bottom: 26, left: gutter };
   const rowH = 26;
   const plotH = rowH * rows.length;
@@ -417,10 +460,7 @@ export function divergingChart(host, { rows, onSelect }) {
         fill: colour,
       }));
     }
-    root.append(svg('text', {
-      x: m.left - 10, y: cy + 4, 'text-anchor': 'end',
-      fill: ink('--text-primary'), 'font-size': 12,
-    }, [document.createTextNode(r.label)]));
+    root.append(rowLabel(r.label, gutter, cy));
     root.append(svg('text', {
       x: up ? zero + w + 7 : zero - w - 7, y: cy + 4,
       'text-anchor': up ? 'start' : 'end',
@@ -474,7 +514,7 @@ export function stackedChart(host, {
   rows, series, max: fixedMax, unit = 'findings', format = (v) => nf0.format(v), tip,
 }) {
   const width = Math.max(320, host.clientWidth || 520);
-  const gutter = Math.min(150, Math.max(80, ...rows.map((r) => textWidth(r.label, 12) + 12)));
+  const gutter = labelGutter(rows, width, 80);
   const m = { top: 6, right: 46, bottom: 6, left: gutter };
   const rowH = 34;
   const height = rowH * rows.length + m.top + m.bottom;
@@ -488,10 +528,7 @@ export function stackedChart(host, {
     const cy = m.top + rowH * i + rowH / 2;
     const total = series.reduce((a, s) => a + (r.values[s.key] || 0), 0);
     let cursor = m.left;
-    root.append(svg('text', {
-      x: m.left - 10, y: cy + 4, 'text-anchor': 'end',
-      fill: ink('--text-primary'), 'font-size': 12,
-    }, [document.createTextNode(r.label)]));
+    root.append(rowLabel(r.label, gutter, cy));
 
     series.forEach((s, si) => {
       const v = r.values[s.key] || 0;
@@ -999,7 +1036,7 @@ export function rangeChart(host, { rows, format = (v) => num(v), onSelect }) {
     return;
   }
   const width = Math.max(320, host.clientWidth || 520);
-  const gutter = Math.min(170, Math.max(80, ...rows.map((r) => textWidth(r.label, 12) + 12)));
+  const gutter = labelGutter(rows, width, 80);
   const m = { top: 8, right: 26, bottom: 26, left: gutter };
   const rowH = 28;
   const plotH = rowH * rows.length;
@@ -1028,9 +1065,7 @@ export function rangeChart(host, { rows, format = (v) => num(v), onSelect }) {
 
   rows.forEach((r, i) => {
     const cy = m.top + rowH * i + rowH / 2;
-    root.append(svg('text', {
-      x: m.left - 10, y: cy + 4, 'text-anchor': 'end', fill: ink('--text-primary'), 'font-size': 12,
-    }, [document.createTextNode(r.label)]));
+    root.append(rowLabel(r.label, gutter, cy));
     root.append(svg('line', {
       x1: x(r.p10), x2: x(r.p90), y1: cy, y2: cy, stroke: ink('--series-1'), 'stroke-width': 2,
       'stroke-linecap': 'round',
