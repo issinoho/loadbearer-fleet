@@ -136,8 +136,14 @@ async function attach(port) {
 
   let id = 0;
   const pending = new Map();
+  // Uncaught exceptions in the page, for the checks that must not cause one.
+  const thrown = [];
   ws.addEventListener('message', (e) => {
     const msg = JSON.parse(e.data);
+    if (msg.method === 'Runtime.exceptionThrown') {
+      const d = msg.params.exceptionDetails;
+      thrown.push(d.exception?.description || d.text);
+    }
     const waiting = msg.id && pending.get(msg.id);
     if (!waiting) return;
     pending.delete(msg.id);
@@ -150,7 +156,7 @@ async function attach(port) {
     ws.send(JSON.stringify({ id: n, method, params }));
   });
 
-  return { send, close: () => ws.close() };
+  return { send, thrown, close: () => ws.close() };
 }
 
 /* ---------------------------------------------------- the page measurement */
@@ -409,6 +415,56 @@ async function painted() {
   return false;
 }
 
+/** Run an expression in the page and return its value; a throw is a failure
+ *  of the check that asked, so it is raised here. */
+async function evaluate(expression) {
+  const r = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+  if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
+  return r.result.value;
+}
+
+/** Wait for an expression to be true in the page, for up to six seconds. */
+async function until(expression) {
+  for (let i = 0; i < 60; i++) {
+    if (await evaluate(expression) === true) return true;
+    await sleep(100);
+  }
+  return false;
+}
+
+/*
+ * The saved views panel: where it sits, whether it is open, the size of every
+ * control in it, and where focus is. Runs in the browser.
+ */
+const PANEL = `(() => {
+  const p = document.querySelector('#views-panel');
+  const r = p.getBoundingClientRect();
+  const controls = [...p.querySelectorAll('.btn, .views-input')].filter((b) => b.getClientRects().length)
+    .map((b) => ({ text: (b.textContent || b.getAttribute('aria-label') || '').trim().slice(0, 30),
+      height: Math.round(b.getBoundingClientRect().height) }));
+  const f = document.activeElement;
+  return JSON.stringify({
+    hidden: p.hidden, left: Math.round(r.left), right: Math.round(r.right), width: Math.round(r.width),
+    viewport: document.documentElement.clientWidth,
+    expanded: document.querySelector('#views-button').getAttribute('aria-expanded'),
+    controls, focus: f && f.closest('#views-panel') ? 'panel' : (f && f.id) || '',
+  });
+})()`;
+
+/*
+ * What a view shows of its own settings — sorted columns, pressed toggles,
+ * cards turned to tables, pickers — so a view set by hand and the same view
+ * loaded fresh from its address can be compared. Runs in the browser.
+ */
+const SHOWN = `(() => JSON.stringify({
+  sorted: [...document.querySelectorAll('main th[aria-sort]')].filter((t) => t.getAttribute('aria-sort') !== 'none')
+    .map((t) => t.textContent + ' ' + t.getAttribute('aria-sort')),
+  pressed: [...document.querySelectorAll('main [aria-pressed="true"]')].map((b) => b.textContent.trim().slice(0, 40)),
+  toggles: [...document.querySelectorAll('main [data-toggle]')].map((b) => b.dataset.toggle + ':' + b.textContent),
+  pickers: [...document.querySelectorAll('main select')].map((s) => (s.getAttribute('aria-label') || '') + '=' + s.value),
+  actions: [...document.querySelectorAll('main .card-actions button')].map((b) => b.textContent),
+}))()`;
+
 /*
  * Runs in the browser under print media. Every control and every piece of
  * chrome must have no box at all; and what is drawn must sit inside the page,
@@ -462,6 +518,15 @@ try {
   cdp = await attach(debugPort);
   await cdp.send('Page.enable');
   await cdp.send('Runtime.enable');
+
+  // Two saved views in this browser, one of them the overview under a name
+  // long enough to test the header with, so every view below is laid out
+  // with the control showing a name or not, and the panel has a list.
+  await cdp.send('Page.navigate', { url: `${origin}/#/overview` });
+  await painted();
+  await evaluate(`localStorage.setItem('lbf-views', JSON.stringify({ version: 1, default: null, views: [
+    { name: 'Every machine in the estate, worst first, by site', hash: '#/overview' },
+    { name: 'Glasgow', hash: '#/machines?tags=site%3Dglasgow' } ] }))`);
 
   for (const size of SIZES) {
     await cdp.send('Emulation.setDeviceMetricsOverride', {
@@ -593,6 +658,37 @@ try {
         check(where, cards.overTime.includes('Over time') && cards.charts === 3,
           `the over-time section has ${cards.charts} chart(s), not 3`);
       }
+
+      // The saved views panel, open with its name field showing, at this
+      // size: inside the screen, every control in it big enough to tap, the
+      // page still not scrolling sideways — then closed by Escape, with focus
+      // back on the button that opened it.
+      if (view === 'overview') {
+        const at = `${where}/views`;
+        await evaluate(`document.querySelector('#views-button').click()`);
+        await evaluate(`document.querySelector('#views-panel [data-action="save"]').click()`);
+        await sleep(100);
+        const open = JSON.parse(await evaluate(PANEL));
+        const page = JSON.parse(await evaluate(MEASURE));
+        check(at, !open.hidden && open.expanded === 'true', 'the panel did not open');
+        check(at, open.left >= 0 && open.right <= open.viewport + 1,
+          `the panel spans ${open.left} to ${open.right}px of a ${open.viewport}px screen`);
+        check(at, open.focus === 'panel', `focus is on ${open.focus || 'nothing'}, not in the panel`);
+        check(at, page.documentWidth <= page.viewport + 1,
+          `the page scrolls sideways with the panel open: ${page.documentWidth}px in ${page.viewport}px`);
+        for (const el of page.paintedPast) check(at, false, `${el.sel} is painted ${el.over}px past the right edge`);
+        if (size.touch) {
+          for (const c of open.controls) {
+            check(at, c.height >= MIN_TAP, `"${c.text}" is ${c.height}px tall; ${MIN_TAP}px is the floor for touch`);
+          }
+        }
+        await evaluate(`document.querySelector('.views-input').dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+        const shut = JSON.parse(await evaluate(PANEL));
+        check(at, shut.hidden && shut.expanded === 'false' && shut.focus === 'views-button',
+          `Escape left the panel ${shut.hidden ? 'closed' : 'open'} and focus on ${shut.focus || 'nothing'}`);
+        notes.push(`${at}: ${open.width}px wide from ${open.left}px, ${open.controls.length} control(s)`);
+      }
     }
   }
 
@@ -629,6 +725,186 @@ try {
     notes.push(`${where}: ${m.documentWidth}px on a ${m.viewport}px page, ${m.hidden} control(s) dropped`);
   }
   await cdp.send('Emulation.setEmulatedMedia', { media: '' });
+
+  // Saved views, driven as a person would, in a real browser with real
+  // storage: save through the panel, the default opening on a bare address,
+  // opening one from the list, the control saying the page has moved on and
+  // Update fixing that, rename and delete, a second tab's change arriving,
+  // and storage this build cannot read. Then each tab's settings set by hand,
+  // and the address that left loaded fresh, which must show the same.
+  await cdp.send('Emulation.setEmulatedMedia', { media: '' });
+  await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false, maxTouchPoints: 1 });
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  const go = async (hash) => {
+    // From a blank page, so nothing is carried over from the view before.
+    await cdp.send('Page.navigate', { url: 'about:blank' });
+    await sleep(50);
+    await cdp.send('Page.navigate', { url: `${origin}/${hash}` });
+    await sleep(150);
+    return painted();
+  };
+  const settle = async () => { await sleep(150); return painted(); };
+  const click = (sel) => evaluate(`document.querySelector(${JSON.stringify(sel)}).click()`);
+  const header = (text) => evaluate(`[...document.querySelectorAll('main th')]
+    .find((t) => t.textContent.replace(/ [▲▼]$/, '') === ${JSON.stringify(text)}).click()`);
+  const stored = async () => JSON.parse(await evaluate(`localStorage.getItem('lbf-views') || 'null'`));
+  const label = () => evaluate(`document.querySelector('#views-button .views-name').textContent
+    + (document.querySelector('#views-button .views-drift').hidden ? '' : ' (modified)')`);
+  const typeName = (text) => evaluate(`(() => {
+    const input = document.querySelector('#views-panel .views-input');
+    input.value = ${JSON.stringify(text)};
+    [...document.querySelectorAll('#views-panel button')].find((b) => b.textContent === 'Save').click();
+  })()`);
+  const thrownBefore = cdp.thrown.length;
+  try {
+    await go('#/machines');
+    await evaluate(`localStorage.removeItem('lbf-views')`);
+    await go('#/machines');
+    await header('Machine');
+    const sortedHash = await evaluate('location.hash');
+    check('views/flow', sortedHash === '#/machines?order.machines=machine', `the sort wrote ${sortedHash}`);
+    await click('#views-button');
+    await click('#views-panel [data-action="save"]');
+    await typeName('Machines by name');
+    let doc = await stored();
+    check('views/flow', doc?.views?.[0]?.name === 'Machines by name' && doc.views[0].hash === sortedHash,
+      `saving stored ${JSON.stringify(doc)}`);
+    check('views/flow', await label() === 'Machines by name', `the control says ${await label()}`);
+    await click('#views-panel [data-action="default"]');
+    check('views/flow', (await stored()).default === 'Machines by name', 'the default was not stored');
+
+    // A bare address opens the default; an address naming a view does not.
+    await go('');
+    check('views/default', await evaluate('location.hash') === sortedHash, `a bare address opened ${await evaluate('location.hash')}`);
+    check('views/default', JSON.parse(await evaluate(SHOWN)).sorted.join() === 'Machine ▲ ascending',
+      'the default opened without its sort');
+    check('views/default', await label() === 'Machines by name', `the control says ${await label()}`);
+    await go('#/overview');
+    check('views/default', await evaluate('location.hash') === '#/overview', 'the default overrode a link');
+    check('views/default', await label() === 'Views', `on an unsaved view the control says ${await label()}`);
+
+    // Opened from the list: the same address, through the same route.
+    await click('#views-button');
+    await click('#views-panel [data-action="open"]');
+    await settle();
+    check('views/open', await evaluate('location.hash') === sortedHash, `opened at ${await evaluate('location.hash')}`);
+    check('views/open', await evaluate(`document.activeElement.id`) === 'views-button', 'focus did not return to the control');
+
+    // Moved on from, marked, and updated.
+    await header('Score');
+    check('views/modified', await label() === 'Machines by name (modified)', `after a sort the control says ${await label()}`);
+    await click('#views-button');
+    await click('#views-panel [data-action="update-opened"]');
+    doc = await stored();
+    check('views/modified', doc.views[0].hash === await evaluate('location.hash') && await label() === 'Machines by name',
+      `Update stored ${doc.views[0].hash} and the control says ${await label()}`);
+
+    // Rename, and delete with its second step.
+    await click('#views-panel [data-action="rename"]');
+    await typeName('Best machines');
+    doc = await stored();
+    check('views/rename', doc.views[0].name === 'Best machines' && doc.default === 'Best machines',
+      `renamed to ${JSON.stringify(doc)}`);
+    await click('#views-panel [data-action="delete"]');
+    check('views/delete', (await stored()).views.length === 1, 'delete did not wait for the second step');
+    await click('#views-panel [data-action="delete-confirm"]');
+    doc = await stored();
+    check('views/delete', doc.views.length === 0 && doc.default === null, `after delete: ${JSON.stringify(doc)}`);
+    await evaluate(`document.querySelector('#views-panel').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+
+    // Another tab saves this very view: the storage event brings it here.
+    const here = await evaluate('location.hash');
+    await evaluate(`(() => {
+      const value = JSON.stringify({ version: 1, default: null, views: [{ name: 'From the other tab', hash: location.hash }] });
+      localStorage.setItem('lbf-views', value);
+      window.dispatchEvent(new StorageEvent('storage', { key: 'lbf-views', newValue: value }));
+    })()`);
+    check('views/tabs', await label() === 'From the other tab', `after another tab saved ${here} the control says ${await label()}`);
+
+    // Storage this build cannot read: no exception, the footer says so once,
+    // and what is stored is left exactly as it was.
+    await evaluate(`localStorage.setItem('lbf-views', '{"version":7,"views":"from a newer build"}')`);
+    await go('#/overview');
+    check('views/unreadable', (await evaluate(`document.querySelector('#footer-note').textContent`)).includes('cannot read'),
+      'the footer does not say the stored views could not be read');
+    check('views/unreadable', await evaluate(`localStorage.getItem('lbf-views')`) === '{"version":7,"views":"from a newer build"}',
+      'unreadable views were overwritten');
+    await click('#views-button');
+    check('views/unreadable', await evaluate(`!!document.querySelector('#views-panel [data-action="copy"]')
+      && !document.querySelector('#views-panel [data-action="save"]')`), 'the panel offers saving over unreadable views');
+    await evaluate(`localStorage.removeItem('lbf-views')`);
+
+    // Each tab set by hand, then its address loaded fresh: the same view.
+    const roundTrips = [
+      ['overview', '#/overview', [
+        `[...document.querySelectorAll('main .card-actions button')].find((b) => b.textContent.startsWith('Show')).click()`,
+        `(() => { const s = document.querySelector('select[aria-label="Compare with"]'); s.value = '4'; s.dispatchEvent(new Event('change')); })()`,
+        `document.querySelector('[data-toggle="grades"]').click()`,
+      ]],
+      ['groups', '#/groups', [
+        `(() => { const s = document.querySelector('select[aria-label="Group by"]'); s.value = 'tag:site'; s.dispatchEvent(new Event('change')); })()`,
+        `[...document.querySelectorAll('main th')].filter((t) => t.textContent.startsWith('Median score')).pop().click()`,
+        `document.querySelector('[data-toggle="identical"]').click()`,
+      ]],
+      ['components', '#/components', [
+        `[...document.querySelectorAll('main button')].find((b) => b.textContent === 'Grade').click()`,
+        `[...document.querySelectorAll('table.heatmap th')].find((t) => t.textContent.startsWith('Machine')).click()`,
+        `document.querySelector('[data-toggle="distribution"]').click()`,
+      ]],
+      ['lifecycle', '#/lifecycle', [
+        `[...document.querySelectorAll('.decision-tile')].find((b) => b.textContent.includes('Watch')).click()`,
+        `[...document.querySelectorAll('main th')].filter((t) => t.textContent.startsWith('Age')).pop().click()`,
+        `document.querySelector('[data-toggle="age"]').click()`,
+      ]],
+      ['machines', '#/machines', [
+        `[...document.querySelectorAll('main th')].find((t) => t.textContent.startsWith('site')).click()`,
+      ]],
+      ['cohorts', '#/cohorts', [
+        `[...document.querySelectorAll('main th')].find((t) => t.textContent.startsWith('Machines')).click()`,
+      ]],
+      ['machine', `#/machine/${encodeURIComponent(machineKey)}`, [
+        `[...document.querySelectorAll('main th')].find((t) => t.textContent.startsWith('Score')).click()`,
+        `document.querySelector('[data-toggle="history"]').click()`,
+      ]],
+    ];
+    for (const [name, start, steps] of roundTrips) {
+      const at = `url/${name}`;
+      if (!(await go(start))) { check(at, false, 'the view never finished rendering'); continue; }
+      for (const step of steps) {
+        await evaluate(step);
+        await settle();
+      }
+      const hash = await evaluate('location.hash');
+      const set = await evaluate(SHOWN);
+      if (!(await go(hash))) { check(at, false, `${hash} never finished rendering`); continue; }
+      const loaded = await evaluate(SHOWN);
+      check(at, set === loaded, `set by hand as ${set}, loaded from ${hash} as ${loaded}`);
+      check(at, hash !== start, `nothing set by hand reached the address: ${hash}`);
+      notes.push(`${at}: ${hash}`);
+    }
+
+    // Stale views open the way a stale link does: a message and a way back,
+    // never a blank page or an exception.
+    const stale = [
+      ['#/groups?by=tag%3Agone&tags=gone%3Dx&order.groups=-nope&table=nope', 'No machine in view matches this filter'],
+      ['#/components?measure=nope%2Fnope&sort=nope', 'Show the overall score instead'],
+      ['#/machine/no-such-machine', 'All machines'],
+      ['#/overview?lifecycle=retire', 'Clear the filter'],
+      ['#/machines?flag=no_such_finding', 'No machine in view matches this filter'],
+    ];
+    for (const [hash, want] of stale) {
+      await cdp.send('Page.navigate', { url: `${origin}/${hash}` });
+      const done = await until(`(() => { const m = document.querySelector('main');
+        return !!m && !m.classList.contains('loading') && m.innerText.includes(${JSON.stringify(want)}); })()`);
+      check(`views/stale ${hash}`, done, `did not say "${want}"`);
+    }
+    check('views/stale', await evaluate(`document.querySelector('#f-flag').value`) === 'no_such_finding',
+      'a stale finding filter is not shown in the filter row');
+  } catch (err) {
+    check('views/flow', false, `threw: ${err.message}`);
+  }
+  check('views/flow', cdp.thrown.length === thrownBefore,
+    `the page threw: ${cdp.thrown.slice(thrownBefore).join(' | ')}`);
 } finally {
   cdp?.close();
   browser.kill();

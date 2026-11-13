@@ -71,6 +71,17 @@ It:
   and never prefixed. The responses carry `Cache-Control: no-store`. A saved
   file is outside this tool's control from then on: treat it as the inventory
   it is;
+- **keeps saved views in the browser, and nowhere else.** A saved view is a
+  name and a dashboard address — the part after `#`, which holds the tab, the
+  filter and the view's settings — in the browser's `localStorage` under
+  `lbf-views`, beside the theme. It holds nothing the address does not: no
+  data from the index, no session, no identity, and it is never sent to the
+  server. Opening one is following a link, so the server applies the scope of
+  whoever opens it. A stored or imported list is parsed as JSON and checked
+  before use, and an address that does not start `#/` is refused, so a view
+  can only ever move the dashboard within itself. The list belongs to the
+  browser profile rather than the account, so anyone using that profile can
+  read the names;
 - **accepts submitted results only through one route.** `POST /api/upload`,
   from a signed-in `contributor` or an ingest token. Five things are checked
   before a byte is kept, and the first two — who the caller is, and whether

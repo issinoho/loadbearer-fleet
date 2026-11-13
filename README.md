@@ -527,6 +527,9 @@ resets when they're reimaged" is something an estate owner should know.
       weak where](#how-each-component-is-spread-and-which-machines-are-weak-where)
 - [x] A printable fleet report, and CSV for the machine and findings tables —
       see [For people without the dashboard](#for-people-without-the-dashboard-csv-and-a-printed-report)
+- [x] Saved views — the filter, grouping and sort in a named URL, kept in the
+      browser — see [Saved views, and every view as a
+      link](#saved-views-and-every-view-as-a-link)
 
 ## Analysis
 
@@ -887,7 +890,9 @@ lines it was judged against instead. On a phone the seven tabs scroll sideways i
 their strip, with the current one kept in view and a fade on the edge where
 more are hidden. The machine table and the findings queue download as CSV, and
 the overview prints as a report — see [For people without the
-dashboard](#for-people-without-the-dashboard-csv-and-a-printed-report).
+dashboard](#for-people-without-the-dashboard-csv-and-a-printed-report). Every
+view is a link, and can be kept under a name — see [Saved views, and every
+view as a link](#saved-views-and-every-view-as-a-link).
 
 ### Which site is in the worst shape
 
@@ -1236,6 +1241,69 @@ keeps a table row and a chart whole and a heading with what follows, repeats
 a table's header on each page, and sets no page size, so A4 and Letter both
 work. Any other tab prints too, without the chrome, though only the report is
 laid out for paper.
+
+### Saved views, and every view as a link
+
+Every view is a URL. The address holds everything that decides what a tab
+shows: the filter row, the Groups dimension, the Lifecycle tile, the
+Components settings, the overview's comparison and its two queue toggles,
+which column each table is sorted by and which way (`order.<table>=<column>`,
+with a `-` for descending), and which charts are shown as their tables
+(`table=`). Each is left out while it is at its default, so a plain link stays
+short and a link made before any of them existed opens as it did. Bookmark it
+or paste it into a ticket, and it opens on the same view for anyone allowed to
+see those machines. The theme, an open note box, a list expanded with **Show
+all** and the scroll position are not part of a view, and are not in it.
+
+**Views**, in the header, names them. A saved view is a name for one of those
+addresses, kept in this browser. **Save this view…** asks for a name; the list
+opens one; each can be renamed, updated to the view on screen, or deleted,
+which asks a second time. The button shows the name of the saved view on
+screen, and "modified" once the page has moved on from the one opened, with
+**Update** at the top of the panel; on a phone it is a star, filled on a saved
+view, and the name is at the top of the panel. Two addresses that say the same
+thing match, whatever order their parameters are in and whether a default is
+spelled out. **Copy link** copies the address, or, where the browser will not
+let a page use the clipboard, puts it in a field, selected, to copy by hand.
+
+One view can be the **default**: it opens when the dashboard is loaded with no
+view in the address at all. A link that names a view, even `#/overview`, always
+wins. The default is marked in the list, and **Unset default** undoes it.
+
+**Export** saves the list as `loadbearer-fleet-views.json`; **Import** reads one
+back, so a team can hand a set of views round with no server involved. A name
+already in the list, compared ignoring case, takes the file's address and keeps
+its own spelling; a new name is added; the default is one browser's choice and
+is not exported. A file that is not a list of views, or that would make more
+than 50, is refused whole.
+
+**What is stored.** One JSON document in the browser's `localStorage`, under
+`lbf-views`, beside the theme's `lbf-theme`: `{"version": 1, "views": [{"name":
+…, "hash": …}], "default": …}`. Nothing is sent to the server, there is no API,
+and the state file is untouched. A view holds nothing its address does not —
+no data and no identity — and opening one is following its link, so the
+server applies the sign-in scope of whoever opens it. At most 50 views, names
+of at most 60 characters, unique ignoring case; past either, it says so. If the
+browser will not store anything — storage switched off, private browsing, a
+full quota — the panel says saving is not available and **Copy link** still
+works. If what is stored was written by a version this one cannot read, it is
+left exactly as it is, the footer says so once, and nothing is saved over it
+unless you choose **Discard them**.
+
+**Per browser, not per person.** The list belongs to the browser profile, not
+to the signed-in account: it does not follow anyone to another browser, two
+people sharing a profile see each other's names, and signing out does not
+clear it. That is deliberate. A list per person would mean writing who they are
+into the browser, which the addresses never did, and would promise a
+separation the browser cannot keep — the same profile's history already holds
+every one of these addresses. At a shared workstation, give each person a
+browser profile; to move views between browsers, export and import them.
+
+**A view that names something gone** — a tag value, a model or a cohort no
+machine has any more, a grouping, a measure, a machine — opens the way an old
+link to it does: the server's reason, or a line saying nothing in view matches
+the filter, each with a button back to the default or to no filter. A sort on
+a column the table no longer has leaves the table in its own order.
 
 ### No build step, no CDN, one binary
 

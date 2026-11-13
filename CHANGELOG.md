@@ -35,6 +35,31 @@ notes, so each one has to stand on its own.
   Print or Save as PDF. Lists stop at 50 rows and say how many more. Printing
   any tab now drops the header, the filters and the buttons, in the light
   theme. `/api/me` gains `public_url`, which the report names as its source.
+- **Saved views**: **Views** in the header gives the view on screen — tab,
+  filter, grouping, sorts and toggles, which is to say its address — a name,
+  kept in this browser. Open one from the list; rename it, update it to the
+  view on screen, or delete it after a second press; mark one the default,
+  opened when the dashboard is loaded with no view in the address; copy the
+  link; and export the list as a file or import one, merged by name. The
+  button shows the saved view on screen, and "modified" once the page has
+  moved on from it. One versioned document in `localStorage` holding names
+  and addresses only — nothing on the server, no API, no change to the state
+  file — per browser profile rather than per account, at most 50 views.
+- **The address is the whole view.** It now also holds each table's sort
+  (`order.<table>=<column>`, `-` for descending), the charts shown as tables
+  (`table=`) and the overview queue's two toggles (`info=1`, `quiet=1`), each
+  left out at its default, so every link made before opens as it did.
+
+### Fixed
+
+- **A filter that matches nothing** — a tag, model or cohort the fleet no
+  longer has — says so, with a button to clear it, instead of showing an
+  empty estate. A finding code no machine carries and a period that is not one
+  of the four on offer are shown in the filter row rather than as "Any", a
+  `cohort=` filter is shown at all, a filter the server refuses offers to
+  clear itself, and a machine that has gone keeps the way back to the table.
+- **A browser that refuses storage** no longer stops the page from wiring up
+  its controls at the theme toggle.
 
 ## 0.10.0 - Fri, 13 Nov 2026
 

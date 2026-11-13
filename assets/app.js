@@ -1068,17 +1068,34 @@ export function legend(items) {
   ])));
 }
 
-export function dataTable({ columns, rows, onRow, sortable, initialSort }) {
+/** A column's name in the URL: its own `key`, or its label as a slug. */
+const columnKey = (c) => c.key || String(c.label).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+export function dataTable({ columns, rows, onRow, sortable, initialSort, id }) {
   // initialSort is { key: columnIndex, dir: 1 | -1 }; without one, rows keep
-  // the order they came in until a header is clicked.
-  const state = { key: initialSort?.key ?? null, dir: initialSort?.dir ?? 1 };
+  // the order they came in until a header is clicked. A table with an `id`
+  // keeps the reader's sort in the URL, as `order.<id>`; a column it names
+  // that this table does not have — a tag key no machine carries any more —
+  // leaves the table in its own order rather than failing.
+  const initial = { key: initialSort?.key ?? null, dir: initialSort?.dir ?? 1 };
+  const chosen = sortable && id ? state.sorts[state.view]?.[id] : null;
+  const named = chosen ? columns.findIndex((c) => columnKey(c) === chosen.replace(/^-/, '')) : -1;
+  const sort = named >= 0 ? { key: named, dir: chosen.startsWith('-') ? -1 : 1 } : { ...initial };
+  const remember = () => {
+    if (!id) return;
+    const mine = { ...(state.sorts[state.view] || {}) };
+    if (sort.key === initial.key && sort.dir === initial.dir) delete mine[id];
+    else mine[id] = `${sort.dir < 0 ? '-' : ''}${columnKey(columns[sort.key])}`;
+    state.sorts = { ...state.sorts, [state.view]: mine };
+    replaceHash();
+  };
   const wrap = el('div', { class: 'table-wrap' });
   const table = el('table', { class: 'data' });
 
   const draw = () => {
     let body = rows;
-    if (state.key !== null) {
-      const i = state.key;
+    if (sort.key !== null) {
+      const i = sort.key;
       // A row's own sort key wins even when it is null, so "no value" sorts
       // last as the null check below intends. Falling back to the cell for a
       // null key compared '—' or an element against numbers instead.
@@ -1088,19 +1105,21 @@ export function dataTable({ columns, rows, onRow, sortable, initialSort }) {
         if (av === bv) return 0;
         if (av === null || av === undefined) return 1;
         if (bv === null || bv === undefined) return -1;
-        return (av > bv ? 1 : -1) * state.dir;
+        return (av > bv ? 1 : -1) * sort.dir;
       });
     }
     table.replaceChildren(
       el('thead', {}, [el('tr', {}, columns.map((c, i) => {
         const th = el('th', {
-          text: c.label + (state.key === i ? (state.dir > 0 ? ' ▲' : ' ▼') : ''),
+          text: c.label + (sort.key === i ? (sort.dir > 0 ? ' ▲' : ' ▼') : ''),
           class: [c.num ? 'num' : '', sortable ? 'sortable' : ''].filter(Boolean).join(' '),
+          'aria-sort': sortable ? (sort.key === i ? (sort.dir > 0 ? 'ascending' : 'descending') : 'none') : null,
         });
         if (sortable) {
           th.addEventListener('click', () => {
-            if (state.key === i) state.dir *= -1; else { state.key = i; state.dir = c.num ? -1 : 1; }
+            if (sort.key === i) sort.dir *= -1; else { sort.key = i; sort.dir = c.num ? -1 : 1; }
             draw();
+            remember();
           });
         }
         return th;
@@ -1132,10 +1151,18 @@ export function dataTable({ columns, rows, onRow, sortable, initialSort }) {
  * A chart and its table are twins: the toggle swaps one for the other, so
  * every value a chart shows is reachable without a pointer.
  */
-function chartCard({ title, subtitle, note, span = 'col-6', draw, table }) {
+function chartCard({
+  title, subtitle, note, span = 'col-6', draw, table, id,
+}) {
   const body = el('div', {});
-  const toggle = el('button', { type: 'button', class: 'btn btn-quiet', text: 'Table' });
-  const entry = { host: body, mode: 'chart', render: null };
+  // A card with an `id` keeps "shown as its table" in the URL, in `table=`,
+  // so a link to the table opens on the table.
+  const asTable = !!(id && table && (state.tables[state.view] || []).includes(id));
+  const toggle = el('button', {
+    type: 'button', class: 'btn btn-quiet', text: asTable ? 'Chart' : 'Table',
+    dataset: id ? { toggle: id } : null,
+  });
+  const entry = { host: body, mode: asTable ? 'table' : 'chart', render: null };
 
   entry.render = () => {
     body.replaceChildren();
@@ -1147,6 +1174,12 @@ function chartCard({ title, subtitle, note, span = 'col-6', draw, table }) {
     entry.mode = entry.mode === 'chart' ? 'table' : 'chart';
     toggle.textContent = entry.mode === 'chart' ? 'Table' : 'Chart';
     entry.render();
+    if (id) {
+      const mine = (state.tables[state.view] || []).filter((t) => t !== id);
+      if (entry.mode === 'table') mine.push(id);
+      state.tables = { ...state.tables, [state.view]: mine };
+      replaceHash();
+    }
   });
 
   const card = el('div', { class: `card chart-card ${span}` }, [
@@ -1256,13 +1289,30 @@ export const state = {
   encoding: null,
   hsort: null,
   hdir: null,
+  /// Each view's table sorts, by table id: `{ machines: { machines: '-score' } }`,
+  /// a leading `-` for descending. Only a sort the reader chose is here; a
+  /// table's own default is not, so it never reaches the URL.
+  sorts: {},
+  /// Each view's chart cards being shown as their table, by card id.
+  tables: {},
 };
 
 /** The filter fields the URL carries, all sent to the server as they are. */
 const FILTER_KEYS = ['since_days', 'tags', 'flag', 'q', 'cohort', 'model', 'cpu', 'os', 'lifecycle'];
 
-function parseHash() {
-  const raw = location.hash.replace(/^#\/?/, '');
+/*
+ * The URL is the whole view. Everything that changes what a tab shows — the
+ * filter, the grouping, each table's sort, a card shown as its table, the
+ * queue's toggles, the Components settings — is in the hash, so a link, a
+ * bookmark and a saved view all reopen exactly what was on screen. What is
+ * not there is not view state: the theme, an open note box, the scroll
+ * position, a list expanded with "Show all".
+ *
+ * A setting at its default is left out, so a plain link stays short and the
+ * links made before a setting existed still open as they did.
+ */
+function parseHash(hash = location.hash) {
+  const raw = String(hash || '').replace(/^#\/?/, '');
   const [path, query] = raw.split('?');
   const parts = (path || 'overview').split('/');
   const params = new URLSearchParams(query || '');
@@ -1294,6 +1344,8 @@ function parseHash() {
     // The printed report's period, which defaults to four weeks rather than
     // one: a report is read at a review, and a review is rarely weekly.
     reportWindow: Number(params.get('changes')) || REPORT_WEEKS,
+    // And the dimension it groups by, which is the same `by` on its own page.
+    reportBy: view === 'report' ? params.get('by') || null : null,
     // The Lifecycle view's tile, which picks the rows of its table. Not the
     // `lifecycle` filter: that narrows the whole fleet, the tiles' own counts
     // included, so choosing a tile through it would zero every other tile.
@@ -1308,34 +1360,105 @@ function parseHash() {
     encoding: params.get('encoding') || null,
     hsort: params.get('sort') || null,
     hdir: params.get('dir') || null,
+    // The overview queue's two toggles.
+    showInfo: params.get('info') === '1',
+    showQuiet: params.get('quiet') === '1',
+    // `order.<table>=<column>`, `-` in front for descending; and the chart
+    // cards shown as tables. Both name things by id, so a table or card this
+    // build no longer has is ignored rather than refused.
+    sorts: Object.fromEntries([...params.entries()]
+      .filter(([k, v]) => k.startsWith('order.') && k.length > 6 && v)
+      .map(([k, v]) => [k.slice(6), v])),
+    tables: (params.get('table') || '').split(',').filter(Boolean),
     filter,
   };
 }
 
-function writeHash({
-  view = state.view, key = state.key, filter = state.filter, runs = state.runs, by = state.by,
-  window: weeks = state.window, decision = state.decision,
-} = {}) {
-  const params = new URLSearchParams(filter);
-  if (view === 'groups' && by) params.set('by', by);
-  if (view === 'lifecycle' && decision) params.set('decision', decision);
-  if (view === 'overview' && weeks && weeks !== 1) params.set('changes', String(weeks));
+/** The hash for a view: the inverse of `parseHash`, and the one place a URL
+ *  is written. Pure, so a saved view can be compared with the page without
+ *  touching it. */
+function buildHash(v) {
+  const { view } = v;
+  const params = new URLSearchParams();
+  for (const [k, val] of Object.entries(v.filter || {})) if (val) params.set(k, val);
+  if (view === 'groups' && v.by) params.set('by', v.by);
+  if (view === 'lifecycle' && v.decision) params.set('decision', v.decision);
+  if (view === 'overview') {
+    if (v.window && v.window !== 1) params.set('changes', String(v.window));
+    if (v.showInfo) params.set('info', '1');
+    if (v.showQuiet) params.set('quiet', '1');
+  }
   if (view === 'report') {
-    if (state.reportWindow && state.reportWindow !== REPORT_WEEKS) params.set('changes', String(state.reportWindow));
-    if (state.reportBy) params.set('by', state.reportBy);
+    if (v.reportWindow && v.reportWindow !== REPORT_WEEKS) params.set('changes', String(v.reportWindow));
+    if (v.reportBy) params.set('by', v.reportBy);
   }
   if (view === 'components') {
-    for (const [k, v] of [['measure', state.measure], ['config', state.config], ['split', state.split],
-      ['bin', state.bin], ['encoding', state.encoding], ['sort', state.hsort], ['dir', state.hdir]]) {
-      if (v !== null && v !== undefined) params.set(k, String(v));
+    for (const [k, val] of [['measure', v.measure], ['config', v.config], ['split', v.split],
+      ['bin', v.bin], ['encoding', v.encoding], ['sort', v.hsort], ['dir', v.hdir]]) {
+      if (val !== null && val !== undefined) params.set(k, String(val));
     }
   }
+  for (const id of Object.keys(v.sorts || {}).sort()) if (v.sorts[id]) params.set(`order.${id}`, v.sorts[id]);
+  if (v.tables?.length) params.set('table', [...new Set(v.tables)].sort().join(','));
   const q = params.toString();
   let path = view;
-  if (view === 'machine') path = `machine/${encodeURIComponent(key)}`;
-  if (view === 'compare') path = runs?.length ? `compare/${runs.join(',')}` : 'compare';
-  location.hash = `#/${path}${q ? `?${q}` : ''}`;
+  if (view === 'machine') path = `machine/${encodeURIComponent(v.key)}`;
+  if (view === 'compare') path = v.runs?.length ? `compare/${v.runs.join(',')}` : 'compare';
+  return `#/${path}${q ? `?${q}` : ''}`;
 }
+
+/** Everything the hash can say, as the page holds it now — with `patch`
+ *  over it. A view's sorts and tables are its own, so going to another tab
+ *  takes that tab's, kept from the last visit like its grouping is. */
+function viewState(patch = {}) {
+  const set = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
+  const view = set.view ?? state.view;
+  return {
+    view, key: state.key, filter: state.filter, runs: state.runs, by: state.by, window: state.window,
+    decision: state.decision, reportWindow: state.reportWindow, reportBy: state.reportBy,
+    measure: state.measure, config: state.config, split: state.split, bin: state.bin,
+    encoding: state.encoding, hsort: state.hsort, hdir: state.hdir,
+    showInfo: state.showInfo, showQuiet: state.showQuiet,
+    sorts: state.sorts[view] || {}, tables: state.tables[view] || [],
+    ...set,
+  };
+}
+
+function writeHash(patch = {}) {
+  location.hash = buildHash(viewState(patch));
+}
+
+/*
+ * A sort, a card turned to its table, or a queue toggle changes the address
+ * in place rather than navigating: the page already shows the change, so
+ * going through `route` would only fetch the same data again and lose the
+ * reader's scroll — and Back should leave the tab, not undo a column click.
+ */
+function replaceHash() {
+  const next = buildHash(viewState());
+  if (typeof history !== 'undefined' && history.replaceState) history.replaceState(null, '', next);
+  else location.hash = next;
+  syncViewsControl();
+}
+
+/**
+ * A hash in one canonical form, for telling whether two say the same thing:
+ * through `parseHash` and back, so a default spelled out and a default left
+ * out agree and anything this build does not read drops away, with the
+ * parameters and the tag pairs in a fixed order.
+ */
+export function canonicalHash(hash) {
+  const v = parseHash(hash);
+  if (v.filter.tags) {
+    v.filter.tags = v.filter.tags.split(',').map((p) => p.trim()).filter(Boolean).sort().join(',');
+  }
+  const [path, query] = buildHash(v).split('?');
+  if (!query) return path;
+  const sorted = [...new URLSearchParams(query)].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `${path}?${new URLSearchParams(sorted)}`;
+}
+
+export { parseHash, buildHash };
 
 /*
  * A 401 means the session has gone - expired, or the server restarted. Sending
@@ -1478,21 +1601,55 @@ function scopeNotice() {
   })]);
 }
 
+/**
+ * Say so when the filter matches nothing at all. An old link or a saved view
+ * can name a tag value, a model or a cohort the fleet no longer has, and
+ * "0 machines" with every card empty reads as an estate with nothing wrong
+ * rather than as a filter with nothing to match. The comparison is left out:
+ * it names runs, not a filter.
+ */
+export function emptyFilterNotice() {
+  if (!state.snap || state.snap.summary.machines > 0 || !Object.keys(state.filter).length) return null;
+  if (state.view === 'compare' || state.view === 'machine') return null;
+  return el('div', { class: 'banner', dataset: { notice: 'empty-filter' } }, [
+    el('span', {
+      text: `No machine in view matches this filter (${filterWords(state.filter).replace(/^Machines /, '').replace(/\.$/, '')}). `
+        + 'It may name a tag, a model or a cohort that is no longer in the fleet.',
+    }),
+    ' ',
+    el('button', {
+      type: 'button', class: 'link-button', text: 'Clear the filter',
+      onclick: () => { state.filter = {}; writeHash({ filter: {} }); },
+    }),
+  ]);
+}
+
 /* -------------------------------------------------------------- filter row */
 
 function syncFilterControls() {
-  $('#f-since').value = state.filter.since_days || '';
+  // A period from a hand-edited link or an old saved view is offered as
+  // itself: a select set to a value it has no option for shows blank, and a
+  // filter nobody can see is one nobody thinks to clear.
+  const since = $('#f-since');
+  since.querySelector('[data-custom]')?.remove();
+  const days = state.filter.since_days || '';
+  if (days && ![...since.options].some((o) => o.value === days)) {
+    since.append(el('option', { value: days, text: `Last ${days} days`, dataset: { custom: '1' } }));
+  }
+  since.value = days;
   $('#f-q').value = state.filter.q || '';
-  $('#f-flag').value = state.filter.flag || '';
 
+  // The finding codes are the ones in view, plus the one being filtered on:
+  // a code no machine carries any more empties the view, and with the
+  // control showing "Any" there would be no way to see why.
   const flagSelect = $('#f-flag');
-  const codes = [...new Set((state.snap?.flags || []).map((f) => f.code))].sort();
-  const keep = flagSelect.value;
+  const flag = state.filter.flag || '';
+  const codes = [...new Set([...(state.snap?.flags || []).map((f) => f.code), flag].filter(Boolean))].sort();
   flagSelect.replaceChildren(
     el('option', { value: '', text: 'Any' }),
     ...codes.map((c) => el('option', { value: c, text: c.replace(/_/g, ' ') })),
   );
-  flagSelect.value = codes.includes(keep) ? keep : '';
+  flagSelect.value = flag;
 
   // Tag filters are built from what the fleet actually reports rather than
   // from a fixed list, because tags are whatever the deployment tool passed.
@@ -1544,8 +1701,11 @@ function syncFilterControls() {
 }
 
 /** The exact-match filters, by query parameter, with what to call each. A
- *  decision is set from the Groups view's replace and repair counts. */
-const EXACT_FILTERS = [['model', 'System model'], ['cpu', 'CPU'], ['os', 'OS'], ['lifecycle', 'Decision']];
+ *  decision is set from the Groups view's replace and repair counts; a cohort
+ *  only ever arrives in a link, and was invisible here until a stale one
+ *  emptied the view with nothing on screen to say why. */
+const EXACT_FILTERS = [['model', 'System model'], ['cpu', 'CPU'], ['os', 'OS'], ['lifecycle', 'Decision'],
+  ['cohort', 'Cohort']];
 
 /**
  * The tab strip scrolls inside itself where the tabs outgrow the row — a
@@ -1637,13 +1797,17 @@ function wireFilters() {
     await route();
   });
 
+  // Guarded: a browser that refuses storage throws on the first touch, and
+  // that used to stop the rest of the page from wiring up at all. Unstored,
+  // the choice simply lasts until the page is closed.
   const themeBtn = $('#theme');
-  const stored = localStorage.getItem('lbf-theme');
+  let stored = null;
+  try { stored = localStorage.getItem('lbf-theme'); } catch { /* no storage here */ }
   if (stored) document.documentElement.dataset.theme = stored;
   themeBtn.addEventListener('click', () => {
     const now = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
     document.documentElement.dataset.theme = now;
-    localStorage.setItem('lbf-theme', now);
+    try { localStorage.setItem('lbf-theme', now); } catch { /* no storage here */ }
     // Marks carry resolved hex, so a theme change is a redraw.
     for (const e of redraws) if (e.host.isConnected) e.render();
   });
@@ -1906,6 +2070,7 @@ export async function renderOverview(main) {
   const grades = s.grades.filter((g) => g[0] !== 'unrecognised' || g[1] > 0);
   const gradeCard = chartCard({
     title: 'Machines by grade',
+    id: 'grades',
     subtitle: 'Against the reference baseline — an absolute answer, so it reflects the age of the hardware as much as its condition.',
     span: 'col-6',
     draw: (host) => columnChart(host, {
@@ -1927,6 +2092,7 @@ export async function renderOverview(main) {
   }));
   const findingsCard = chartCard({
     title: 'Findings by queue',
+    id: 'findings',
     subtitle: 'Split by what you would do about them: fix the machine, fix the collection, or go and collect.',
     span: 'col-6',
     draw: (host) => {
@@ -1956,6 +2122,7 @@ export async function renderOverview(main) {
   }
   const spreadCard = chartCard({
     title: 'Score distribution',
+    id: 'spread',
     subtitle: 'How the estate is spread, not how it compares. Ranking across configurations is what the cohort view is for.',
     span: 'col-6',
     draw: (host) => columnChart(host, { rows: bands, unit: 'machines' }),
@@ -1982,13 +2149,13 @@ export async function renderOverview(main) {
         el('button', {
           type: 'button', class: 'btn btn-quiet',
           text: state.showInfo ? 'Hide informational' : `Show ${s.info} informational`,
-          onclick: () => { state.showInfo = !state.showInfo; render(); },
+          onclick: () => { state.showInfo = !state.showInfo; replaceHash(); render(); },
         }),
         hiddenQuiet ? el('button', {
           type: 'button', class: 'btn btn-quiet',
           text: state.showQuiet ? 'Hide snoozed and suppressed' : `Show ${hiddenQuiet} snoozed or suppressed`,
           'aria-pressed': state.showQuiet ? 'true' : 'false',
-          onclick: () => { state.showQuiet = !state.showQuiet; render(); },
+          onclick: () => { state.showQuiet = !state.showQuiet; replaceHash(); render(); },
         }) : null,
         csvLink('findings'),
       ]),
@@ -2239,6 +2406,7 @@ export function overTimeCards(tl) {
   ];
   const attention = chartCard({
     title: 'Machines needing attention',
+    id: 'attention',
     subtitle: 'With a critical or warning finding, and how many of those are critical.',
     span: 'col-4',
     draw: (host) => {
@@ -2257,6 +2425,7 @@ export function overTimeCards(tl) {
 
   const median = chartCard({
     title: 'Median score',
+    id: 'median',
     subtitle: 'Moves when the machines change and when the mix of machines does — a refresh lifts it.',
     span: 'col-4',
     draw: (host) => line(host, [
@@ -2278,6 +2447,7 @@ export function overTimeCards(tl) {
   const gradeKeys = points[points.length - 1].grades.map(([g]) => g);
   const grades = chartCard({
     title: 'Fleet size and grade mix',
+    id: 'mix',
     subtitle: 'Machines graded S to B and C to F against the reference baseline.',
     span: 'col-4',
     draw: (host) => {
@@ -2355,6 +2525,7 @@ export function renderCohorts(main) {
       columns: [{ label: 'CPU' }, { label: 'Configuration' }, { label: 'Machines', num: true }],
       rows: thin.map((c) => ({ cells: [c.cpu_model, `${c.comparability.preset} · ${c.comparability.profile} · ${c.comparability.baseline} · ${c.comparability.build_isa}`, c.members] })),
       sortable: true,
+      id: 'thin',
     }),
   ]) : null;
 
@@ -2505,6 +2676,7 @@ export async function renderGroups(main) {
 
   const identicalCard = chartCard({
     title: 'Against identical machines',
+    id: 'identical',
     subtitle: 'Each bar is the median of a group’s machines, each measured against the median of the machines '
       + 'like it across the whole index. Below zero, this group’s machines run slower than the same hardware '
       + 'elsewhere. Select a bar to see its machines.',
@@ -2538,6 +2710,7 @@ export async function renderGroups(main) {
         sort: [groupLabel(g, by), g.machines, g.with_cohort, g.median_cohort_delta_pct, g.thin],
       })),
       sortable: true,
+      id: 'identical',
     }),
   });
 
@@ -2559,6 +2732,7 @@ export async function renderGroups(main) {
   ];
   const attentionCard = chartCard({
     title: 'Machines needing attention',
+    id: 'attention',
     subtitle: 'The share of each group’s machines with a critical or warning finding, by the worst one each carries.',
     note: truncated,
     span: 'col-6',
@@ -2583,6 +2757,7 @@ export async function renderGroups(main) {
         sort: [groupLabel(g, by), g.machines, g.flagged, share(g.flagged, g.machines), g.machines_critical],
       })),
       sortable: true,
+      id: 'attention',
     }),
   });
 
@@ -2606,6 +2781,7 @@ export async function renderGroups(main) {
   ];
   const gradesCard = chartCard({
     title: 'Grades',
+    id: 'grades',
     subtitle: 'Against the reference baseline, so this says how new a group’s hardware is as much as how it is '
       + 'doing. Split at B here; the table has every grade.',
     note: truncated,
@@ -2629,6 +2805,7 @@ export async function renderGroups(main) {
         cells: [groupLabel(g, by), g.machines, ...g.grades.map(([, n]) => n)],
       })),
       sortable: true,
+      id: 'grades',
     }),
   });
 
@@ -2675,6 +2852,7 @@ export async function renderGroups(main) {
       })),
       onRow: (r) => drillInto(r.group, by),
       sortable: true,
+      id: 'groups',
     }),
   ]);
 
@@ -2938,6 +3116,7 @@ function binCard(d, fmt) {
     rows: points.map(row),
     onRow: (r) => writeHash({ view: 'machine', key: r.key }),
     sortable: true,
+    id: 'bin',
   });
   if (chosen !== null) {
     const b = d.bins[chosen];
@@ -2983,6 +3162,7 @@ function distributionCards(d) {
   ].filter(Boolean);
   const chart = chartCard({
     title: `${d.label} · ${unitWords}`,
+    id: 'distribution',
     subtitle: d.config_label
       ? `${nf0.format(d.included)} of ${nf0.format(d.machines)} machine(s) in view, all measured with `
         + `${d.config_label} — numbers are only comparable within one configuration, so others are drawn on their own.`
@@ -3037,6 +3217,7 @@ function distributionCards(d) {
     const label = (g) => (g.value !== null ? g.value : (by.startsWith('tag:') ? '(untagged)' : '(not recorded)'));
     cards.push(chartCard({
       title: `${d.label} by ${dimensionLabel(by).toLowerCase()}`,
+      id: 'split',
       subtitle: 'Each line runs from a group’s p10 to its p90, with its median marked, on the axis above. '
         + 'Select a group to see its machines.',
       note: thin
@@ -3063,6 +3244,7 @@ function distributionCards(d) {
           sort: [label(g).toLowerCase(), g.machines, g.p10, g.median, g.p90, g.thin],
         })),
         sortable: true,
+        id: 'split',
       }),
     }));
   }
@@ -3187,6 +3369,7 @@ export function renderLifecycle(main) {
   ]);
   const scatterCard = chartCard({
     title: 'Age against score',
+    id: 'age',
     subtitle: `Each machine’s best-estimate age against its overall score. The line is ${years} years, from `
       + 'where a machine counts as old'
       + (overriddenCount(snap, 'replace_age_years') ? ' unless the configuration sets another for it' : '')
@@ -3233,6 +3416,7 @@ export function renderLifecycle(main) {
       })),
       onRow: (r) => writeHash({ view: 'machine', key: r.key }),
       sortable: true,
+      id: 'age',
     }),
   });
 
@@ -3268,7 +3452,7 @@ export function renderLifecycle(main) {
         columns: [{ label: 'Machine' }, { label: 'Decision' }, { label: 'Reasons', wrap: true },
           { label: 'Age', num: true }, { label: 'Grade' }, { label: 'Score', num: true },
           { label: 'Battery', num: true }, { label: 'Worst drive wear', num: true }, { label: 'System model' },
-          ...tagKeys.map((k) => ({ label: k }))],
+          ...tagKeys.map((k) => ({ label: k, key: `tag:${k}` }))],
         rows: listed.map((m) => ({
           key: m.key,
           cells: [
@@ -3283,6 +3467,7 @@ export function renderLifecycle(main) {
         })),
         onRow: (r) => writeHash({ view: 'machine', key: r.key }),
         sortable: true,
+        id: 'decisions',
       })
       : el('div', {
         class: 'empty',
@@ -3353,9 +3538,10 @@ export function renderMachines(main) {
       columns: [{ label: 'Machine' }, { label: 'CPU' }, { label: 'Score', num: true }, { label: 'Grade' },
         { label: 'vs peers', num: true }, { label: 'vs own history', num: true },
         { label: 'Findings', num: true }, { label: 'Age', num: true }, { label: 'Measured' },
-        ...tagKeys.map((k) => ({ label: k }))],
+        ...tagKeys.map((k) => ({ label: k, key: `tag:${k}` }))],
       rows,
       sortable: true,
+      id: 'machines',
       // Best first: the fleet's strongest machines at the top, unscored last.
       initialSort: { key: 2, dir: -1 },
     }),
@@ -3367,7 +3553,15 @@ export async function renderMachine(main, key) {
   try {
     payload = await fetchJson(`/api/machine/${encodeURIComponent(key)}`);
   } catch (err) {
-    main.append(el('div', { class: 'banner' }, [el('span', { text: err.message })]));
+    // A machine forgotten since the link was made, or out of the caller's
+    // scope: the server's reason, and the way back to the fleet.
+    main.append(
+      el('div', { class: 'breadcrumb' }, [el('button', {
+        type: 'button', class: 'link-button', text: '← All machines',
+        onclick: () => writeHash({ view: 'machines', key: null }),
+      })]),
+      el('div', { class: 'banner' }, [el('span', { text: err.message })]),
+    );
     return;
   }
   const { machine: m, flags, cohort, history, subtests } = payload;
@@ -3446,6 +3640,7 @@ export async function renderMachine(main, key) {
   const mixed = points.some((p) => !p.comparable);
   const historyCard = chartCard({
     title: 'Score history',
+    id: 'history',
     subtitle: 'The same machine over time. Holding the hardware constant makes this the strongest signal there is.',
     note: mixed
       ? 'Grey points were measured under a different preset, profile, baseline or instruction set. They are shown for '
@@ -3481,6 +3676,7 @@ export async function renderMachine(main, key) {
   const comps = m.components;
   const componentCard = chartCard({
     title: 'Components',
+    id: 'components',
     subtitle: 'Where the overall score comes from.',
     note: 'Network and GPU are measured but never folded into a grade: they describe the link and the driver stack '
       + 'rather than the machine, so they are shown in grey.',
@@ -3571,6 +3767,7 @@ export async function renderMachine(main, key) {
         sort: [t.component, t.id, t.value, t.unit, t.score, t.ratio, t.cv, t.confidence, t.representative, t.scored],
       })),
       sortable: true,
+      id: 'measurements',
     }),
   ]);
 
@@ -4130,6 +4327,554 @@ window.addEventListener('afterprint', () => {
   for (const e of redraws) if (e.host.isConnected && e.mode === 'chart') e.render();
 });
 
+/* ------------------------------------------------------------- saved views */
+
+/*
+ * A saved view is a name for a URL: the hash, whole — tab, filter, grouping,
+ * sorts, toggles — and nothing the hash does not already hold. They are kept
+ * in this browser, as one versioned JSON document under one localStorage key;
+ * there is no server state, no API and nothing in the state file. Opening one
+ * sets the hash and lets `route` do what it does for any link, so there is no
+ * second way of restoring a view to get wrong, and a view that names a tag or
+ * a measure the fleet no longer has opens as an old link to it would.
+ *
+ * One list per browser profile, not per signed-in person. A list per person
+ * would mean writing the person's subject, or something worked out from it,
+ * into the browser — an identity the URLs never held — and would promise a
+ * separation localStorage cannot keep, since anyone at that profile can read
+ * it, as they can read the same profile's history, which already holds every
+ * one of these URLs. So signing out leaves the list, as it leaves the
+ * history, and a shared workstation wants a browser profile per person. The
+ * server is unaffected either way: a view only ever carries a filter, and
+ * each caller's sign-in scope is still applied to it.
+ */
+
+const VIEWS_KEY = 'lbf-views';
+const VIEWS_VERSION = 1;
+/** The most views one browser keeps, and the longest name: enough for a
+ *  team's working set, short enough to fit the list on a phone. */
+export const VIEWS_MAX = 50;
+export const VIEW_NAME_MAX = 60;
+/** A saved address is a filter and some settings; past this it is something
+ *  else, and storage is not the place for it. */
+export const VIEW_HASH_MAX = 2000;
+
+const emptyViews = () => ({ version: VIEWS_VERSION, views: [], default: null });
+
+export const saved = {
+  doc: emptyViews(),
+  /// `ok`; `unavailable` when this browser will not store anything — storage
+  /// switched off, private mode, a full quota; `unreadable` when what is
+  /// stored is not a document this build reads, which is then left exactly
+  /// as it is rather than overwritten.
+  status: 'ok',
+  /// The view last opened, saved or updated here, so the control can say the
+  /// page has moved on from it.
+  opened: null,
+};
+
+/** Looked up each time rather than once: touching storage can throw in a
+ *  browser that refuses it, and the geometry check swaps in its own. */
+function storage() {
+  try { return globalThis.localStorage || null; } catch { return null; }
+}
+
+const sameName = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase();
+
+/**
+ * The stored or imported document, checked, or null if it is not one this
+ * build reads: version 1, at most `VIEWS_MAX` views, each a non-empty name of
+ * at most `VIEW_NAME_MAX` characters (unique, ignoring case) and a hash that
+ * starts `#/`, and a default that names one of them. All of it or none.
+ */
+export function readViewsDoc(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  if (raw.version !== VIEWS_VERSION || !Array.isArray(raw.views) || raw.views.length > VIEWS_MAX) return null;
+  const views = [];
+  for (const v of raw.views) {
+    if (!v || typeof v !== 'object' || typeof v.name !== 'string' || typeof v.hash !== 'string') return null;
+    const name = v.name.trim();
+    if (!name || name.length > VIEW_NAME_MAX || views.some((w) => sameName(w.name, name))) return null;
+    if (!v.hash.startsWith('#/') || v.hash.length > VIEW_HASH_MAX) return null;
+    views.push({ name, hash: v.hash });
+  }
+  const def = raw.default ?? null;
+  if (def !== null && (typeof def !== 'string' || !views.some((w) => sameName(w.name, def)))) return null;
+  return {
+    version: VIEWS_VERSION, views, default: def === null ? null : views.find((w) => sameName(w.name, def)).name,
+  };
+}
+
+/** Read the list from storage, and decide whether saving is possible here. */
+export function loadViews() {
+  const store = storage();
+  saved.doc = emptyViews();
+  try {
+    if (!store) throw new Error('no storage');
+    // A write, because a browser can read storage and refuse to write it.
+    store.setItem('lbf-probe', '1');
+    store.removeItem('lbf-probe');
+  } catch {
+    saved.status = 'unavailable';
+    saved.opened = null;
+    return saved;
+  }
+  let text = null;
+  try { text = store.getItem(VIEWS_KEY); } catch { /* read as nothing stored */ }
+  saved.status = 'ok';
+  if (text !== null) {
+    let raw = null;
+    try { raw = JSON.parse(text); } catch { /* not JSON: unreadable below */ }
+    const doc = readViewsDoc(raw);
+    if (doc) saved.doc = doc; else saved.status = 'unreadable';
+  }
+  if (saved.opened && !saved.doc.views.some((v) => v.name === saved.opened)) saved.opened = null;
+  return saved;
+}
+
+/** Write the list, or say why it could not be. */
+function storeViews(doc) {
+  if (saved.status === 'unavailable') return 'Saving views is not available in this browser. Copy link still works.';
+  if (saved.status === 'unreadable') {
+    return 'The views already stored in this browser are in a form this version cannot read, so nothing is saved over them.';
+  }
+  try {
+    storage().setItem(VIEWS_KEY, JSON.stringify(doc));
+  } catch {
+    return 'This browser would not store that — its storage may be full. Copy link still works.';
+  }
+  saved.doc = doc;
+  return null;
+}
+
+function nameProblem(name, except = null) {
+  if (!name) return 'Give the view a name.';
+  if (name.length > VIEW_NAME_MAX) {
+    return `A name can be at most ${VIEW_NAME_MAX} characters; that one has ${name.length}.`;
+  }
+  const taken = saved.doc.views.find((v) => sameName(v.name, name) && !(except && sameName(v.name, except)));
+  return taken ? `There is already a view called “${taken.name}”. Choose another name, or open that one and update it.` : null;
+}
+
+function hashProblem(hash) {
+  const n = canonicalHash(hash).length;
+  return n > VIEW_HASH_MAX
+    ? `This view’s address is ${n} characters, over the ${VIEW_HASH_MAX} a saved view holds. Copy link still works.`
+    : null;
+}
+
+/** Each change returns null when done, or what stopped it, in words. */
+export function saveView(name, hash = location.hash) {
+  const n = String(name).trim();
+  const problem = nameProblem(n) || hashProblem(hash);
+  if (problem) return problem;
+  if (saved.doc.views.length >= VIEWS_MAX) {
+    return `${VIEWS_MAX} views is the most this browser keeps. Delete one to save another.`;
+  }
+  const failed = storeViews({ ...saved.doc, views: [...saved.doc.views, { name: n, hash: canonicalHash(hash) }] });
+  if (!failed) saved.opened = n;
+  return failed;
+}
+
+export function renameView(from, name) {
+  const n = String(name).trim();
+  const problem = nameProblem(n, from);
+  if (problem) return problem;
+  const failed = storeViews({
+    ...saved.doc,
+    views: saved.doc.views.map((v) => (v.name === from ? { ...v, name: n } : v)),
+    default: saved.doc.default === from ? n : saved.doc.default,
+  });
+  if (!failed && saved.opened === from) saved.opened = n;
+  return failed;
+}
+
+export function updateView(name, hash = location.hash) {
+  const problem = hashProblem(hash);
+  if (problem) return problem;
+  const failed = storeViews({
+    ...saved.doc, views: saved.doc.views.map((v) => (v.name === name ? { ...v, hash: canonicalHash(hash) } : v)),
+  });
+  if (!failed) saved.opened = name;
+  return failed;
+}
+
+export function deleteView(name) {
+  const failed = storeViews({
+    ...saved.doc,
+    views: saved.doc.views.filter((v) => v.name !== name),
+    default: saved.doc.default === name ? null : saved.doc.default,
+  });
+  if (!failed && saved.opened === name) saved.opened = null;
+  return failed;
+}
+
+/** The view to open when the dashboard is loaded with no hash, or none. */
+export function setDefaultView(name) {
+  return storeViews({ ...saved.doc, default: name });
+}
+
+export function defaultView() {
+  return saved.doc.views.find((v) => v.name === saved.doc.default) || null;
+}
+
+/** The view to open on a load with this hash: the default, and only for a
+ *  bare address — a link that names a view, even `#/overview`, always wins. */
+export function startingView(hash = location.hash) {
+  const start = String(hash || '').replace(/^#/, '') ? null : defaultView();
+  if (start) saved.opened = start.name;
+  return start;
+}
+
+/** The saved view this hash shows, compared canonically — the one last
+ *  opened first, when two say the same thing. */
+export function matchingView(hash = location.hash) {
+  const here = canonicalHash(hash);
+  const same = saved.doc.views.filter((v) => canonicalHash(v.hash) === here);
+  return same.find((v) => v.name === saved.opened) || same[0] || null;
+}
+
+/** The list as a file: the stored document, less the default, which is one
+ *  browser's choice and not the team's. */
+export function exportViews() {
+  return `${JSON.stringify({ version: VIEWS_VERSION, views: saved.doc.views }, null, 2)}\n`;
+}
+
+/**
+ * Merge a file of views into the list, by name. A name already here (ignoring
+ * case) takes the file's address and keeps its own spelling and default; a
+ * new name is added. A file that is not a list of views, or that would take
+ * the list past `VIEWS_MAX`, is refused whole: nothing is half imported.
+ */
+export function importViews(text) {
+  let raw = null;
+  try { raw = JSON.parse(text); } catch { /* refused below */ }
+  const doc = readViewsDoc(raw);
+  if (!doc) {
+    return {
+      error: 'That file is not a set of saved views this version can read — it should be what Export writes: '
+        + `version 1, at most ${VIEWS_MAX} views, each a name of at most ${VIEW_NAME_MAX} characters and an address.`,
+    };
+  }
+  const views = saved.doc.views.slice();
+  let added = 0;
+  let replaced = 0;
+  for (const v of doc.views) {
+    const hash = canonicalHash(v.hash);
+    const i = views.findIndex((w) => sameName(w.name, v.name));
+    if (i < 0) {
+      views.push({ name: v.name, hash });
+      added += 1;
+    } else if (views[i].hash !== hash) {
+      views[i] = { ...views[i], hash };
+      replaced += 1;
+    }
+  }
+  if (views.length > VIEWS_MAX) {
+    return { error: `That would make ${views.length} views, and ${VIEWS_MAX} is the most this browser keeps. Nothing was imported.` };
+  }
+  const failed = storeViews({ ...saved.doc, views });
+  return failed ? { error: failed } : { added, replaced, same: doc.views.length - added - replaced };
+}
+
+/** What the control says: the saved view on screen, or the one opened last
+ *  and since moved on from, or neither. */
+export function viewsLabel(hash = location.hash) {
+  const match = matchingView(hash);
+  if (match) return { name: match.name, drift: false };
+  const opened = saved.doc.views.find((v) => v.name === saved.opened);
+  return opened ? { name: opened.name, drift: true } : { name: null, drift: false };
+}
+
+/** The panel's own state: open or not, which row is being edited, and the
+ *  last thing it had to say. */
+export const viewsUi = { open: false, editing: null, note: '', copyField: false };
+
+function syncViewsControl() {
+  const btn = $('#views-button');
+  if (!btn) return;
+  const { name, drift } = viewsLabel();
+  btn.querySelector('.views-name').textContent = name || 'Views';
+  btn.querySelector('.views-drift').hidden = !drift;
+  btn.querySelector('.views-icon').textContent = name && !drift ? '★' : '☆';
+  const said = name ? `Saved views: showing ${name}${drift ? ', changed since it was opened' : ''}` : 'Saved views';
+  btn.setAttribute('aria-label', said);
+  btn.title = said;
+  // Not while a name is being typed: redrawing would take the field away.
+  const panel = $('#views-panel');
+  if (viewsUi.open && panel && !viewsUi.editing) renderViewsPanel(panel);
+}
+
+function openSavedView(v) {
+  saved.opened = v.name;
+  closeViews(true);
+  if (location.hash !== v.hash) location.hash = v.hash;
+  else syncViewsControl();
+}
+
+/**
+ * The panel's contents, from `saved` and the address. Exported so the
+ * geometry check can lay it out and press its buttons without a page.
+ */
+export function renderViewsPanel(panel) {
+  const redraw = () => renderViewsPanel(panel);
+  const say = (text) => { viewsUi.note = text || ''; };
+  const act = (fn) => () => { say(fn()); viewsUi.editing = null; syncViewsControl(); redraw(); };
+  const editing = viewsUi.editing;
+  const match = matchingView();
+  const { name: shown, drift } = viewsLabel();
+  const writable = saved.status === 'ok';
+
+  // A name field with Save and Cancel, for saving and for renaming. Enter
+  // saves, Escape is the panel's.
+  const nameForm = (label, initial, done, success) => {
+    const input = el('input', {
+      type: 'text', class: 'views-input', value: initial, 'aria-label': label,
+      autocomplete: 'off', spellcheck: 'false',
+    });
+    input.value = initial;
+    const submit = () => {
+      const failed = done(input.value);
+      say(failed || success(input.value.trim()));
+      if (!failed) viewsUi.editing = null;
+      syncViewsControl();
+      redraw();
+      if (failed) panel.querySelector('.views-input')?.focus();
+    };
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    return el('div', { class: 'views-form', role: 'group', 'aria-label': label }, [
+      input,
+      el('button', { type: 'button', class: 'btn', text: 'Save', onclick: submit }),
+      el('button', {
+        type: 'button', class: 'btn btn-quiet', text: 'Cancel',
+        onclick: () => { viewsUi.editing = null; say(''); redraw(); },
+      }),
+    ]);
+  };
+
+  let where;
+  if (match) where = `This is “${match.name}”${saved.doc.default === match.name ? ', the default view' : ''}.`;
+  else if (drift) where = `Changed since you opened “${shown}”.`;
+  else where = 'This view is not saved.';
+  const head = el('div', { class: 'views-head' }, [
+    el('p', { class: 'views-where', text: where }),
+    drift && writable ? el('button', {
+      type: 'button', class: 'btn', text: `Update “${shown}”`, dataset: { action: 'update-opened' },
+      onclick: act(() => updateView(shown) || `Updated “${shown}” to this view.`),
+    }) : null,
+  ]);
+
+  const actions = el('div', { class: 'views-actions' }, [
+    writable && editing?.kind !== 'save' ? el('button', {
+      type: 'button', class: 'btn', text: 'Save this view…', dataset: { action: 'save' },
+      onclick: () => { viewsUi.editing = { kind: 'save' }; say(''); redraw(); panel.querySelector('.views-input')?.focus(); },
+    }) : null,
+    el('button', {
+      type: 'button', class: 'btn', text: 'Copy link', dataset: { action: 'copy' },
+      onclick: () => copyLink(panel),
+    }),
+  ]);
+  const saveForm = editing?.kind === 'save'
+    ? nameForm('Name for this view', '', (n) => saveView(n), (n) => `Saved “${n}”.`)
+    : null;
+
+  const copyField = viewsUi.copyField ? el('input', {
+    type: 'text', class: 'views-input', readonly: true, value: location.href, 'aria-label': 'The link to this view',
+  }) : null;
+  if (copyField) copyField.value = location.href;
+
+  // Why saving is off, said where the Save button would be.
+  let blocked = null;
+  if (saved.status === 'unavailable') {
+    blocked = el('p', {
+      class: 'views-blocked',
+      text: 'Saving views is not available in this browser — its storage is switched off or full. Every view is '
+        + 'still a link: Copy link, or bookmark the page.',
+    });
+  } else if (saved.status === 'unreadable') {
+    blocked = el('div', { class: 'views-blocked' }, [
+      el('p', {
+        text: 'The saved views in this browser were written in a form this version cannot read, so they are left '
+          + 'as they are and nothing can be saved over them.',
+      }),
+      editing?.kind === 'discard'
+        ? el('div', { class: 'views-form' }, [
+          el('span', { text: 'Discard them for good?' }),
+          el('button', {
+            type: 'button', class: 'btn', text: 'Discard', dataset: { action: 'discard-confirm' },
+            onclick: () => {
+              try { storage().removeItem(VIEWS_KEY); } catch { /* status below says */ }
+              loadViews();
+              viewsUi.editing = null;
+              say(saved.status === 'ok' ? 'Discarded. Views can be saved again.' : 'This browser would not let them go.');
+              syncViewsControl();
+              redraw();
+            },
+          }),
+          el('button', {
+            type: 'button', class: 'btn btn-quiet', text: 'Keep them',
+            onclick: () => { viewsUi.editing = null; redraw(); },
+          }),
+        ])
+        : el('button', {
+          type: 'button', class: 'btn btn-quiet', text: 'Discard them…', dataset: { action: 'discard' },
+          onclick: () => { viewsUi.editing = { kind: 'discard' }; redraw(); },
+        }),
+    ]);
+  }
+
+  const items = saved.doc.views.map((v) => {
+    const isDefault = saved.doc.default === v.name;
+    const here = match?.name === v.name;
+    if (editing?.kind === 'rename' && editing.name === v.name) {
+      return el('li', { class: 'views-item' }, [
+        nameForm(`New name for ${v.name}`, v.name, (n) => renameView(v.name, n), (n) => `Renamed to “${n}”.`),
+      ]);
+    }
+    if (editing?.kind === 'delete' && editing.name === v.name) {
+      return el('li', { class: 'views-item views-confirm' }, [
+        el('span', { class: 'views-confirm-text', text: `Delete “${v.name}”?` }),
+        el('div', { class: 'views-item-actions' }, [
+          el('button', {
+            type: 'button', class: 'btn', text: 'Delete', dataset: { action: 'delete-confirm' },
+            onclick: act(() => deleteView(v.name) || `Deleted “${v.name}”.`),
+          }),
+          el('button', {
+            type: 'button', class: 'btn btn-quiet', text: 'Keep it',
+            onclick: () => { viewsUi.editing = null; redraw(); },
+          }),
+        ]),
+      ]);
+    }
+    const quiet = (text, action, onclick, label) => el('button', {
+      type: 'button', class: 'btn btn-quiet', text, dataset: { action }, onclick,
+      'aria-label': `${label || text} ${v.name}`,
+    });
+    return el('li', { class: `views-item${here ? ' views-here' : ''}` }, [
+      el('div', { class: 'views-item-head' }, [
+        el('button', {
+          type: 'button', class: 'btn views-open', 'aria-current': here ? 'true' : null,
+          dataset: { action: 'open' }, onclick: () => openSavedView(v),
+        }, [el('span', { class: 'views-open-name', text: v.name })]),
+        isDefault ? el('span', { class: 'chip views-default', text: 'default' }) : null,
+      ]),
+      writable ? el('div', { class: 'views-item-actions' }, [
+        quiet('Rename', 'rename', () => { viewsUi.editing = { kind: 'rename', name: v.name }; say(''); redraw(); panel.querySelector('.views-input')?.focus(); }),
+        here ? null : quiet('Update', 'update', act(() => updateView(v.name) || `Updated “${v.name}” to this view.`),
+          'Update to this view:'),
+        quiet(isDefault ? 'Unset default' : 'Make default', 'default',
+          act(() => setDefaultView(isDefault ? null : v.name)
+            || (isDefault ? `No view opens by default now.` : `“${v.name}” opens when the dashboard is loaded without a view named.`)),
+          isDefault ? 'Stop opening by default:' : 'Open by default:'),
+        quiet('Delete', 'delete', () => { viewsUi.editing = { kind: 'delete', name: v.name }; say(''); redraw(); }, 'Delete…'),
+      ]) : null,
+    ]);
+  });
+  const list = items.length
+    ? el('ul', { class: 'views-list', 'aria-label': 'Saved views' }, items)
+    : el('p', {
+      class: 'views-empty',
+      text: writable ? 'No saved views yet. A saved view is a name for this page’s address, kept in this browser.' : '',
+    });
+
+  const file = el('input', { type: 'file', accept: '.json,application/json', hidden: true, 'aria-hidden': 'true' });
+  file.addEventListener('change', async (e) => {
+    const [f] = [...(e.target.files || [])];
+    e.target.value = '';
+    if (!f) return;
+    const r = importViews(await f.text());
+    say(r.error || `Imported: ${r.added} added, ${r.replaced} replaced by the file’s version, ${r.same} already the same.`);
+    syncViewsControl();
+    redraw();
+  });
+  const portable = el('div', { class: 'views-actions views-files' }, [
+    saved.doc.views.length ? el('button', {
+      type: 'button', class: 'btn btn-quiet', text: 'Export', dataset: { action: 'export' },
+      'aria-label': 'Export the saved views as a file', onclick: () => { downloadViews(); say('Exported.'); redraw(); },
+    }) : null,
+    writable ? el('button', {
+      type: 'button', class: 'btn btn-quiet', text: 'Import…', dataset: { action: 'import' },
+      'aria-label': 'Import saved views from a file', onclick: () => file.click(),
+    }) : null,
+    file,
+  ]);
+
+  // Filtered: `replaceChildren` writes a null as the text "null".
+  panel.replaceChildren(...[
+    head, actions, saveForm, copyField, blocked, list, portable,
+    el('p', { class: 'views-note', role: 'status', text: viewsUi.note }),
+  ].filter(Boolean));
+  if (copyField) { copyField.focus(); copyField.select(); }
+}
+
+/** Copy the address, or where the browser will not let a page do that —
+ *  no clipboard API, or not a secure origin — put it in a field, selected. */
+async function copyLink(panel) {
+  try {
+    await globalThis.navigator.clipboard.writeText(location.href);
+    viewsUi.copyField = false;
+    viewsUi.note = 'Link copied.';
+  } catch {
+    viewsUi.copyField = true;
+    viewsUi.note = 'This browser would not copy for the page. The link is in the field above, selected: copy it from there.';
+  }
+  renderViewsPanel(panel);
+}
+
+function downloadViews() {
+  const url = URL.createObjectURL(new Blob([exportViews()], { type: 'application/json' }));
+  const a = el('a', { href: url, download: 'loadbearer-fleet-views.json', hidden: true });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+function openViews() {
+  const panel = $('#views-panel');
+  Object.assign(viewsUi, { open: true, editing: null, note: '', copyField: false });
+  $('#views-button').setAttribute('aria-expanded', 'true');
+  panel.hidden = false;
+  renderViewsPanel(panel);
+  panel.querySelector('button')?.focus();
+}
+
+function closeViews(returnFocus) {
+  const panel = $('#views-panel');
+  if (!viewsUi.open || !panel) return;
+  Object.assign(viewsUi, { open: false, editing: null, copyField: false });
+  $('#views-button').setAttribute('aria-expanded', 'false');
+  panel.hidden = true;
+  panel.replaceChildren();
+  if (returnFocus) $('#views-button').focus();
+}
+
+function wireViews() {
+  const btn = $('#views-button');
+  if (!btn) return;
+  btn.addEventListener('click', () => (viewsUi.open ? closeViews(true) : openViews()));
+  $('#views').addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && viewsUi.open) { e.preventDefault(); closeViews(true); }
+  });
+  // A press anywhere else closes it, as any popover does; focus stays where
+  // the reader put it.
+  document.addEventListener('pointerdown', (e) => {
+    if (viewsUi.open && !$('#views').contains(e.target)) closeViews(false);
+  });
+  // Another tab saved or deleted one: this tab's list and label agree with it.
+  window.addEventListener('storage', (e) => {
+    if (e.key !== null && e.key !== VIEWS_KEY) return;
+    loadViews();
+    syncViewsControl();
+  });
+  // Said once, where Rescan reports: the views are still there, untouched.
+  if (saved.status === 'unreadable') {
+    $('#footer-note').textContent = 'The saved views in this browser are in a form this version cannot read; '
+      + 'they have been left as they are.';
+  }
+  syncViewsControl();
+}
+
 /* -------------------------------------------------------------------- boot */
 
 function render() {
@@ -4152,6 +4897,8 @@ function render() {
   // The report states the scope in its own heading, where it prints.
   const notice = state.view === 'report' ? null : scopeNotice();
   if (notice) main.append(notice);
+  const stale = emptyFilterNotice();
+  if (stale) main.append(stale);
 
   if (state.view === 'machine') { renderMachine(main, state.key); return; }
   if (state.view === 'compare') { renderCompare(main, state.runs); return; }
@@ -4164,10 +4911,13 @@ function render() {
   else return renderOverview(main);
 }
 
-async function route() {
+/** Set the page's view state from a hash: the half of `route` that reads the
+ *  address, apart so the check can load a hash without a server. */
+export function applyHash(hash = location.hash) {
   const {
-    view, key, filter, runs, by, window: weeks, decision, reportWindow, ...rest
-  } = parseHash();
+    view, key, filter, runs, by, window: weeks, decision, reportWindow, reportBy,
+    showInfo, showQuiet, sorts, tables, ...rest
+  } = parseHash(hash);
   state.view = view;
   state.key = key;
   state.filter = filter;
@@ -4175,13 +4925,24 @@ async function route() {
   // Only the Groups view's own URL names one; elsewhere the last choice is
   // kept for the way back. The overview's window likewise.
   if (view === 'groups') state.by = by;
-  if (view === 'overview') state.window = weeks;
+  if (view === 'overview') {
+    state.window = weeks;
+    state.showInfo = showInfo;
+    state.showQuiet = showQuiet;
+  }
   if (view === 'lifecycle') state.decision = decision;
   if (view === 'report') {
     state.reportWindow = reportWindow;
-    state.reportBy = by;
+    state.reportBy = reportBy;
   }
   if (view === 'components') Object.assign(state, rest);
+  state.sorts = { ...state.sorts, [view]: sorts };
+  state.tables = { ...state.tables, [view]: tables };
+}
+
+async function route() {
+  applyHash();
+  syncViewsControl();
   const main = $('#main');
   main.classList.add('loading');
   try {
@@ -4204,7 +4965,17 @@ async function route() {
     // has drawn it, rather than lifting over a half-built page.
     await render();
   } catch (err) {
-    main.replaceChildren(el('div', { class: 'banner' }, [el('span', { text: `Could not load the fleet: ${err.message}` })]));
+    // A filter the server refuses — a link from before a value was renamed,
+    // or edited by hand — is the likeliest cause, so the way out is offered
+    // here rather than left to the filter row, which may not show the value.
+    main.replaceChildren(el('div', { class: 'banner' }, [
+      el('span', { text: `Could not load the fleet: ${err.message}` }),
+      Object.keys(state.filter).length ? ' ' : null,
+      Object.keys(state.filter).length ? el('button', {
+        type: 'button', class: 'link-button', text: 'Clear the filter',
+        onclick: () => { state.filter = {}; writeHash({ filter: {} }); },
+      }) : null,
+    ]));
   } finally {
     main.classList.remove('loading');
   }
@@ -4213,7 +4984,13 @@ async function route() {
 // Guarded so this module can be imported by the geometry check, which mounts
 // no page. In the browser #main is always there.
 if ($('#main')) {
+  loadViews();
+  // Replaced rather than pushed, so Back does not land on the bare address
+  // and bounce straight back to the default.
+  const start = startingView();
+  if (start) history.replaceState(null, '', start.hash);
   wireFilters();
+  wireViews();
   window.addEventListener('hashchange', route);
   route();
 }
