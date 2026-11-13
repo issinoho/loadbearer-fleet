@@ -533,6 +533,10 @@ resets when they're reimaged" is something an estate owner should know.
 - [x] Saved views — the filter, grouping and sort in a named URL, kept in the
       browser — see [Saved views, and every view as a
       link](#saved-views-and-every-view-as-a-link)
+- [x] Uptime, elevation and security posture where a run asked for them, and
+      one finding drawn from it, Secure Boot read as off — see [Uptime,
+      elevation and security posture, where a run
+      asked](#uptime-elevation-and-security-posture-where-a-run-asked)
 
 ## Analysis
 
@@ -572,7 +576,7 @@ means an estate owner reads a thermal caveat as a failing asset:
 
 | Queue | Means | Examples |
 | --- | --- | --- |
-| **machine** | a hardware decision — repair, replace, reassign | low grade, cohort outlier, regression, one weak component, worn battery, failing or worn drive, media errors, nearly full disk, firmware behind its peers or simply old |
+| **machine** | a hardware decision — repair, replace, reassign | low grade, cohort outlier, regression, one weak component, worn battery, failing or worn drive, media errors, nearly full disk, firmware behind its peers or simply old, Secure Boot read as off |
 | **measurement** | the number can't be trusted until collection is fixed | thermally limited, run on battery, held back by its power settings, partial run, RAM-backed disk target, unstable CPU timings |
 | **coverage** | about the data we hold, not about the machine | stale result, attributed by hostname only, no peer group |
 
@@ -970,14 +974,43 @@ like any other filter, goes through the sign-in scope like any other filter,
 and any other value is refused with a 400. The Search box does not match the
 posture — "off" or "none" as a substring would read as an answer it isn't.
 
-**No findings, no metrics, no notifications** are drawn from any of it. Secure
-Boot off, no TPM, no dm-crypt detected and a long uptime are each a question to
-ask of the estate rather than a fault this tool can judge — see the paragraph
-above on what `none_detected` and "no TPM" do and don't mean. And `/metrics`
-carries nothing of it, not even a fleet-wide count: a count of machines
-without Secure Boot in a metrics store less protected than this one is
-exactly what the CLI's PRIVACY.md worries about. See [SECURITY.md](SECURITY.md)
-for how sensitive the list is.
+**One finding, `secure_boot_off`, and nothing else.** It is raised when the
+latest run read Secure Boot as **off on a UEFI boot**: a warning, in the
+machine queue, which says where the value came from — on Windows the registry
+value `UEFISecureBootEnabled` under
+`HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State`, which mirrors the
+firmware's state; on Linux the `SecureBoot` EFI variable — so it can be
+checked on the machine with `Confirm-SecureBootUEFI` or `mokutil --sb-state`
+before anyone acts. It is never raised for a run that did not ask, one that
+asked and could not read it, or a legacy-BIOS boot, where there is no Secure
+Boot to be off; nor for "off" beside a firmware mode that is missing or one
+this build does not know, since without knowing the machine booted through
+UEFI, "off" is not something to act on. Off is sometimes deliberate —
+unsigned drivers or kernels, lab and build machines — so
+[suppress it](#acknowledge-snooze-suppress) for those, by machine or by tag.
+It has no threshold, and it is a setting rather than a part or a slowdown, so
+it never moves a machine's [lifecycle verdict](#what-to-do-about-each-machine).
+Like every rule it is re-applied to the past, to the run that stood for each
+machine then, so "What changed" shows when Secure Boot was turned off or back
+on, and a week whose run did not ask has no finding.
+
+Only that one, because the other facts are not faults this tool can judge:
+`none_detected` is not "unencrypted" — see above for what is not looked for —
+many VMs have no TPM, and an uptime is as of the run, not now. Each of those
+is a question to ask with `posture=`.
+
+**The finding makes the fact visible** wherever findings go, to everyone who
+can see the machine: the queue, the machine page, the `flag=` filter, the
+findings CSV, "What changed", the printed report's findings and `report` on
+the command line. It goes no further. It is a warning, so the [critical
+notification](#when-a-critical-notification-is-sent) never carries it, and the
+[digest](#the-digest) counts it among the warnings and lists only critical
+findings, so it never names the machine. `/metrics` carries none of the facts,
+not even a fleet-wide count — a count of machines without Secure Boot in a
+metrics store less protected than this one is exactly what the CLI's
+PRIVACY.md worries about — and the finding is only one more in
+`findings{severity="warning"}`, which has no rule or machine label. See
+[SECURITY.md](SECURITY.md) for how sensitive the list is.
 
 An index from an earlier version gains the columns on open, with no format
 change; runs it already holds read as not asked until `scan --reindex` fills

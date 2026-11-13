@@ -41,10 +41,25 @@ sensitive than the hardware inventory**: it is a map of where to aim. It exists
 in the index, the archive, the backups, the machines CSV and the API — only for
 the machines whose runs asked for it, never for one that didn't — and it is
 scope-projected like everything else, so a scoped viewer cannot see another
-site's posture, filter by it, or count it. It is deliberately **not** in
-`/metrics` (not even as a fleet-wide count), the `[notify]` webhook payloads,
-the digest, or the printed report — which states a Security filter if it was
-printed under one, and shows no machine's posture either way.
+site's posture, filter by it, or count it. The facts themselves are
+deliberately **not** in `/metrics` (not even as a fleet-wide count), the
+`[notify]` webhook payloads, the digest, or the printed report — which states
+a Security filter if it was printed under one, and shows no machine's posture
+either way.
+
+One finding is drawn from it: `secure_boot_off`, a warning, where a UEFI boot
+was read with Secure Boot off. **A finding makes the fact visible to everyone
+who can see the machine**, wherever findings go: the findings queue, the
+machine page, the `flag=` filter, the findings CSV, "What changed", the
+printed report's list of findings, and `report` on the command line. Scope
+still applies, so a viewer scoped to one site sees it only on that site's
+machines. It never reaches a webhook payload: the critical event carries
+only critical findings, and the digest counts it among the warnings without
+naming the machine. In `/metrics` it is one more in
+`findings{severity="warning"}`, which has no rule or machine label. Where
+the off is deliberate, a suppression by machine or by tag takes it out of
+the attention counts, but not out of the findings list: a suppressed finding
+is still shown, marked as suppressed.
 
 It:
 

@@ -53,10 +53,26 @@ notes, so each one has to stand on its own.
   `firmware_mode`, `secure_boot`, `tpm_present`, `tpm_version`,
   `disk_encryption` and `disk_encryption_method`; the machines CSV gains ten
   columns for them before the tags, empty for not asked, `unknown` for asked
-  and unreadable, `not_applicable` where the fact cannot exist. No findings,
-  metrics or notifications are drawn from any of it, and SECURITY.md says how
-  sensitive it is. An existing index gains the columns on open with no format
-  change; `scan --reindex` fills them in.
+  and unreadable, `not_applicable` where the fact cannot exist. One finding
+  is drawn from it, `secure_boot_off` (below); no metrics or notifications
+  carry any of it, and SECURITY.md says how sensitive it is. An existing
+  index gains the columns on open with no format change; `scan --reindex`
+  fills them in.
+- **`secure_boot_off`**, a warning in the machine queue, where a run read
+  Secure Boot as off on a UEFI boot. Never for a run that did not ask, one
+  that could not read it, a legacy-BIOS boot, or "off" beside a firmware mode
+  that is missing or unknown. The detail says where the value comes from
+  (`UEFISecureBootEnabled` in the registry on Windows, the `SecureBoot` EFI
+  variable on Linux) and how to confirm it on the machine
+  (`Confirm-SecureBootUEFI`, `mokutil --sb-state`), and that off is sometimes
+  deliberate, on lab and build machines and for unsigned drivers or kernels:
+  suppress it for those by machine or by tag. No threshold, and no part in the
+  lifecycle verdict. It is the only finding drawn from the posture — no TPM,
+  no dm-crypt detected and a long uptime raise nothing. It is shown wherever
+  findings are, to whoever can see the machine; it never reaches the critical
+  webhook, and the digest counts it among the warnings without naming the
+  machine. A finding's detail now wraps anywhere on a narrow screen, so a
+  path with no space in it no longer pushes the card past the edge.
 
 ## 0.11.0 - Fri, 13 Nov 2026
 

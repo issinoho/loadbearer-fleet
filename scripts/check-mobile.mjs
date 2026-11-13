@@ -357,7 +357,9 @@ for (const f of readdirSync(join(root, 'tests/fixtures'))) {
   arrived.run = { id: '5b1d7e0c-3a2f-4e8b-9c6d-1e2f3a4b5c6d', duration_secs: 61 };
   arrived.machine.os_detail = { distro: 'debian', version: '13' };
   // Asked for its elevation and security posture: not elevated, Secure Boot
-  // off, no TPM exposed, and no dm-crypt under its root.
+  // off, no TPM exposed, and no dm-crypt under its root. Its UEFI boot read
+  // with Secure Boot off raises `secure_boot_off`, so its page lays out that
+  // finding too.
   arrived.run.collect = ['elevation', 'security'];
   arrived.run.elevated = false;
   arrived.machine.security = {
@@ -686,8 +688,11 @@ try {
       const SAYS = {
         'machine-memory': [['UEFI · Secure Boot on · TPM 2.0 · disk encryption not read on Windows',
           'at the time of the run', 'last restarted', 'not elevated'], ['--collect']],
+        // With the one finding the posture raises, which the server drew
+        // from its UEFI boot read as off.
         'machine-security': [['Secure Boot off', 'no TPM exposed to the OS', 'no dm-crypt detected under /',
-          'not elevated, so drive health'], ['not encrypted', 'unencrypted', 'Uptime']],
+          'not elevated, so drive health', 'Secure Boot is off', 'mokutil --sb-state'],
+        ['not encrypted', 'unencrypted', 'Uptime']],
         machine: [['--collect'], ['Secure Boot', 'UEFI', 'not collected']],
         'machines-posture': [['WORKSTATION-WITH-A-VERY-LONG-HOSTNAME-07'], ['FLEET-OLD-01']],
       }[view];
@@ -695,6 +700,10 @@ try {
         const body = await evaluate('document.querySelector("#main").innerText');
         for (const w of SAYS[0]) check(where, body.includes(w), `"${w}" is not on the page`);
         for (const w of SAYS[1]) check(where, !body.includes(w), `"${w}" should not be on the page`);
+        if (view === 'machine-security') {
+          const times = body.split('Secure Boot is off').length - 1;
+          check(where, times === 1, `its finding is on the page ${times} time(s), not once`);
+        }
       }
       if (view === 'machines-posture') {
         const select = await evaluate(`(() => { const s = document.querySelector('#f-posture');

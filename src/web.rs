@@ -4488,6 +4488,35 @@ mod tests {
             .await,
         );
         assert!(rows.is_empty(), "no row for a machine out of scope");
+
+        // Nor from its `secure_boot_off` finding, which the admin sees on it
+        // and the Glasgow viewer sees nowhere: not in the queue, the `flag=`
+        // filter, the findings CSV or what changed.
+        let flagged = get(&state, "/api/snapshot?flag=secure_boot_off", Some(&admin))
+            .await
+            .json();
+        let raised: Vec<&serde_json::Value> = flagged["flags"]
+            .as_array()
+            .expect("flags")
+            .iter()
+            .filter(|f| f["code"] == "secure_boot_off")
+            .collect();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0]["machine_key"], edinburgh.as_str());
+        assert_eq!(raised[0]["severity"], "warning");
+        assert_eq!(raised[0]["kind"], "machine");
+        for uri in [
+            "/api/snapshot",
+            "/api/snapshot?flag=secure_boot_off",
+            "/api/changes?window=13",
+            "/api/findings.csv",
+            "/api/findings.csv?flag=secure_boot_off",
+        ] {
+            let r = get(&state, uri, Some(&glasgow)).await;
+            assert_eq!(r.status, StatusCode::OK, "{uri}");
+            assert!(!r.body.contains("secure_boot_off"), "{uri}");
+            assert!(!r.body.contains("Secure Boot is off"), "{uri}");
+        }
     }
 
     /// `posture=` is a closed set, like `lifecycle=`: a value that is not one

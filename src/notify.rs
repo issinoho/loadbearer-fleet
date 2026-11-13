@@ -1199,10 +1199,12 @@ mod tests {
         .unwrap()
     }
 
-    /// A fleet whose every machine opted in to `--collect`, several without
+    /// A fleet whose every machine opted in to `--collect`, one without
     /// Secure Boot: neither payload says a word of it. A webhook goes to a
     /// chat channel, which is exactly where a list of unprotected machines
-    /// should not end up.
+    /// should not end up. The `secure_boot_off` finding drawn from it is a
+    /// warning, so the critical event can never carry it, and the digest
+    /// counts it among the warnings without naming the machine.
     #[test]
     fn no_payload_carries_the_opt_in_facts() {
         use crate::schema::samples;
@@ -1227,18 +1229,69 @@ mod tests {
         )
         .unwrap();
         assert!(snap.machines.iter().any(|m| m.secure_boot == Some(false)));
-        let all: Vec<&Flag> = snap.flags.iter().collect();
+        let off = snap
+            .flags
+            .iter()
+            .find(|f| f.code == "secure_boot_off")
+            .expect("the finding is raised");
+        assert_eq!(off.severity, Severity::Warning);
+        let host = off.hostname.clone().expect("a hostname");
+        let off_key = off.machine_key.clone();
+        assert!(
+            !snap
+                .flags
+                .iter()
+                .any(|f| f.machine_key == off_key && f.severity == Severity::Critical),
+            "the machine has no critical of its own, so nothing else would name it"
+        );
+
+        // What the critical event is handed: the news against a baseline
+        // that knew every machine and none of their findings, so that every
+        // critical in the fleet is new. These fixtures raise no critical of
+        // their own, so one is added on another machine: the event then has
+        // something to carry, and what it leaves out is left out by the rule
+        // rather than for want of news.
+        let mut snap = snap;
+        let other = snap
+            .machines
+            .iter()
+            .find(|m| m.key != off_key)
+            .expect("another machine");
+        let critical = flag(
+            &other.key,
+            other.hostname.as_deref().unwrap_or("H"),
+            "drive_failing",
+        );
+        snap.flags.push(critical);
+        let mut before = snap.clone();
+        before.flags.clear();
+        let news = new_criticals(&before, &snap).expect("a baseline");
+        let codes: Vec<&str> = news.iter().map(|f| f.code).collect();
+        assert_eq!(
+            codes,
+            ["drive_failing"],
+            "the critical, and not the warning"
+        );
+
+        let digest = digest_event(
+            "https://fleet.example.com",
+            DigestSchedule::Daily,
+            &snap,
+            None,
+            datetime!(2026-11-12 08:00 UTC),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&digest.body).expect("JSON");
+        assert_eq!(v["summary"]["live"]["warning"], snap.summary.warnings);
+        let listed = v["findings"].as_array().expect("a list");
+        assert!(listed.iter().all(|f| f["severity"] == "critical"));
+        let body = String::from_utf8(digest.body.clone()).expect("UTF-8");
+        assert!(!body.contains(&host), "the digest names the machine");
+
         for out in [
-            digest_event(
-                "https://fleet.example.com",
-                DigestSchedule::Daily,
-                &snap,
-                None,
-                datetime!(2026-11-12 08:00 UTC),
-            ),
+            digest,
             critical_event(
                 "https://fleet.example.com",
-                &all,
+                &news,
                 datetime!(2026-11-12 08:00 UTC),
             ),
         ] {

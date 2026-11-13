@@ -275,7 +275,7 @@ impl Flag {
 /// Two tests hold it to `evaluate`: one reads `evaluate`'s own source and
 /// fails on a code missing from here or listed here and never raised, and
 /// `push` asserts every code it is handed is in it.
-pub const RULES: [&str; 21] = [
+pub const RULES: [&str; 22] = [
     "grade_low",
     "cohort_outlier",
     "regressed",
@@ -287,6 +287,7 @@ pub const RULES: [&str; 21] = [
     "disk_nearly_full",
     "firmware_behind_peers",
     "firmware_old",
+    "secure_boot_off",
     "thermal_limited",
     "on_battery",
     "power_limited",
@@ -837,8 +838,9 @@ impl std::str::FromStr for Verdict {
 /// into a list of unprotected machines. A legacy-BIOS boot has no Secure Boot
 /// at all and is its own value rather than either side.
 ///
-/// One value at a time, and deliberately no findings or metrics drawn from
-/// it — see the README's "Uptime, elevation and security posture".
+/// One value at a time, and deliberately no metrics drawn from it, and one
+/// finding only: `secure_boot_off`, which `evaluate` raises on a UEFI boot
+/// read as off — see the README's "Uptime, elevation and security posture".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Posture {
     SecureBootOn,
@@ -935,8 +937,8 @@ pub struct Lifecycle {
 }
 
 /// Findings that name a part: something to fix or swap rather than a reason
-/// to retire the platform. Not a nearly full disk, which is housekeeping, and
-/// not firmware, which is an update.
+/// to retire the platform. Not a nearly full disk, which is housekeeping, not
+/// firmware, which is an update, and not Secure Boot off, which is a setting.
 const PART_FINDINGS: [&str; 5] = [
     "battery_worn",
     "drive_failing",
@@ -2289,6 +2291,37 @@ fn evaluate(
                     ),
                 );
             }
+        }
+
+        // The one finding drawn from the opt-in posture, and only where the
+        // run read Secure Boot as off on a UEFI boot. Not asked, asked and
+        // unreadable, and a legacy-BIOS boot are all `None` and raise
+        // nothing. Neither does "off" beside a firmware mode that is absent
+        // or one this build has not heard of: without knowing the machine
+        // booted through UEFI, "off" is not something to act on. The other
+        // facts raise nothing at all — `none_detected` is not "unencrypted",
+        // many VMs have no TPM, and an uptime is as of the run — see the
+        // README's "Uptime, elevation and security posture". Read from the
+        // run being judged, like the drives and the firmware, so a
+        // reconstructed week says what that week's run read.
+        if m.secure_boot == Some(false) && m.firmware_mode.as_deref() == Some("uefi") {
+            push(
+                Severity::Warning,
+                FlagKind::Machine,
+                "secure_boot_off",
+                "Secure Boot is off".to_string(),
+                "The machine boots through UEFI and its latest run read Secure Boot as off, so the \
+                 firmware will start a boot loader or kernel whether it is signed or not — the \
+                 check that keeps malware out of the boot chain is not being made. Sometimes \
+                 that is deliberate: unsigned drivers or kernels, lab and build machines. \
+                 Suppress it for those, by machine or by tag. On Windows the run reads \
+                 UEFISecureBootEnabled under \
+                 HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State, a registry value \
+                 that mirrors the firmware's state, and on Linux the SecureBoot EFI variable; \
+                 confirm it on the machine with Confirm-SecureBootUEFI or mokutil --sb-state \
+                 before acting."
+                    .to_string(),
+            );
         }
 
         // --- The measurement ------------------------------------------------
@@ -4366,8 +4399,11 @@ mod tests {
             );
         }
 
-        // No finding is drawn from any of it: every machine here is the same
-        // fixture, so each carries exactly the codes the one not asked does.
+        // One finding is drawn from it, and nothing else: every machine here
+        // is the same fixture, so each carries exactly the codes the one not
+        // asked does — and the one whose UEFI boot was read with Secure Boot
+        // off carries `secure_boot_off` besides. No TPM, no dm-crypt and a
+        // long uptime raise nothing.
         let codes = |host: &str| -> Vec<&str> {
             let key = &machine(&s, host).key;
             let mut c: Vec<&str> = s
@@ -4379,9 +4415,273 @@ mod tests {
             c.sort();
             c
         };
-        for host in ["PC-WIN", "PC-LUKS", "PC-NONE", "PC-BIOS", "PC-UNREAD"] {
+        for host in [
+            "PC-WIN",
+            "PC-NONE",
+            "PC-BIOS",
+            "PC-UNREAD",
+            "PC-FUTURE",
+            "PC-STRAY",
+        ] {
             assert_eq!(codes(host), codes("PC-OLD"), "{host}");
         }
+        let mut luks = codes("PC-OLD");
+        luks.push("secure_boot_off");
+        luks.sort();
+        assert_eq!(codes("PC-LUKS"), luks);
+    }
+
+    /// `secure_boot_off` on exactly one shape: a UEFI boot whose run read
+    /// Secure Boot as off. Not on, not asked, asked and unreadable, a
+    /// legacy-BIOS boot, the blocks without `run.collect`, nor "off" beside a
+    /// firmware mode that is missing or unheard of.
+    #[test]
+    fn secure_boot_off_is_raised_only_for_a_uefi_boot_read_as_off() {
+        use crate::schema::samples;
+        let mut e = opted_in_estate();
+        let at = "2026-09-01T10:00:00Z";
+        e.add_with("PC-UPPER", 1000.0, at, |d| {
+            samples::optin_linux_luks(d);
+            d["machine"]["security"]["firmware_mode"] = json!("UEFI");
+        });
+        e.add_with("PC-COREBOOT-OFF", 1000.0, at, |d| {
+            samples::optin_future(d);
+            d["machine"]["security"]["secure_boot"] = json!(false);
+        });
+        e.add_with("PC-NO-MODE-OFF", 1000.0, at, |d| {
+            samples::optin_linux_luks(d);
+            d["machine"]["security"]
+                .as_object_mut()
+                .expect("a security block")
+                .remove("firmware_mode");
+        });
+        let s = e.snap();
+        assert_eq!(machine(&s, "PC-COREBOOT-OFF").secure_boot, Some(false));
+        assert_eq!(machine(&s, "PC-NO-MODE-OFF").secure_boot, Some(false));
+        assert_eq!(machine(&s, "PC-NO-MODE-OFF").firmware_mode, None);
+
+        let mut raised: Vec<&str> = flags_for(&s, "secure_boot_off")
+            .iter()
+            .filter_map(|f| f.hostname.as_deref())
+            .collect();
+        raised.sort();
+        assert_eq!(raised, ["PC-LUKS", "PC-UPPER"]);
+
+        let f = flag_on(&s, "secure_boot_off", "PC-LUKS").expect("raised");
+        assert_eq!(f.severity, Severity::Warning, "never critical");
+        assert_eq!(f.kind, FlagKind::Machine, "the machine's queue");
+        assert_eq!(f.headline, "Secure Boot is off");
+        for w in [
+            "deliberate",
+            "by machine or by tag",
+            "UEFISecureBootEnabled",
+            "Confirm-SecureBootUEFI",
+            "mokutil --sb-state",
+        ] {
+            assert!(f.detail.contains(w), "{w} is not in the detail");
+        }
+        assert_eq!(rule("secure_boot_off"), Some("secure_boot_off"));
+    }
+
+    /// Secure Boot off is a setting, not a part, a slowdown or an age: it
+    /// moves no machine's lifecycle verdict and is none of its reasons. The
+    /// same estate with and without the posture, verdict for verdict.
+    #[test]
+    fn secure_boot_off_does_not_change_the_lifecycle_verdict() {
+        use crate::schema::samples;
+        let build = |opted: bool| {
+            let mut e = Estate::new();
+            let at = "2026-09-01T10:00:00Z";
+            // Keep, investigate (a cohort outlier) and repair, and a
+            // measurement caveat, each with Secure Boot off.
+            type Shape = fn(&mut Value);
+            let shapes: [(&str, f64, Shape); 4] = [
+                ("KEEP", 1000.0, |_| {}),
+                ("SLOW", 500.0, |_| {}),
+                ("REPAIR", 1000.0, |d| {
+                    d["machine"]["battery"] = json!({
+                        "charge_pct": 90.0, "state": "charging",
+                        "health_pct": 50.0, "cycle_count": 900
+                    });
+                }),
+                ("HOT", 1000.0, hot),
+            ];
+            for (host, score, shape) in shapes {
+                e.add_with(host, score, at, |d| {
+                    shape(d);
+                    if opted {
+                        samples::optin_linux_luks(d);
+                    }
+                });
+            }
+            e.snap()
+        };
+        let (with, without) = (build(true), build(false));
+        assert_eq!(flags_for(&with, "secure_boot_off").len(), 4);
+        assert!(flags_for(&without, "secure_boot_off").is_empty());
+        for (a, b) in with.machines.iter().zip(&without.machines) {
+            assert_eq!(a.hostname, b.hostname);
+            assert_eq!(
+                (
+                    a.lifecycle.verdict,
+                    &a.lifecycle.reasons,
+                    a.lifecycle.uncertain
+                ),
+                (
+                    b.lifecycle.verdict,
+                    &b.lifecycle.reasons,
+                    b.lifecycle.uncertain
+                ),
+                "{:?}",
+                a.hostname
+            );
+        }
+        assert_eq!(with.summary.lifecycle, without.summary.lifecycle);
+        let verdict = |h: &str| machine(&with, h).lifecycle.verdict;
+        assert_eq!(
+            [verdict("KEEP"), verdict("SLOW"), verdict("REPAIR")],
+            [Verdict::Keep, Verdict::Investigate, Verdict::Repair],
+            "verdicts other than keep, to leave alone"
+        );
+        assert!(
+            with.machines.iter().all(|m| !m
+                .lifecycle
+                .reasons
+                .iter()
+                .any(|r| r.contains("Secure Boot"))),
+            "and never a reason"
+        );
+        // And it is counted as the warning it is, by the summary and by the
+        // groups, which add up to it.
+        assert_eq!(with.summary.warnings, without.summary.warnings + 4);
+        assert_eq!(with.summary.critical, without.summary.critical);
+        let all = |s: &Snapshot| groups(s, &GroupBy::Cpu);
+        let (g, h) = (all(&with), all(&without));
+        assert_eq!(
+            g.iter().map(|g| g.warnings).sum::<usize>(),
+            h.iter().map(|g| g.warnings).sum::<usize>() + 4
+        );
+    }
+
+    /// The past is judged by the run that stood for each machine then, so
+    /// "what changed" shows when Secure Boot was turned off — or back on —
+    /// and a week whose run never asked has no finding at all.
+    #[test]
+    fn secure_boot_off_in_the_past_is_read_from_the_run_judged_then() {
+        use crate::schema::samples;
+        let mut e = Estate::new();
+        let then = "2026-08-30T10:00:00Z";
+        let now_ = "2026-09-06T10:00:00Z";
+        e.add_with("TURNED-OFF", 1000.0, then, samples::optin_windows);
+        e.add_with("TURNED-OFF", 1000.0, now_, samples::optin_linux_luks);
+        e.add_with("TURNED-ON", 1000.0, then, samples::optin_linux_luks);
+        e.add_with("TURNED-ON", 1000.0, now_, samples::optin_windows);
+        e.add("NOW-ASKED", 1000.0, then);
+        e.add_with("NOW-ASKED", 1000.0, now_, samples::optin_linux_luks);
+
+        let past = e.snap_as_of(datetime!(2026-09-02 12:00:00 UTC));
+        let hosts = |s: &Snapshot| -> Vec<String> {
+            let mut h: Vec<String> = flags_for(s, "secure_boot_off")
+                .iter()
+                .filter_map(|f| f.hostname.clone())
+                .collect();
+            h.sort();
+            h
+        };
+        assert_eq!(hosts(&past), ["TURNED-ON"]);
+        assert_eq!(hosts(&e.snap()), ["NOW-ASKED", "TURNED-OFF"]);
+
+        let (snap, t) = e.timeline(4);
+        let c = t.changes(&snap, 1);
+        let of = |list: &[timeline::FindingChange]| -> Vec<String> {
+            let mut h: Vec<String> = list
+                .iter()
+                .filter(|f| f.code == "secure_boot_off")
+                .filter_map(|f| f.hostname.clone())
+                .collect();
+            h.sort();
+            h
+        };
+        assert_eq!(of(&c.new_findings), ["NOW-ASKED", "TURNED-OFF"]);
+        assert_eq!(of(&c.resolved), ["TURNED-ON"]);
+        assert!(
+            c.new_findings
+                .iter()
+                .filter(|f| f.code == "secure_boot_off")
+                .all(|f| f.severity == Severity::Warning && !f.new_machine)
+        );
+        assert_eq!(c.counts.resolved.warning, 1);
+    }
+
+    /// Triage needs nothing of its own for it: the code is in `RULES`, so it
+    /// can be acknowledged, snoozed and suppressed by tag like any other —
+    /// and the suppression takes in only the machines with that tag.
+    #[test]
+    fn secure_boot_off_is_triaged_like_any_finding() {
+        use crate::schema::samples;
+        use crate::state::TriageState::{Acknowledged, Snoozed, Suppressed};
+        let mut e = Estate::new();
+        let at = "2026-09-01T10:00:00Z";
+        for (host, site) in [
+            ("LAB-1", "lab"),
+            ("LAB-2", "lab"),
+            ("DESK-ACK", "glasgow"),
+            ("DESK-SNOOZE", "glasgow"),
+            ("DESK-LIVE", "glasgow"),
+        ] {
+            e.add_with(host, 1000.0, at, |d| {
+                samples::optin_linux_luks(d);
+                d["tags"] = json!({ "site": site });
+            });
+        }
+        let raw = e.snap();
+        let key = |h: &str| machine(&raw, h).key.clone();
+        let book = book_of(
+            &[
+                mark_on(
+                    &key("DESK-ACK"),
+                    "secure_boot_off",
+                    Acknowledged,
+                    Severity::Warning,
+                    None,
+                ),
+                mark_on(
+                    &key("DESK-SNOOZE"),
+                    "secure_boot_off",
+                    Snoozed,
+                    Severity::Warning,
+                    Some(time::macros::date!(2026 - 12 - 01)),
+                ),
+            ],
+            &[suppression(
+                "secure_boot_off",
+                None,
+                Some(&[("site", "lab")]),
+            )],
+        );
+        let view = raw.filtered_with(&Filter::default(), &book, now());
+        let state = |h: &str| {
+            flag_on(&view, "secure_boot_off", h)
+                .expect("still a finding, whatever its triage")
+                .triage
+                .as_ref()
+                .map(|t| t.state)
+        };
+        assert_eq!(state("LAB-1"), Some(Suppressed));
+        assert_eq!(state("LAB-2"), Some(Suppressed));
+        assert_eq!(state("DESK-ACK"), Some(Acknowledged));
+        assert_eq!(state("DESK-SNOOZE"), Some(Snoozed));
+        assert_eq!(state("DESK-LIVE"), None, "the tag does not reach it");
+        let (q, p) = (&view.summary, &raw.summary);
+        assert_eq!(q.warnings, p.warnings - 4);
+        assert_eq!(
+            (
+                q.quieted.acknowledged,
+                q.quieted.snoozed,
+                q.quieted.suppressed
+            ),
+            (1, 1, 2)
+        );
     }
 
     /// `posture=` matches only machines where the fact was read: neither
