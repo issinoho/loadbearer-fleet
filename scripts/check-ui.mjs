@@ -1612,6 +1612,16 @@ function heatRows(h) {
     tpm_present: null, tpm_version: null, disk_encryption: null, disk_encryption_method: null,
   };
   const ALL = ['elevation', 'security', 'uptime'];
+  // The one finding drawn from the posture, as the server words it: on a
+  // UEFI boot read as off, and only there.
+  const secureBootOff = (m) => ({
+    severity: 'warning', kind: 'machine', code: 'secure_boot_off', machine_key: m.key, hostname: m.hostname,
+    headline: 'Secure Boot is off',
+    detail: 'The machine boots through UEFI and its latest run read Secure Boot as off. Sometimes that is '
+      + 'deliberate: suppress it for those, by machine or by tag. Confirm it with Confirm-SecureBootUEFI or '
+      + 'mokutil --sb-state before acting.',
+    triage: null,
+  });
   const NEVER = ['unencrypted', 'not encrypted', 'undefined', 'NaN', 'null'];
   const cases = [
     {
@@ -1632,8 +1642,10 @@ function heatRows(h) {
         firmware_mode: 'uefi', secure_boot: false, tpm_present: true, tpm_version: '2.0',
         disk_encryption: 'encrypted', disk_encryption_method: 'luks2',
       },
+      // Its finding, rendered as any other is.
+      flags: secureBootOff,
       want: ['UEFI · Secure Boot off · TPM 2.0 · root filesystem on dm-crypt (LUKS2)', 'up 3d 2h at the time of the run',
-        'booted ', ' · elevated'],
+        'booted ', ' · elevated', 'Secure Boot is off', 'mokutil --sb-state'],
       not: ['last restarted', 'not elevated', 'not read on Windows', 'elevation not reported'],
       dts: ['Security', 'Uptime'],
     },
@@ -1721,7 +1733,8 @@ function heatRows(h) {
     globalThis.fetch = () => Promise.resolve({
       ok: true,
       json: () => Promise.resolve({
-        machine: c.machine, flags: [], cohort: null, history: [], subtests: [], drives: [], memory_modules: [],
+        machine: c.machine, flags: c.flags ? [c.flags(c.machine)] : [], cohort: null, history: [], subtests: [], drives: [],
+        memory_modules: [],
       }),
       text: () => Promise.resolve(''),
     });
@@ -1732,6 +1745,10 @@ function heatRows(h) {
       const text = textOf(h);
       const dts = dtsOf(h);
       for (const w of c.want) check(c.name, text.includes(w), `"${w}" is missing`);
+      if (c.flags) {
+        const times = text.split(c.flags(c.machine).headline).length - 1;
+        check(c.name, times === 1, `its finding is on the page ${times} time(s), not once`);
+      }
       for (const w of [...c.not, ...NEVER]) check(c.name, !text.includes(w), `"${w}" should not be there`);
       for (const d of c.dts || []) check(c.name, dts.includes(d), `no ${d} row`);
       for (const d of c.noDts || []) check(c.name, !dts.includes(d), `a ${d} row for something not asked`);
@@ -2251,10 +2268,13 @@ async function renderReportWith(name, { snap, changes, timeline, grouping = null
     check('report/fixtures', text.includes('Fleet size and grade mix'), 'the over-time charts are missing');
   }
 
-  // Every machine opted in, posture and all: the report carries none of it.
-  // It is a document for a review meeting, and a printed list of which
-  // machines lack Secure Boot is what the CLI's opt-in exists to keep from
-  // lying around.
+  // Every machine opted in, posture and all: the report carries none of the
+  // facts themselves — no Security line, no uptime, no elevation. It is a
+  // document for a review meeting, and a printed table of every machine's
+  // posture is what the CLI's opt-in exists to keep from lying around. The
+  // one finding drawn from it, `secure_boot_off`, is a finding like any
+  // other, so where one is live it is listed with the rest, once; see
+  // SECURITY.md.
   const opted = {
     ...snapshot,
     machines: snapshot.machines.map((m) => ({
@@ -2269,6 +2289,26 @@ async function renderReportWith(name, { snap, changes, timeline, grouping = null
   if (postured) {
     for (const w of ['Secure Boot', 'TPM', 'dm-crypt', 'UEFI', 'elevat', 'uptime', 'Uptime', '--collect']) {
       check('report/opted-in', !postured.text.includes(w), `"${w}" reached the printed report`);
+    }
+  }
+  const first = opted.machines[0];
+  const withFinding = await renderReportWith('report/secure-boot-off', {
+    snap: {
+      ...opted,
+      flags: [...opted.flags, {
+        severity: 'warning', kind: 'machine', code: 'secure_boot_off', machine_key: first.key, hostname: first.hostname,
+        headline: 'Secure Boot is off', detail: 'Sometimes deliberate: suppress it for those, by machine or by tag.',
+        triage: null,
+      }],
+    },
+    changes: realChanges(4),
+    timeline: weeksOf(27),
+  });
+  if (withFinding) {
+    const times = withFinding.text.split('Secure Boot is off').length - 1;
+    check('report/secure-boot-off', times === 1, `the finding is listed ${times} time(s), not once`);
+    for (const w of ['Secure Boot off', 'TPM', 'dm-crypt', 'UEFI ·', 'elevat', 'uptime', 'Uptime', '--collect']) {
+      check('report/secure-boot-off', !withFinding.text.includes(w), `"${w}" reached the printed report`);
     }
   }
 

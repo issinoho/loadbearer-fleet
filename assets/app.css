@@ -431,7 +431,10 @@ table.data td.wrap { white-space: normal; min-width: 16em; }
 .finding:last-child { border-bottom: 0; }
 .finding-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .finding-who { font-weight: 600; }
-.finding-detail { color: var(--text-secondary); margin: 4px 0 0; }
+/* `anywhere`, not `break-word`: a detail can carry a path with no space in it
+   — a mount point, a registry key — and only `anywhere` lets it shrink the
+   flex item it sits in, rather than push the card past a phone's edge. */
+.finding-detail { color: var(--text-secondary); margin: 4px 0 0; overflow-wrap: anywhere; }
 .finding-queue { color: var(--text-muted); font-size: 12px; }
 
 /* Triage. A quieted finding is still a finding, so it keeps its place and its

@@ -18,13 +18,17 @@
 //! about a machine; this is the place to ask whether the fleet view can be
 //! trusted.
 //!
-//! Nor anything drawn from the opt-in facts of `--collect` — Secure Boot, the
-//! TPM, disk encryption, uptime, elevation — **not even as a fleet-wide
-//! count**. "Machines without Secure Boot" in a store that is less protected
+//! Nor any of the opt-in facts of `--collect` — Secure Boot, the TPM, disk
+//! encryption, uptime, elevation — **not even as a fleet-wide count** of a
+//! fact. "Machines without Secure Boot" in a store that is less protected
 //! than this one is exactly the list loadbearer's PRIVACY.md makes those
 //! facts opt-in to keep from leaking, and a count of it is half the way
 //! there. The Machines tab's `posture=` filter, behind sign-in and scope, is
-//! where that question is asked.
+//! where that question is asked. The one finding drawn from them,
+//! `secure_boot_off`, is a warning like any other, so it is counted in
+//! `findings{severity="warning"}` and `machines_flagged` beside every other
+//! warning: no family has a rule or machine label, so nothing here tells it
+//! apart from a worn battery.
 
 use std::fmt::Write as _;
 
@@ -605,7 +609,8 @@ mod tests {
     }
 
     /// Nothing of a machine's security posture reaches a scrape, even where
-    /// every machine opted in and several lack Secure Boot.
+    /// every machine opted in and one lacks Secure Boot — except that its
+    /// `secure_boot_off` finding is one of the warnings counted, unlabelled.
     #[test]
     fn the_opt_in_facts_are_not_exported() {
         use crate::schema::samples;
@@ -635,6 +640,24 @@ mod tests {
         ] {
             assert!(!text.contains(word), "{word} in the exposition");
         }
+        // The finding is there, and is counted as one more warning: the
+        // family's value is the summary's, which includes it.
+        let off = snap
+            .flags
+            .iter()
+            .filter(|f| f.code == "secure_boot_off")
+            .count();
+        assert_eq!(off, 1);
+        let warnings = snap
+            .flags
+            .iter()
+            .filter(|f| f.severity == crate::analytics::Severity::Warning)
+            .count();
+        assert_eq!(snap.summary.warnings, warnings);
+        assert_eq!(
+            value_of(&text, "loadbearer_fleet_findings{severity=\"warning\"} "),
+            warnings.to_string()
+        );
     }
 
     #[test]
