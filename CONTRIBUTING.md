@@ -81,6 +81,7 @@ trade-off, not restate what the code already says.
 | `src/index.rs` | the SQLite index, ingest, the document archive, `backup`, `forget` |
 | `src/analytics.rs` | cohorts, the red-flag engine, the executive summary, the filter projection |
 | `src/analytics/timeline.rs` | the fleet over time, reconstructed from the runs already indexed, and what changed between two dates |
+| `src/analytics/thresholds.rs` | the lines each machine is judged against: which thresholds an override may set and why, and resolving a machine's own thresholds from `[thresholds]` and its overrides |
 | `src/web.rs` | the HTTP layer, the snapshot cache, authorization applied as part of the projection, the triage endpoints |
 | `src/state.rs` | the state file: acknowledgements, snoozes and suppressions, the one thing not derived from the folder; how they apply to a finding and when they lapse |
 | `src/auth.rs` | OIDC sign-in, sessions, roles and tag scopes |
@@ -94,6 +95,7 @@ trade-off, not restate what the code already says.
 | `tests/ingest.rs` | ingest against real result documents |
 | `tests/stdout_is_data.rs` | runs the **real binary** and parses its stdout, for the commands that print a document |
 | `tests/notify.rs` | runs `notify test` against a receiver on 127.0.0.1, for its exit status and what it prints |
+| `tests/thresholds.rs` | runs `report` and `serve` over one index and one config with threshold overrides, and checks they judge the fleet the same way |
 | `scripts/check-ui.mjs` | the chart and view geometry check |
 | `scripts/check-mobile.mjs` | the same page in a real browser, at four screen widths |
 

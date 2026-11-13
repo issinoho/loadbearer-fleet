@@ -913,7 +913,7 @@ pub(crate) mod receiver {
 mod tests {
     use super::receiver;
     use super::*;
-    use crate::analytics::{FlagKind, Thresholds};
+    use crate::analytics::{FlagKind, Tuning};
     use crate::index::Index;
     use std::path::Path;
     use time::macros::{datetime, time};
@@ -1193,7 +1193,7 @@ mod tests {
         }
         crate::analytics::snapshot(
             index.conn(),
-            &Thresholds::default(),
+            &Tuning::default(),
             datetime!(2026-09-12 12:00 UTC),
         )
         .unwrap()
