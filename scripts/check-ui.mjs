@@ -43,6 +43,7 @@ class FakeNode {
     this.textContent = '';
     this.className = '';
     this.hidden = false;
+    this.listeners = {};
   }
 
   setAttribute(k, v) { this.attrs[k] = v; }
@@ -55,7 +56,14 @@ class FakeNode {
 
   replaceChildren(...kids) { this.children = kids.filter(Boolean); }
 
-  addEventListener() {}
+  // Kept rather than dropped, so a check can press a button: `fire` below.
+  addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+
+  focus() {}
+
+  select() {}
+
+  remove() {}
 
   querySelector() { return null; }
 
@@ -89,6 +97,8 @@ globalThis.localStorage = { getItem: () => null, setItem() {} };
 // and the audit below sees the marks.
 globalThis.requestAnimationFrame = (fn) => fn();
 globalThis.location = { hash: '' };
+// Saved views and the table sorts write the address in place.
+globalThis.history = { replaceState(_s, _t, url) { globalThis.location.hash = url; } };
 globalThis.fetch = () => Promise.reject(new Error('no network in the geometry check'));
 
 /* ---------------------------------------------------------------- the walk */
@@ -96,6 +106,20 @@ globalThis.fetch = () => Promise.reject(new Error('no network in the geometry ch
 function walk(node, fn, depth = 0) {
   fn(node, depth);
   for (const kid of node.children || []) walk(kid, fn, depth + 1);
+}
+
+/** Press a button, or send any event, as the browser would. */
+async function fire(node, type = 'click', ev = {}) {
+  for (const fn of node?.listeners?.[type] || []) {
+    await fn({ target: node, preventDefault() {}, stopPropagation() {}, ...ev });
+  }
+}
+
+/** Every node under `root` that `test` accepts, in document order. */
+function findAll(root, test) {
+  const out = [];
+  walk(root, (n) => { if (test(n)) out.push(n); });
+  return out;
 }
 
 function textOf(node) {
@@ -1980,6 +2004,359 @@ async function renderReportWith(name, { snap, changes, timeline, grouping = null
     `the overview's report link does not carry the filter: ${links.join(' ')}`);
   notes.push(`csv: ${links.length} link(s) on the overview, the machine table's download carries the filter`);
   mod.state.filter = {};
+}
+
+/* ------------------------------------------------------- the URL is the view */
+
+/*
+ * Every piece of view state on every tab, set, written to a hash, and that
+ * hash loaded fresh — through `applyHash`, the half of `route` that reads the
+ * address — into a page that remembers nothing. What comes back must be what
+ * went in, and the view drawn from it must show it: the sorted column, the
+ * card turned to its table, the toggle pressed. Then the links made before
+ * any of this existed, which must still read and write as they did.
+ */
+const BLANK = {
+  key: null, filter: {}, runs: [], by: null, window: 1, decision: null, reportWindow: 4, reportBy: null,
+  measure: null, config: null, split: null, bin: null, encoding: null, hsort: null, hdir: null,
+  showInfo: false, showQuiet: false, sorts: {}, tables: [],
+};
+const freshState = () => Object.assign(mod.state, { ...BLANK, view: 'overview', sorts: {}, tables: {}, me: null });
+/** What a view's hash is responsible for, so other tabs' settings don't count. */
+function viewFacts(v) {
+  const own = {
+    overview: ['window', 'showInfo', 'showQuiet'], groups: ['by'], lifecycle: ['decision'],
+    components: ['measure', 'config', 'split', 'bin', 'encoding', 'hsort', 'hdir'],
+    report: ['reportWindow', 'reportBy'], machine: ['key'], compare: ['runs'],
+  }[v.view] || [];
+  return JSON.stringify({
+    view: v.view, filter: v.filter, tables: [...v.tables].sort(),
+    sorts: Object.fromEntries(Object.entries(v.sorts).sort()),
+    ...Object.fromEntries(own.map((k) => [k, v[k]])),
+  });
+}
+{
+  const AUDIT = [
+    { view: 'overview', filter: { tags: 'site=glasgow', q: 'PC' }, window: 4, showInfo: true, showQuiet: true, tables: ['grades', 'mix'] },
+    { view: 'cohorts', filter: { since_days: '30' }, sorts: { thin: '-machines' } },
+    { view: 'groups', filter: { os: 'Windows 11' }, by: 'tag:site', sorts: { groups: '-flagged', identical: 'group' }, tables: ['identical'] },
+    {
+      view: 'components', measure: 'disk/seq_read', config: 'thorough|general', split: 'tag:site', bin: 0, encoding: 'grade',
+      hsort: 'disk', hdir: 'desc', sorts: { bin: 'machine', split: '-median' }, tables: ['distribution'],
+    },
+    { view: 'lifecycle', filter: { lifecycle: 'watch' }, decision: 'watch', sorts: { decisions: '-age', age: 'score' }, tables: ['age'] },
+    { view: 'machines', filter: { flag: 'stale_result', cohort: 'X|y' }, sorts: { machines: 'tag:site' } },
+    { view: 'machine', key: 'SN WIN/01', sorts: { measurements: '-score' }, tables: ['history'] },
+    { view: 'compare', runs: [3, 1, 2], filter: { tags: 'site=glasgow' } },
+    { view: 'report', filter: { model: 'Latitude 7440' }, reportWindow: 13, reportBy: 'tag:site', tables: ['median'] },
+  ];
+  for (const set of AUDIT) {
+    const name = `url/${set.view}`;
+    const want = { ...BLANK, ...set };
+    const hash = mod.buildHash(want);
+    freshState();
+    mod.applyHash(hash);
+    const got = {
+      ...mod.state, sorts: mod.state.sorts[set.view] || {}, tables: mod.state.tables[set.view] || [],
+    };
+    check(name, viewFacts(got) === viewFacts(want), `${hash} reads back as ${viewFacts(got)}, not ${viewFacts(want)}`);
+    // And the hash the page would write from there is the one it was given.
+    check(name, mod.buildHash({ ...got, view: set.view }) === hash, `${hash} is written back differently`);
+    notes.push(`${name}: ${hash}`);
+  }
+
+  // Shown, not just held: each view drawn from a hash loaded fresh.
+  const sortedBy = (h) => findAll(h, (n) => n.tagName === 'th' && n.attrs['aria-sort'] && n.attrs['aria-sort'] !== 'none')
+    .map((n) => `${n.textContent.replace(/ [▲▼]$/, '')} ${n.attrs['aria-sort']}`);
+  const toggles = (h) => Object.fromEntries(findAll(h, (n) => n.dataset?.toggle).map((n) => [n.dataset.toggle, n.textContent]));
+  const button = (h, text) => findAll(h, (n) => n.tagName === 'button' && n.textContent === text)[0];
+  globalThis.fetch = () => Promise.reject(new Error('no network in the geometry check'));
+
+  freshState();
+  mod.state.snap = snapshot;
+  mod.applyHash('#/machines?order.machines=-tag%3Asite');
+  let h = host(1200);
+  mod.renderMachines(h);
+  check('url/machines/shown', sortedBy(h).join() === 'site descending', `sorted by ${sortedBy(h).join()}`);
+
+  freshState();
+  mod.applyHash('#/overview?info=1&table=grades%2Cmix');
+  h = host(1200);
+  await mod.renderOverview(h);
+  check('url/overview/shown', !!button(h, 'Hide informational'), 'the informational findings are not shown');
+  check('url/overview/shown', toggles(h).grades === 'Chart' && toggles(h).findings === 'Table',
+    `cards in the wrong mode: ${JSON.stringify(toggles(h))}`);
+
+  freshState();
+  mod.applyHash('#/lifecycle?decision=watch&order.decisions=-age&table=age');
+  h = host(1200);
+  mod.renderLifecycle(h);
+  const pressed = findAll(h, (n) => n.attrs?.['aria-pressed'] === 'true').map(textOf);
+  check('url/lifecycle/shown', pressed.length === 1 && pressed[0].startsWith('Watch'), `pressed: ${pressed.join(' | ')}`);
+  check('url/lifecycle/shown', sortedBy(h).includes('Age descending'), `sorted by ${sortedBy(h).join()}`);
+  check('url/lifecycle/shown', toggles(h).age === 'Chart', 'the scatter is not shown as its table');
+
+  freshState();
+  mod.applyHash('#/cohorts?order.thin=-machines');
+  h = host(1200);
+  mod.renderCohorts(h);
+  check('url/cohorts/shown', sortedBy(h).join() === 'Machines descending', `sorted by ${sortedBy(h).join()}`);
+
+  // A header pressed writes the sort into the address in place, and pressing
+  // back to the table's own order takes it out again.
+  freshState();
+  mod.applyHash('#/machines');
+  location.hash = '#/machines';
+  h = host(1200);
+  mod.renderMachines(h);
+  const header = (label) => findAll(h, (n) => n.tagName === 'th' && n.textContent.replace(/ [▲▼]$/, '') === label)[0];
+  await fire(header('Machine'));
+  check('url/sort-click', location.hash === '#/machines?order.machines=machine', `wrote ${location.hash}`);
+  await fire(header('Score'));
+  check('url/sort-click', location.hash === '#/machines', `the default sort is written as ${location.hash}`);
+
+  // Every link made before this existed opens as it did, and is written back
+  // byte for byte.
+  for (const old of ['#/overview', '#/overview?changes=13', '#/lifecycle?decision=keep', '#/groups?tags=site%3Dglasgow&by=os',
+    '#/components?measure=disk%2Fseq_read&split=tag%3Asite&bin=0&encoding=grade&sort=disk&dir=desc',
+    '#/report?by=tag%3Asite', '#/compare/1,2', '#/machines?cpu=Intel%28R%29+Core%28TM%29', '#/machine/SN-WIN-0001']) {
+    check('url/old-links', mod.buildHash(mod.parseHash(old)) === old, `${old} is rewritten as ${mod.buildHash(mod.parseHash(old))}`);
+  }
+
+  // A stale address: a sort on a column no table has, a card that does not
+  // exist, a filter that matches nothing. Drawn in the table's own order,
+  // and the empty view says why.
+  freshState();
+  mod.applyHash('#/machines?tags=gone%3Dx&order.machines=-tag%3Agone&table=nothing');
+  mod.state.snap = { ...snapshot, machines: [], flags: [], summary: { ...snapshot.summary, machines: 0 } };
+  h = host(1200);
+  try {
+    mod.renderMachines(h);
+    check('url/stale', sortedBy(h).join() === 'Score descending', `a stale sort drew ${sortedBy(h).join()}`);
+    const notice = mod.emptyFilterNotice();
+    check('url/stale', !!notice && textOf(notice).includes('No machine in view matches this filter')
+      && textOf(notice).includes('tagged gone=x') && !!button(notice, 'Clear the filter'),
+    `the empty view does not say why: ${notice ? textOf(notice) : 'no notice'}`);
+  } catch (err) {
+    failures.push(`url/stale: threw ${err.message}`);
+  }
+  mod.state.snap = snapshot;
+  freshState();
+}
+
+/* ------------------------------------------------------------- saved views */
+
+/*
+ * Saved views against a storage that lives in memory, and ones that refuse:
+ * the panel laid out and its buttons pressed, the document as it is stored,
+ * and every way the stored or imported document can be wrong.
+ */
+function memoryStorage(seed = {}) {
+  const m = new Map(Object.entries(seed));
+  return {
+    getItem: (k) => (m.has(k) ? m.get(k) : null),
+    setItem: (k, v) => { m.set(k, String(v)); },
+    removeItem: (k) => { m.delete(k); },
+    m,
+  };
+}
+{
+  const realStorage = globalThis.localStorage;
+  const store = memoryStorage();
+  globalThis.localStorage = store;
+  mod.loadViews();
+  check('views/load', mod.saved.status === 'ok' && mod.saved.doc.views.length === 0, `empty storage read as ${mod.saved.status}`);
+  const stored = () => JSON.parse(store.getItem('lbf-views'));
+  const panel = () => { const p = new FakeNode('div'); mod.renderViewsPanel(p); return p; };
+  const press = async (p, action, i = 0) => {
+    const b = findAll(p, (n) => n.tagName === 'button' && n.dataset?.action === action)[i];
+    check('views/ui', !!b, `no ${action} button`);
+    await fire(b);
+    return b;
+  };
+  const typeAndSave = async (p, text) => {
+    const input = findAll(p, (n) => n.className === 'views-input')[0];
+    check('views/ui', !!input, 'no name field');
+    if (!input) return;
+    input.value = text;
+    await fire(findAll(p, (n) => n.tagName === 'button' && n.textContent === 'Save')[0]);
+  };
+
+  // Save, through the panel.
+  location.hash = '#/machines?tags=site%3Dglasgow&order.machines=machine';
+  let p = panel();
+  check('views/ui', textOf(p).includes('This view is not saved.'), 'the panel does not say the view is unsaved');
+  await press(p, 'save');
+  await typeAndSave(p, '  Glasgow by name  ');
+  check('views/save', stored().views.length === 1 && stored().views[0].name === 'Glasgow by name'
+    && stored().views[0].hash === mod.canonicalHash(location.hash), `stored ${JSON.stringify(stored())}`);
+  check('views/save', stored().version === 1, 'the document carries no version');
+  check('views/save', mod.viewsLabel().name === 'Glasgow by name' && !mod.viewsLabel().drift, 'the control does not name the view');
+  check('views/save', textOf(p).includes('Saved “Glasgow by name”.'), `the panel said ${textOf(p)}`);
+
+  // A duplicate name, an empty one, a long one: refused, with the reason.
+  p = panel();
+  await press(p, 'save');
+  await typeAndSave(p, 'GLASGOW BY NAME');
+  check('views/names', textOf(p).includes('There is already a view called “Glasgow by name”'), 'a duplicate name was not refused aloud');
+  check('views/names', mod.saveView('   ') === 'Give the view a name.', 'an empty name was not refused');
+  check('views/names', /at most 60 characters/.test(mod.saveView('x'.repeat(61)) || ''), 'a long name was not refused');
+  check('views/names', stored().views.length === 1, 'a refused name was stored');
+  mod.viewsUi.editing = null;
+
+  // Canonical: the same view with its parameters in another order, a default
+  // spelled out, and its tag pairs reversed, is the same view.
+  const a = '#/overview?tags=site%3Dglasgow%2Cring%3Dpilot&info=1&changes=4';
+  const b = '#/overview?changes=4&info=1&tags=ring%3Dpilot%2Csite%3Dglasgow&quiet=0&bogus=1';
+  check('views/canonical', mod.canonicalHash(a) === mod.canonicalHash(b), `${mod.canonicalHash(a)} ≠ ${mod.canonicalHash(b)}`);
+  check('views/canonical', mod.canonicalHash('') === mod.canonicalHash('#/overview?changes=1'), 'the bare address is not the overview');
+  check('views/canonical', mod.canonicalHash(a) !== mod.canonicalHash('#/overview?changes=4'), 'a filter was lost');
+  check('views/canonical', mod.saveView('Overview, pilot', a) === null, 'could not save a second view');
+  location.hash = b;
+  check('views/canonical', mod.viewsLabel().name === 'Overview, pilot', 'reordered parameters do not match the saved view');
+
+  // Opening one lands on its hash, through the address; then the page moves
+  // on and the control says so, with Update to hand.
+  location.hash = '#/overview';
+  p = panel();
+  await press(p, 'open', 0);
+  check('views/open', location.hash === stored().views[0].hash, `opened at ${location.hash}`);
+  location.hash = '#/machines?tags=site%3Dglasgow&order.machines=-score';
+  check('views/modified', mod.viewsLabel().name === 'Glasgow by name' && mod.viewsLabel().drift, 'a changed view is not marked');
+  p = panel();
+  check('views/modified', textOf(p).includes('Changed since you opened “Glasgow by name”.'), `the panel said ${textOf(p)}`);
+  await press(p, 'update-opened');
+  check('views/update', stored().views[0].hash === mod.canonicalHash(location.hash) && !mod.viewsLabel().drift,
+    'Update did not take the address on screen');
+
+  // Rename, then delete with its second step — and Keep it, which keeps it.
+  p = panel();
+  await press(p, 'rename', 0);
+  await typeAndSave(p, 'Glasgow, worst first');
+  check('views/rename', stored().views[0].name === 'Glasgow, worst first' && mod.viewsLabel().name === 'Glasgow, worst first',
+    `renamed to ${stored().views[0].name}`);
+  p = panel();
+  await press(p, 'delete', 0);
+  check('views/delete', stored().views.length === 2 && textOf(p).includes('Delete “Glasgow, worst first”?'),
+    'delete did not ask first');
+  await fire(findAll(p, (n) => n.tagName === 'button' && n.textContent === 'Keep it')[0]);
+  check('views/delete', stored().views.length === 2, 'Keep it deleted it');
+  await press(p, 'delete', 0);
+  await press(p, 'delete-confirm');
+  check('views/delete', stored().views.length === 1 && stored().views[0].name === 'Overview, pilot', 'delete did not delete');
+
+  // The default: marked, opened on a bare address, never over a named one.
+  p = panel();
+  await press(p, 'default', 0);
+  check('views/default', stored().default === 'Overview, pilot', 'the default was not stored');
+  p = panel();
+  check('views/default', findAll(p, (n) => String(n.className).includes('views-default')).length === 1
+    && findAll(p, (n) => n.textContent === 'Unset default').length === 1, 'the default is not marked, or cannot be unset');
+  mod.loadViews();
+  check('views/default', mod.startingView('')?.hash === stored().views[0].hash, 'a bare address does not open the default');
+  check('views/default', mod.startingView('#/machines') === null, 'the default overrode a link');
+  check('views/default', mod.startingView('#/overview') === null, 'the default overrode #/overview');
+
+  // Export, then import into an empty browser: the same views, and the
+  // default stays behind, as one browser's choice.
+  const file = mod.exportViews();
+  const exported = JSON.parse(file);
+  check('views/export', exported.version === 1 && exported.views.length === 1 && !('default' in exported), `exported ${file}`);
+  store.m.clear();
+  mod.loadViews();
+  let r = mod.importViews(file);
+  check('views/import', !r.error && r.added === 1 && JSON.stringify(stored().views) === JSON.stringify(exported.views),
+    `round trip: ${JSON.stringify(r)} → ${store.getItem('lbf-views')}`);
+  // The collision rule: the file's address wins, under the name already here.
+  r = mod.importViews(JSON.stringify({ version: 1, views: [
+    { name: 'overview, PILOT', hash: '#/overview?changes=13' }, { name: 'New one', hash: '#/groups?by=os' },
+  ] }));
+  check('views/import', r.added === 1 && r.replaced === 1 && stored().views[0].name === 'Overview, pilot'
+    && stored().views[0].hash === '#/overview?changes=13', `merged as ${JSON.stringify(r)} → ${store.getItem('lbf-views')}`);
+  // Wrong shapes are refused whole, and nothing changes.
+  const before = store.getItem('lbf-views');
+  for (const bad of ['not json', '[]', '{"version":2,"views":[]}', '{"version":1,"views":"x"}',
+    '{"version":1,"views":[{"name":"x","hash":"https://elsewhere.example/"}]}',
+    '{"version":1,"views":[{"name":"a","hash":"#/"},{"name":"A","hash":"#/"}]}',
+    JSON.stringify({ version: 1, views: Array.from({ length: 51 }, (_, i) => ({ name: `v${i}`, hash: '#/' })) })]) {
+    const refused = mod.importViews(bad);
+    check('views/import', !!refused.error, `accepted ${bad.slice(0, 60)}`);
+  }
+  check('views/import', store.getItem('lbf-views') === before, 'a refused file changed the list');
+
+  // The cap, said rather than silent — and an import that would pass it is
+  // refused whole.
+  store.m.clear();
+  mod.loadViews();
+  for (let i = 0; i < mod.VIEWS_MAX; i += 1) mod.saveView(`View ${i}`, `#/machines?q=${i}`);
+  check('views/cap', stored().views.length === mod.VIEWS_MAX, `${stored().views.length} saved`);
+  check('views/cap', /50 views is the most/.test(mod.saveView('One more', '#/groups') || ''), 'the cap was silent');
+  r = mod.importViews(JSON.stringify({ version: 1, views: [{ name: 'Over the top', hash: '#/groups' }] }));
+  check('views/cap', /Nothing was imported/.test(r.error || '') && stored().views.length === mod.VIEWS_MAX,
+    'an import past the cap was not refused');
+
+  // Corrupt storage, or a version from the future: ignored without a throw,
+  // left exactly as it was, and saving over it refused.
+  for (const corrupt of ['{oops', '{"version":9,"views":[]}', '{"version":1,"views":[{"name":""}]}', '"a string"']) {
+    store.m.clear();
+    store.setItem('lbf-views', corrupt);
+    try {
+      mod.loadViews();
+      check('views/corrupt', mod.saved.status === 'unreadable' && mod.saved.doc.views.length === 0,
+        `${corrupt} read as ${mod.saved.status}`);
+      check('views/corrupt', !!mod.saveView('Anything', '#/groups'), `saved over ${corrupt}`);
+      check('views/corrupt', store.getItem('lbf-views') === corrupt, `${corrupt} was overwritten`);
+      p = panel();
+      check('views/corrupt', textOf(p).includes('cannot read') && !findAll(p, (n) => n.dataset?.action === 'save').length,
+        'the panel does not say why it cannot save');
+    } catch (err) {
+      failures.push(`views/corrupt: ${corrupt} threw ${err.message}`);
+    }
+  }
+  // Discard is the deliberate way out, in two steps.
+  p = panel();
+  await press(p, 'discard');
+  await press(p, 'discard-confirm');
+  check('views/corrupt', mod.saved.status === 'ok' && store.getItem('lbf-views') === null, 'discarding did not clear them');
+
+  // No storage at all: a browser that throws on touching it, and one whose
+  // writes fail. The control still copies a link, and says why it cannot save.
+  for (const [what, broken] of [
+    ['throws', { getItem() { throw new Error('SecurityError'); }, setItem() { throw new Error('SecurityError'); }, removeItem() {} }],
+    ['full', { getItem: () => null, setItem() { throw new Error('QuotaExceededError'); }, removeItem() {} }],
+  ]) {
+    globalThis.localStorage = broken;
+    try {
+      mod.loadViews();
+      check(`views/unavailable/${what}`, mod.saved.status === 'unavailable', `read as ${mod.saved.status}`);
+      check(`views/unavailable/${what}`, /not available in this browser/.test(mod.saveView('x', '#/groups') || ''),
+        'saving did not say it is unavailable');
+      p = panel();
+      check(`views/unavailable/${what}`, textOf(p).includes('not available in this browser')
+        && findAll(p, (n) => n.dataset?.action === 'copy').length === 1
+        && !findAll(p, (n) => n.dataset?.action === 'save').length, 'the panel does not offer Copy link alone');
+      // No clipboard here either: the link is put in a field instead.
+      await press(p, 'copy');
+      check(`views/unavailable/${what}`, mod.viewsUi.copyField && /copy it from there/.test(mod.viewsUi.note),
+        'Copy link has no fallback');
+      mod.viewsUi.copyField = false;
+    } catch (err) {
+      failures.push(`views/unavailable/${what}: threw ${err.message}`);
+    }
+  }
+  // Nothing saved holds more than the address: a name and a hash per view.
+  globalThis.localStorage = memoryStorage();
+  mod.loadViews();
+  mod.saveView('Plain', '#/machines?q=PC');
+  const doc = JSON.parse(globalThis.localStorage.getItem('lbf-views'));
+  check('views/contents', JSON.stringify(Object.keys(doc).sort()) === '["default","version","views"]'
+    && doc.views.every((v) => JSON.stringify(Object.keys(v).sort()) === '["hash","name"]'), `stored ${JSON.stringify(doc)}`);
+  notes.push('views: save, rename, update, delete, default, canonical match, export and import, the cap, '
+    + 'corrupt and unavailable storage');
+  globalThis.localStorage = realStorage;
+  mod.saved.opened = null;
+  mod.loadViews();
+  location.hash = '';
 }
 
 /* ------------------------------------------------------------------ report */

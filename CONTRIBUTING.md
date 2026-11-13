@@ -62,13 +62,19 @@ All of it must pass. Some notes on why it's shaped like that:
   its own box, bars within spec, markers carrying their surface ring, hit
   targets big enough to hit, axis labels that fit their band and never repeat.
   It builds its snapshot by running the binary over the fixtures, so it can't
-  drift from the API.
+  drift from the API. It also holds the address to being the whole view —
+  every tab's settings written to a hash and read back, and every older link
+  written back unchanged — and puts saved views through storage that is
+  empty, corrupt, full or missing.
 - **`node scripts/check-mobile.mjs`** does the half of that a DOM shim cannot:
   it starts the binary, lays the real page out in headless Chrome at 390, 320,
   768 and 1440 pixels wide, and fails if anything scrolls sideways, is painted
   past the right edge, clips instead of scrolling, or is too small to tap —
-  then once more under print media at the width of an A4 page, where the
-  chrome must be gone and the report must fit. It skips itself with a message
+  the saved views panel open as well as closed — then once more under print
+  media at the width of an A4 page, where the chrome must be gone and the
+  report must fit. Then it saves, opens, updates and deletes a view through
+  the panel with the browser's own storage, and sets each tab by hand and
+  checks its address reopens it the same. It skips itself with a message
   where there is no browser to drive.
 
 Match the style of the surrounding code — comment density, naming, idiom.

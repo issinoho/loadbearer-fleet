@@ -800,6 +800,83 @@ table.compare .compare-component th { font-weight: 600; }
   .topbar-actions .btn-icon { display: inline; font-size: 15px; line-height: 1; }
 }
 
+/* ---------- saved views ---------- */
+
+.views { display: flex; }
+.views-button { display: inline-flex; align-items: center; max-width: 260px; }
+.views-label { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
+/* A name is whatever someone typed, so it truncates inside the button rather
+   than widening the action row; the title and the aria-label carry all of it. */
+.views-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.views-drift { color: var(--text-muted); white-space: nowrap; }
+.views-caret { font-size: 10px; color: var(--text-muted); }
+
+/* The panel hangs from the header's right edge rather than from the button:
+   the button lands wherever the action row wraps it, and anchored to it the
+   panel ran off the left of a 320px phone. From the header it is in the same
+   place at every width, and never wider than the screen. */
+.views-panel[hidden] { display: none; }
+.views-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 12px;
+  z-index: 30;
+  width: min(380px, calc(100% - 24px));
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  font-size: 13px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.views-panel p { margin: 0; }
+.views-head, .views-actions, .views-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.views-where { flex: 1 1 160px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.views-blocked, .views-note { color: var(--text-secondary); overflow-wrap: anywhere; }
+.views-blocked { display: flex; flex-direction: column; gap: 8px; }
+.views-note:empty { display: none; }
+.views-empty { color: var(--text-muted); }
+
+.views-input {
+  flex: 1 1 160px;
+  min-width: 0;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+
+.views-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--grid); }
+.views-item { display: flex; flex-direction: column; gap: 4px; padding: 8px 0; border-bottom: 1px solid var(--grid); }
+.views-item-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.views-open { flex: 1 1 auto; min-width: 0; justify-content: flex-start; text-align: left; }
+.views-open-name { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The one on screen, marked by its border and `aria-current` rather than by
+   colour alone. */
+.views-here .views-open { border-color: var(--series-1); box-shadow: inset 2px 0 0 var(--series-1); }
+.views-item-actions { display: flex; flex-wrap: wrap; gap: 2px 4px; }
+.views-item-actions .btn { padding-left: 6px; padding-right: 6px; }
+.views-confirm-text { font-weight: 600; overflow-wrap: anywhere; }
+
+@media (max-width: 820px) {
+  /* Static below this width (it does not stick), so the panel needs its own
+     containing block to hang from. */
+  .topbar { position: relative; }
+}
+
+@media (pointer: coarse) {
+  .views-input { min-height: 40px; }
+}
+
 /* ---------- downloads and the printed report ---------- */
 
 /* A download is a link, so the browser saves the file and the server names
