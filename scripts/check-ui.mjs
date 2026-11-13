@@ -1488,9 +1488,114 @@ function heatRows(h) {
     check('machine', !text.includes('NaN'), 'the word "NaN" reached the page');
     notes.push(`machine: ${auditTree('machine', h)} chart(s), ${text.length} chars of text`);
     check('machine', !text.includes('Judged by'), 'a machine on the fleet-wide lines claims an override');
+    // None of the fixtures was taken by a loadbearer that records the run,
+    // the OS detail or the memory, and this payload has no `memory_modules`
+    // at all, as from a server older than them: nothing is invented.
+    check('machine', text.includes('layout not reported'), 'a run without a memory layout does not say so');
+    check('machine', !text.includes('Run ID') && !text.includes('took '), 'a duration or run ID was invented');
+    check('machine', !text.includes(' slots'), 'a slot count was invented');
   } catch (err) {
     failures.push(`machine: threw ${err.message}`);
   }
+}
+
+// The run, OS-detail and memory blocks of a loadbearer release after 1.8.1,
+// none of which the fixtures carry: every block, a partial Linux one, and a
+// mixed set of modules too many kinds for one line — each against the same
+// real machine, with only those fields set.
+{
+  const m0 = snapshot.machines.find((x) => (x.os || '').startsWith('Windows 11')) || snapshot.machines[0];
+  const dimm = (size, type, ff, rated, running) => ({
+    position: 0, size_bytes: size, type, form_factor: ff, speed_mts: rated, configured_speed_mts: running,
+  });
+  const GiB = 1024 ** 3;
+  const cases = [
+    {
+      name: 'machine/enriched',
+      machine: {
+        ...m0, os: 'Windows 11 Enterprise', os_edition: 'Enterprise', os_version: '24H2', os_build: '26100.2314',
+        os_distro: null, memory_slots: 4, memory_populated: 2, memory_types: ['DDR5'],
+        run_uuid: '0f8b5a52-7c1e-4c39-9d0e-5a1f3b2c4d6e', run_duration_secs: 472.318,
+      },
+      modules: [dimm(16 * GiB, 'DDR5', 'SODIMM', 5600, 4800), dimm(16 * GiB, 'DDR5', 'SODIMM', 5600, 4800)],
+      want: ['Windows 11 Enterprise · 24H2 · build 26100.2314',
+        '2 of 4 slots · 2 × 16 GiB DDR5 SODIMM, 5600 MT/s (running 4800)',
+        'took 7m 52s', '0f8b5a52-7c1e-4c39-9d0e-5a1f3b2c4d6e', 'Took'],
+      not: ['Enterprise · Enterprise', 'layout not reported'],
+    },
+    {
+      // Linux as root: the distribution already in `os`, a variant that is
+      // not, one slot empty and a module whose firmware gave no speed, and
+      // no run ID.
+      name: 'machine/linux',
+      machine: {
+        ...m0, os: 'Linux (Ubuntu 26.04)', os_distro: 'ubuntu', os_version: '26.04', os_edition: 'server',
+        os_build: null, memory_slots: 2, memory_populated: 1, memory_types: ['DDR4'],
+        run_uuid: null, run_duration_secs: 95.5,
+      },
+      modules: [dimm(8 * GiB, 'DDR4', 'DIMM', null, null)],
+      want: ['Linux (Ubuntu 26.04) · server', '1 of 2 slots · 8 GiB DDR4 DIMM', 'took 1m 36s'],
+      not: ['ubuntu', '· build', 'Run ID', 'MT/s', 'layout not reported'],
+    },
+    {
+      // Unprivileged Linux: os-release, and no memory block at all.
+      name: 'machine/linux-user',
+      machine: {
+        ...m0, os: 'Linux (Debian GNU/Linux 13)', os_distro: 'debian', os_version: '13', os_edition: null,
+        os_build: null, memory_slots: null, memory_populated: null, memory_types: [],
+        run_uuid: null, run_duration_secs: null,
+      },
+      modules: [],
+      want: ['Linux (Debian GNU/Linux 13)', 'layout not reported'],
+      not: ['debian', 'took ', ' slots'],
+    },
+    {
+      name: 'machine/mixed-memory',
+      machine: {
+        ...m0, memory_slots: 4, memory_populated: 4, memory_types: ['DDR4'], run_duration_secs: 3725,
+      },
+      modules: [dimm(16 * GiB, 'DDR4', 'DIMM', 3200, 2666), dimm(16 * GiB, 'DDR4', 'DIMM', 3200, 2666),
+        dimm(8 * GiB, 'DDR4', 'DIMM', 2666, 2666), dimm(512 * 1024 ** 2, 'DDR4', 'DIMM', 2400, null)]
+        .map((x, i) => ({ ...x, position: i })),
+      want: ['4 of 4 slots · 4 modules of 3 kinds, listed below', 'Memory', 'Rated', 'Running', '512 MiB',
+        '2400 MT/s', 'took 1h 02m'],
+      not: [],
+    },
+  ];
+  const before = { view: mod.state.view, tables: mod.state.tables };
+  for (const c of cases) {
+    const history = [
+      { grade: m0.grade, tool_version: '1.8.1', partial: false, thermal_limited: null, on_ac: null,
+        comparability: m0.comparability, run_id: 1, taken_at: '2026-05-01T09:00:00Z', score: 1000,
+        source_path: 'a.json', duration_secs: null, run_uuid: null },
+      { grade: c.machine.grade, tool_version: c.machine.tool_version, partial: false, thermal_limited: null,
+        on_ac: null, comparability: c.machine.comparability, run_id: c.machine.run_id, taken_at: c.machine.taken_at,
+        score: c.machine.score, source_path: c.machine.source_path, duration_secs: c.machine.run_duration_secs,
+        run_uuid: c.machine.run_uuid },
+    ];
+    globalThis.fetch = () => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        machine: c.machine, flags: [], cohort: null, history, subtests: [], drives: [], memory_modules: c.modules,
+      }),
+      text: () => Promise.resolve(''),
+    });
+    // The history as its table, which is where each run's duration is.
+    Object.assign(mod.state, { view: 'machine', tables: { ...before.tables, machine: ['history'] } });
+    const h = host(1200);
+    try {
+      await mod.renderMachine(h, c.machine.key);
+      const text = textOf(h);
+      for (const w of c.want) check(c.name, text.includes(w), `"${w}" is missing`);
+      for (const w of c.not) check(c.name, !text.includes(w), `"${w}" should not be there`);
+      check(c.name, !text.includes('undefined') && !text.includes('NaN') && !text.includes('null'),
+        'undefined, NaN or null reached the page');
+      auditTree(c.name, h);
+    } catch (err) {
+      failures.push(`${c.name}: threw ${err.message}`);
+    }
+  }
+  Object.assign(mod.state, before);
 }
 
 // Machines an override judges against other lines, from a snapshot the binary

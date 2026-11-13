@@ -82,6 +82,8 @@ pub struct RunRef {
     pub power_plan: Option<String>,
     pub power_mode: Option<String>,
     pub power_held_back: Option<String>,
+    /// How long the run's benchmarks took (a loadbearer release after 1.8.1).
+    pub duration_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -316,7 +318,7 @@ fn load_run(conn: &Connection, run_id: i64) -> Result<RunRef> {
                 build_isa, overall_score, overall_grade, system_model, cpu_family,
                 cpu_launched, firmware_dated, drive_power_on_hours, drive_wear_pct,
                 battery_cycles, drive_hours_undercounted, on_ac, power_plan, power_mode,
-                power_held_back
+                power_held_back, run_duration_secs
            FROM run WHERE id = ?1",
         [run_id],
         |r| {
@@ -359,6 +361,7 @@ fn load_run(conn: &Connection, run_id: i64) -> Result<RunRef> {
                 power_held_back: r
                     .get::<_, Option<String>>(21)?
                     .map(|h| h.replace(" | ", ", ")),
+                duration_secs: r.get(22)?,
             })
         },
     );

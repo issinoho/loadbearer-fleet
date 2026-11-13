@@ -175,6 +175,106 @@ function powerFact(m) {
   return parts.join(' · ') + (held ? ` — held back by ${held}` : '');
 }
 
+/** "took 7m 52s", as loadbearer's own summary words a run's duration, or null
+ *  for a run that didn't record one. */
+function took(secs) {
+  if (secs === null || secs === undefined || !Number.isFinite(secs) || secs < 0) return null;
+  const s = Math.round(secs);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+}
+
+/** Windows' `EditionID` against the words `os` uses for the same edition, so
+ *  "Windows 11 Pro" isn't followed by "Professional". */
+const EDITION_WORDS = {
+  professional: 'pro', core: 'home', enterprises: 'enterprise ltsc',
+  professionalworkstation: 'pro for workstations', serverstandard: 'standard', serverdatacenter: 'datacenter',
+};
+
+/** Whether `os` already says `part`, as a whole word — "13" is in
+ *  "Debian GNU/Linux 13" but not in "130". */
+function says(os, part) {
+  const esc = part.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^a-z0-9])${esc}($|[^a-z0-9])`).test(os.toLowerCase());
+}
+
+/** The OS line: the free-text `os`, then whatever of a loadbearer release
+ *  after 1.8.1's `os_detail` it doesn't already say — "Windows 11 Enterprise ·
+ *  24H2 · build 26100.2314", or "Linux (Ubuntu 26.04) · server". */
+function osFact(m) {
+  const os = m.os || '';
+  const parts = [];
+  const add = (v) => { if (v && !(os && says(os, v)) && !parts.includes(v)) parts.push(v); };
+  const edition = () => {
+    if (!m.os_edition) return;
+    const alias = EDITION_WORDS[m.os_edition.toLowerCase()];
+    if (!(alias && os && says(os, alias))) add(m.os_edition);
+  };
+  // Windows reads edition then release ("Enterprise · 24H2"), Linux release
+  // then variant ("ubuntu · 26.04 · server"), as loadbearer's `info` does.
+  if (!m.os_distro) edition();
+  add(m.os_distro);
+  add(m.os_version);
+  if (m.os_distro) edition();
+  const head = [os || (parts.length ? null : 'unknown'), ...parts].filter(Boolean).join(' · ');
+  return m.os_build && !(os && says(os, m.os_build)) ? `${head} · build ${m.os_build}` : head;
+}
+
+/** "16 GiB", or "512 MiB" for a module too small for whole GiB. */
+function moduleSize(bytes) {
+  if (bytes === null || bytes === undefined) return null;
+  return bytes >= 1024 ** 3 ? gib(bytes) : `${nf0.format(bytes / 1024 ** 2)} MiB`;
+}
+
+/** One module in words — "16 GiB DDR5 SODIMM, 5600 MT/s (running 4800)" —
+ *  with the rated and the running speed side by side and no judgement: memory
+ *  held below its rating is common, and usually the platform's doing. */
+function moduleWords(x) {
+  const words = [moduleSize(x.size_bytes), x.type, x.form_factor].filter(Boolean).join(' ');
+  const r = x.speed_mts;
+  const c = x.configured_speed_mts;
+  const has = (v) => v !== null && v !== undefined;
+  // Plain digits, as a speed grade is written: "DDR5-5600", not "5,600".
+  const speed = has(r) && has(c) && r !== c ? `${r} MT/s (running ${c})`
+    : has(r) ? `${r} MT/s`
+      : has(c) ? `running ${c} MT/s` : null;
+  return [words, speed].filter(Boolean).join(', ');
+}
+
+/** Identical modules counted together, in slot order: [["16 GiB DDR5 …", 2]]. */
+function moduleGroups(modules) {
+  const groups = [];
+  for (const x of modules) {
+    const w = moduleWords(x);
+    if (!w) continue;
+    const g = groups.find(([words]) => words === w);
+    if (g) g[1] += 1; else groups.push([w, 1]);
+  }
+  return groups;
+}
+
+/** More kinds of module than this, and the Memory line counts them and a
+ *  table lists them, rather than one line running on. */
+const MODULE_KINDS_IN_A_LINE = 2;
+
+/** The Memory line: the total, then the layout — "16 GiB · 2 of 4 slots ·
+ *  2 × 8 GiB DDR5 SODIMM, 5600 MT/s (running 4800)". Without a layout it says
+ *  "not reported", as Serial does: Linux reads it only as root, and older
+ *  runs don't record it, neither of which says anything about the memory. */
+function memoryFact(m, modules) {
+  const has = (v) => v !== null && v !== undefined;
+  const slots = has(m.memory_populated) && has(m.memory_slots) ? `${m.memory_populated} of ${m.memory_slots} slots`
+    : has(m.memory_slots) ? `${m.memory_slots} slots`
+      : has(m.memory_populated) ? `${m.memory_populated} populated` : null;
+  const groups = moduleGroups(modules);
+  const kinds = groups.length > MODULE_KINDS_IN_A_LINE
+    ? [`${modules.length} modules of ${groups.length} kinds, listed below`]
+    : groups.map(([w, n]) => (n > 1 ? `${n} × ${w}` : w));
+  const layout = [slots, ...kinds].filter(Boolean);
+  return [gib(m.ram_bytes), ...(layout.length ? layout : ['layout not reported'])].join(' · ');
+}
+
 /** Each threshold an override can set, as the line it draws. Plain numbers:
  *  these are the values in the config file, and `regression_frac` the one
  *  fraction among them. */
@@ -3603,6 +3703,9 @@ export async function renderMachine(main, key) {
   // Absent from a server older than the drive table, as well as empty for a
   // run that recorded none.
   const drives = payload.drives || [];
+  // Likewise from a server older than the memory-module table.
+  const modules = payload.memory_modules || [];
+  const lasted = took(m.run_duration_secs);
 
   const age = ageFacts(m);
   // The fixed volume with the least free space — what `disk_nearly_full`
@@ -3627,13 +3730,14 @@ export async function renderMachine(main, key) {
       `${m.battery_cycles} cycles`
         + (m.battery_health === null || m.battery_health === undefined ? '' : ` · ${nf0.format(m.battery_health)}% of design capacity`)]]),
     ['Cores', `${m.cpu_cores} logical`],
-    ['Memory', gib(m.ram_bytes)],
-    ['OS', m.os || 'unknown'],
+    ['Memory', memoryFact(m, modules)],
+    ['OS', osFact(m)],
     ['Architecture', m.arch],
     ['Serial', m.serial || 'not reported'],
     ['Asset tag', m.asset_tag || 'not reported'],
     ['Attributed by', m.key_kind],
-    ['Measured', `${when(m.taken_at)} (${ago(m.age_days)})`],
+    ['Measured', `${when(m.taken_at)} (${ago(m.age_days)})${lasted ? ` · took ${lasted}` : ''}`],
+    ...(m.run_uuid ? [['Run ID', m.run_uuid]] : []),
     ['loadbearer', m.tool_version],
     ['Configuration', `${m.comparability.preset} · ${m.comparability.profile} · ${m.comparability.baseline} · ${m.comparability.build_isa}`],
     ['Source', m.source_path],
@@ -3697,9 +3801,12 @@ export async function renderMachine(main, key) {
     },
     table: () => dataTable({
       columns: [{ label: 'Measured' }, { label: 'Score', num: true }, { label: 'Grade' },
-        { label: 'Configuration' }, { label: 'Caveats', wrap: true }, { label: 'loadbearer' }],
+        { label: 'Took', num: true }, { label: 'Configuration' }, { label: 'Caveats', wrap: true },
+        { label: 'loadbearer' }],
       rows: points.slice().reverse().map((p) => ({
         cells: [when(p.taken_at), num(p.score, 0), p.grade,
+          // Blank for a run whose loadbearer didn't record it.
+          took(p.duration_secs),
           `${p.comparability.preset} · ${p.comparability.build_isa}`,
           [p.thermal_limited ? 'clocks fell' : null, p.on_ac === false ? 'on battery' : null,
             p.partial ? 'partial' : null].filter(Boolean).join(', ') || 'none',
@@ -3783,6 +3890,28 @@ export async function renderMachine(main, key) {
     ])
     : null;
 
+  // Only where the Memory line would run on: a mixed set of more kinds than
+  // fit in it. Rated and running speed side by side, and no verdict — memory
+  // held below its rating is usually the platform's limit, not a fault.
+  const mts = (v) => (v === null || v === undefined ? null : `${v} MT/s`);
+  const memoryCard = moduleGroups(modules).length > MODULE_KINDS_IN_A_LINE
+    ? el('div', { class: 'card col-12' }, [
+      el('div', { class: 'card-head' }, [el('h3', { text: 'Memory' })]),
+      el('p', {
+        class: 'card-sub',
+        text: 'Each filled slot, as of the latest run. Blank cells are figures the firmware doesn’t report.',
+      }),
+      dataTable({
+        columns: [{ label: 'Module', num: true }, { label: 'Size', num: true }, { label: 'Type' },
+          { label: 'Form factor' }, { label: 'Rated', num: true }, { label: 'Running', num: true }],
+        rows: modules.map((x) => ({
+          cells: [x.position + 1, moduleSize(x.size_bytes), x.type, x.form_factor,
+            mts(x.speed_mts), mts(x.configured_speed_mts)],
+        })),
+      }),
+    ])
+    : null;
+
   const measurementCard = el('div', { class: 'card col-12' }, [
     el('div', { class: 'card-head' }, [el('h3', { text: 'Measurements' })]),
     el('p', {
@@ -3811,8 +3940,8 @@ export async function renderMachine(main, key) {
       type: 'button', class: 'link-button', text: '← All machines',
       onclick: () => writeHash({ view: 'machines', key: null }),
     })]),
-    el('div', { class: 'grid' }, [head, heroCard, historyCard, componentCard, flagCard, driveCard, measurementCard]
-      .filter(Boolean)),
+    el('div', { class: 'grid' }, [head, heroCard, historyCard, componentCard, flagCard, driveCard, memoryCard,
+      measurementCard].filter(Boolean)),
   );
 }
 
@@ -3942,6 +4071,7 @@ function compareTable(data) {
     ['Drive', facts.map((f) => f.drive || '—')],
     ['Battery', data.runs.map((r) => (r.battery_cycles === null || r.battery_cycles === undefined ? '—' : `${r.battery_cycles} cycles`))],
     ['Power', data.runs.map((r) => powerFact(r) || '—')],
+    ['Took', data.runs.map((r) => took(r.duration_secs) || '—')],
   ].filter(([, cells]) => cells.some((c) => c !== '—'));
   if (machineRows.length) {
     rows.push(el('tr', { class: 'compare-component' }, [

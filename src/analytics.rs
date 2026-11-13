@@ -388,6 +388,41 @@ const DRIVE_COLUMNS: &str = "d.position, d.device, d.interface, d.model, d.power
      d.power_cycles, d.unsafe_shutdowns, d.percentage_used, d.available_spare_pct, \
      d.data_written_tb, d.media_errors, d.critical_warning";
 
+/// One memory module, as recorded with a run (a loadbearer release after
+/// 1.8.1). Every field is optional: firmware reports junk often enough that the
+/// CLI leaves out anything unknown, and absent is never read as zero.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleView {
+    pub position: i64,
+    pub size_bytes: Option<i64>,
+    /// `DDR4`, `DDR5`, `LPDDR5`, … — named as the document names it.
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub form_factor: Option<String>,
+    /// Rated, and what it runs at. Shown side by side and judged by no rule:
+    /// memory held below its rating is common, and usually the platform's
+    /// limit rather than a fault.
+    pub speed_mts: Option<i64>,
+    pub configured_speed_mts: Option<i64>,
+}
+
+impl ModuleView {
+    fn from_row(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Self> {
+        Ok(ModuleView {
+            position: r.get(at)?,
+            size_bytes: r.get(at + 1)?,
+            kind: r.get(at + 2)?,
+            form_factor: r.get(at + 3)?,
+            speed_mts: r.get(at + 4)?,
+            configured_speed_mts: r.get(at + 5)?,
+        })
+    }
+}
+
+/// The columns `ModuleView::from_row` reads, in its order.
+const MODULE_COLUMNS: &str = "mm.position, mm.size_bytes, mm.type, mm.form_factor, mm.speed_mts, \
+     mm.configured_speed_mts";
+
 /// NVMe's critical-warning bits, in words. Bits past these are reserved or
 /// newer than this table, and are reported by number rather than guessed at.
 fn critical_warning_words(bits: i64) -> Vec<String> {
@@ -568,6 +603,30 @@ pub struct MachineView {
     pub disk_low_mount: Option<String>,
     pub disk_low_free_pct: Option<f64>,
     pub disk_low_free_bytes: Option<i64>,
+    /// The OS release in parts, from a loadbearer release after 1.8.1's
+    /// `machine.os_detail`: on Windows the display version, the build with its
+    /// update revision and the edition; on Linux the os-release ID, version
+    /// and variant. `None` where the run didn't record it.
+    pub os_distro: Option<String>,
+    pub os_version: Option<String>,
+    pub os_build: Option<String>,
+    pub os_edition: Option<String>,
+    /// Memory slots for system RAM, and how many are filled, from
+    /// `machine.memory`. `None` is unknown — Linux without root, or an older
+    /// CLI — and never "no slots".
+    pub memory_slots: Option<i64>,
+    pub memory_populated: Option<i64>,
+    /// The distinct module types of the latest run, in slot order: `["DDR5"]`.
+    /// Empty when no module recorded one.
+    pub memory_types: Vec<String>,
+    /// Every module of the latest run. Not serialised, like `drives`: the
+    /// drilldown gets them from `detail`.
+    #[serde(skip)]
+    pub memory_modules: Vec<ModuleView>,
+    /// The latest run's random ID (`run.id`, not this index's `run_id`) and
+    /// how long its benchmarks took.
+    pub run_uuid: Option<String>,
+    pub run_duration_secs: Option<f64>,
     /// Every drive of the latest run, for the rules. Not serialised: the
     /// snapshot ships every machine, and the drilldown, which wants these,
     /// gets them from `detail` instead.
@@ -1436,6 +1495,20 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
         }
     }
 
+    let mut modules: HashMap<i64, Vec<ModuleView>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT mm.run_id, {MODULE_COLUMNS} FROM memory_module mm \
+             JOIN ({chosen}) l ON l.id = mm.run_id ORDER BY mm.run_id, mm.position"
+        ))?;
+        for row in stmt.query_map(bind(), |r| {
+            Ok((r.get::<_, i64>(0)?, ModuleView::from_row(r, 1)?))
+        })? {
+            let (id, m) = row?;
+            modules.entry(id).or_default().push(m);
+        }
+    }
+
     // loadbearer's own confidence verdict, not a cv threshold re-derived here:
     // it already folds in the thermal downgrade, so a run whose clocks fell
     // counts as shaky without this module having to decide that a second time.
@@ -1461,7 +1534,8 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
                 firmware_likely_original, drive_power_on_hours, drive_wear_pct,
                 drive_hours_undercounted, power_plan, power_mode, power_held_back,
                 bios_version, bios_date, disk_low_mount, disk_low_free_pct,
-                disk_low_free_bytes
+                disk_low_free_bytes, os_distro, os_version, os_build, os_edition,
+                memory_slots, memory_populated, run_uuid, run_duration_secs
            FROM run WHERE id IN ({chosen}) ORDER BY machine_key"
     ))?;
 
@@ -1489,6 +1563,13 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
             _ => r.get(29)?,
         };
         let drives = drives.remove(&run_id).unwrap_or_default();
+        let memory_modules = modules.remove(&run_id).unwrap_or_default();
+        let mut memory_types: Vec<String> = Vec::new();
+        for t in memory_modules.iter().filter_map(|m| m.kind.as_ref()) {
+            if !memory_types.contains(t) {
+                memory_types.push(t.clone());
+            }
+        }
         let drive_wear_pct: Option<i64> = r.get(33)?;
         Ok(MachineView {
             // Set by `place`, against whichever "now" this run is seen from.
@@ -1557,6 +1638,16 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
             disk_low_mount: r.get(40)?,
             disk_low_free_pct: r.get(41)?,
             disk_low_free_bytes: r.get(42)?,
+            os_distro: r.get(43)?,
+            os_version: r.get(44)?,
+            os_build: r.get(45)?,
+            os_edition: r.get(46)?,
+            memory_slots: r.get(47)?,
+            memory_populated: r.get(48)?,
+            memory_types,
+            memory_modules,
+            run_uuid: r.get(49)?,
+            run_duration_secs: r.get(50)?,
             drives,
             low_confidence_cpu_subtests: low_conf.get(&run_id).copied().unwrap_or(0),
             tags: tags.remove(&run_id).unwrap_or_default(),
@@ -2370,7 +2461,8 @@ pub struct Filter {
     pub cpu_model: Option<String>,
     pub os: Option<String>,
     /// Case-insensitive substring of hostname, key, serial, asset tag, system
-    /// model, CPU, power plan, power mode or any tag value.
+    /// model, CPU, power plan, power mode, OS edition, version or build,
+    /// memory type, or any tag value.
     pub search: Option<String>,
     /// Only machines carrying a flag with this code.
     pub flag: Option<String>,
@@ -2471,9 +2563,16 @@ impl Filter {
                 m.system_model.as_deref(),
                 plan.as_deref(),
                 mode.as_deref(),
+                // The parts of the OS release `os` does not reliably carry —
+                // `24H2`, a build, `Enterprise` — and the memory type, so
+                // "which machines are still on DDR4" is a search.
+                m.os_edition.as_deref(),
+                m.os_version.as_deref(),
+                m.os_build.as_deref(),
             ]
             .into_iter()
             .flatten()
+            .chain(m.memory_types.iter().map(String::as_str))
             // Tag *values* as well, so whatever the deployment tool labels a
             // machine with is findable by typing it. Values only, not keys: a
             // search for "site" should not return the whole estate because
@@ -3013,6 +3112,11 @@ pub struct HistoryPoint {
     pub on_ac: Option<bool>,
     pub partial: bool,
     pub source_path: String,
+    /// How long the run's benchmarks took, and its own random ID — `run.id`
+    /// in the document, which is not this index's `run_id`. `None` for a run
+    /// from a loadbearer that didn't record them.
+    pub duration_secs: Option<f64>,
+    pub run_uuid: Option<String>,
 }
 
 /// A single measurement, for the drilldown table.
@@ -3040,6 +3144,10 @@ pub struct Detail {
     /// Empty for a run from before loadbearer 1.6.0 or without admin / root,
     /// and for one indexed before this build until `scan --reindex`.
     pub drives: Vec<DriveView>,
+    /// Every memory module of the latest run, in the document's order. Empty
+    /// for a run from a loadbearer that didn't record them, for Linux without
+    /// root, and for one indexed before this build until `scan --reindex`.
+    pub memory_modules: Vec<ModuleView>,
 }
 
 /// The per-machine detail the drilldown needs, which the fleet snapshot
@@ -3050,7 +3158,8 @@ pub struct Detail {
 pub fn detail(conn: &Connection, machine_key: &str, latest_run: i64) -> Result<Detail> {
     let mut stmt = conn.prepare(
         "SELECT id, taken_at, overall_score, overall_grade, tool_version, preset, profile,
-                baseline, build_isa, thermal_limited, on_ac, partial, source_path
+                baseline, build_isa, thermal_limited, on_ac, partial, source_path,
+                run_duration_secs, run_uuid
            FROM run WHERE machine_key = ?1 ORDER BY taken_at, id",
     )?;
     let history = stmt
@@ -3071,6 +3180,8 @@ pub fn detail(conn: &Connection, machine_key: &str, latest_run: i64) -> Result<D
                 on_ac: r.get(10)?,
                 partial: r.get(11)?,
                 source_path: r.get(12)?,
+                duration_secs: r.get(13)?,
+                run_uuid: r.get(14)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3103,10 +3214,18 @@ pub fn detail(conn: &Connection, machine_key: &str, latest_run: i64) -> Result<D
         .query_map([latest_run], |r| DriveView::from_row(r, 0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MODULE_COLUMNS} FROM memory_module mm WHERE mm.run_id = ?1 ORDER BY mm.position"
+    ))?;
+    let memory_modules = stmt
+        .query_map([latest_run], |r| ModuleView::from_row(r, 0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
     Ok(Detail {
         history,
         subtests,
         drives,
+        memory_modules,
     })
 }
 
@@ -3936,6 +4055,124 @@ mod tests {
             by_key.summary.machines, 0,
             "a tag key is not a value and must not match every machine that has one"
         );
+    }
+
+    /// The OS detail and memory of the latest run reach the view as recorded,
+    /// partial blocks included, and a run without them reads as unknown —
+    /// never as zero slots or no edition.
+    #[test]
+    fn os_detail_and_memory_reach_the_view_as_recorded() {
+        let mut e = Estate::new();
+        e.add_with(
+            "PC-WIN",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            crate::schema::samples::windows,
+        );
+        e.add_with(
+            "PC-ROOT",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            crate::schema::samples::linux_root,
+        );
+        e.add_with(
+            "PC-USER",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            crate::schema::samples::linux_user,
+        );
+        e.add("PC-OLD", 1000.0, "2026-09-01T10:00:00Z");
+        let s = e.snap();
+
+        let win = machine(&s, "PC-WIN");
+        assert_eq!(win.os_edition.as_deref(), Some("Enterprise"));
+        assert_eq!(win.os_version.as_deref(), Some("24H2"));
+        assert_eq!(win.os_build.as_deref(), Some("26100.2314"));
+        assert_eq!(win.os_distro, None);
+        assert_eq!((win.memory_slots, win.memory_populated), (Some(4), Some(2)));
+        assert_eq!(win.memory_types, ["DDR5"], "two modules, one type");
+        assert_eq!(win.memory_modules.len(), 2);
+        assert_eq!(win.run_duration_secs, Some(472.318));
+        assert!(win.run_uuid.is_some());
+
+        let root = machine(&s, "PC-ROOT");
+        assert_eq!(root.os_distro.as_deref(), Some("ubuntu"));
+        assert_eq!(root.os_edition.as_deref(), Some("server"));
+        assert_eq!(root.os_build, None);
+        assert_eq!(
+            (root.memory_slots, root.memory_populated),
+            (Some(2), Some(1))
+        );
+        let only = &root.memory_modules[0];
+        assert_eq!((only.speed_mts, only.configured_speed_mts), (None, None));
+        assert_eq!(root.run_uuid, None, "a run without an ID has none");
+        assert_eq!(root.run_duration_secs, Some(95.5));
+
+        let user = machine(&s, "PC-USER");
+        assert_eq!(user.os_version.as_deref(), Some("13"));
+        assert_eq!((user.memory_slots, user.memory_populated), (None, None));
+        assert!(user.memory_types.is_empty() && user.memory_modules.is_empty());
+
+        let old = machine(&s, "PC-OLD");
+        assert_eq!(
+            (&old.os_edition, old.memory_slots, old.run_duration_secs),
+            (&None, None, None)
+        );
+
+        // The history carries each run's duration and ID; the drilldown the
+        // modules of the latest.
+        let d = detail(e.idx.conn(), &win.key, win.run_id).unwrap();
+        assert_eq!(d.history[0].duration_secs, Some(472.318));
+        assert_eq!(
+            d.history[0].run_uuid.as_deref(),
+            Some("0f8b5a52-7c1e-4c39-9d0e-5a1f3b2c4d6e")
+        );
+        assert_eq!(d.memory_modules.len(), 2);
+        let d = detail(e.idx.conn(), &old.key, old.run_id).unwrap();
+        assert_eq!(d.history[0].duration_secs, None);
+        assert!(d.memory_modules.is_empty());
+    }
+
+    /// `24H2`, `Enterprise`, a build or `DDR4` typed into the search box finds
+    /// the machines that recorded it, and nothing that didn't.
+    #[test]
+    fn search_finds_a_machine_by_edition_build_or_memory_type() {
+        let mut e = Estate::new();
+        e.add_with(
+            "PC-WIN",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            crate::schema::samples::windows,
+        );
+        e.add_with(
+            "PC-ROOT",
+            1000.0,
+            "2026-09-01T10:00:00Z",
+            crate::schema::samples::linux_root,
+        );
+        // `os` says "Windows 11 Enterprise" here too, and `os` is not
+        // searched: an edition the run did not record is not found.
+        e.add("PC-OLD", 1000.0, "2026-09-01T10:00:00Z");
+        let all = e.snap();
+        let hosts = |q: &str| -> Vec<String> {
+            let mut h: Vec<_> = all
+                .filtered(&Filter {
+                    search: Some(q.into()),
+                    ..Default::default()
+                })
+                .machines
+                .iter()
+                .filter_map(|m| m.hostname.clone())
+                .collect();
+            h.sort();
+            h
+        };
+        assert_eq!(hosts("24h2"), ["PC-WIN"]);
+        assert_eq!(hosts("Enterprise"), ["PC-WIN"]);
+        assert_eq!(hosts("26100.2314"), ["PC-WIN"]);
+        assert_eq!(hosts("DDR4"), ["PC-ROOT"]);
+        assert_eq!(hosts("ddr5"), ["PC-WIN"]);
+        assert_eq!(hosts("server"), ["PC-ROOT"]);
     }
 
     /// "Which machines are on Best power efficiency" should be answerable from

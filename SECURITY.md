@@ -26,7 +26,10 @@ within a few days.
 Unlike [loadbearer](https://github.com/issinoho/loadbearer), which is a local
 command-line tool, this is a **long-running HTTP server that holds an inventory
 of an entire estate** — hostnames, firmware serials, asset tags, CPU models,
-disk models and capacities, for every machine that has ever reported. Treat the
+disk models and capacities, the OS build and edition, the memory modules
+fitted, and a random ID per run, for every machine that has ever reported. A
+build and edition across an estate is also a list of which machines are
+behind on updates, so the index is as sensitive as a patch report. Treat the
 index, the archive and the state file as you would any other asset database.
 
 It:

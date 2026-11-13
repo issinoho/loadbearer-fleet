@@ -5,6 +5,31 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## Unreleased
+
+### Added
+
+- **The OS release, the memory layout and how long a run took**, from a
+  loadbearer release after 1.8.1. The machine page's OS line adds the edition,
+  display version and build it didn't already say (`Windows 11 Enterprise ·
+  24H2 · build 26100.2314`); the Memory line gives the slots filled and the
+  modules, rated and running speed side by side (`2 of 4 slots · 2 × 16 GiB
+  DDR5 SODIMM, 5600 MT/s (running 4800)`), with a table for a mixed set; and
+  **Measured**, the score history's table and a comparison say how long each
+  run took, beside its run ID. Memory below its rated speed is shown, not
+  flagged. Search finds a machine by edition, OS version or build and memory
+  type, and the hint names them. The snapshot and the drilldown carry
+  `os_distro`, `os_version`, `os_build`, `os_edition`, `memory_slots`,
+  `memory_populated`, `memory_types`, `run_uuid` and `run_duration_secs`, the
+  drilldown `memory_modules` and each history run's `duration_secs` and
+  `run_uuid`; the machines CSV gains twelve columns for them, after the
+  existing ones and before the tags. Absent is unknown — older runs, and Linux
+  without root for the memory — and reads as "not reported", never zero. The
+  run ID is recorded, not used to tell documents apart: that is still the
+  content hash. An existing index gains the columns and a `memory_module`
+  table on open, with no format change; `scan --reindex` fills them in for the
+  runs it already holds.
+
 ## 0.11.0 - Fri, 13 Nov 2026
 
 **The fleet by component, and ways to take it with you.** A Components tab
