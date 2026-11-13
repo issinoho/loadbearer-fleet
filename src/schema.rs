@@ -16,7 +16,9 @@
 //!   `machine.identity`, `telemetry`, `battery`, and `machine.firmware` /
 //!   `drives` / `age` are all omitted when empty
 //!   or unsupported, and older files predate them entirely — a 1.2.4 result has
-//!   no identity block at all.
+//!   no identity block at all. The same goes for `run`, `machine.os_detail` and
+//!   `machine.memory`, and for every field inside them: absent is unknown,
+//!   never zero, false or "none".
 //! * **Open enumerations stay `String`.** `grade`, `confidence` and
 //!   `representative` are parsed as text rather than enums so that a value this
 //!   build has never heard of degrades to "unrecognised" instead of failing the
@@ -65,6 +67,81 @@ pub struct ResultFile {
     pub gates: Option<Gates>,
     #[serde(default)]
     pub telemetry: Option<Telemetry>,
+    /// Which run this was, when its benchmarks started and how long they took.
+    /// From a loadbearer release after 1.8.1; absent on older files and on a
+    /// synthetic result no run produced.
+    #[serde(default)]
+    pub run: Option<RunInfo>,
+}
+
+/// The `run` block. Every field is optional on its own: the ID is left out
+/// when the OS would not supply randomness, rather than made up.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RunInfo {
+    /// Random, UUID-v4-shaped, generated fresh for each run and derived from
+    /// nothing. It names a run; it is **not** what makes two documents the
+    /// same here — see `Index::ingest_text`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// RFC 3339 UTC. `timestamp` is when the document was written, at the end.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// Wall-clock seconds from `started_at` until the run was scored — the
+    /// `--jitter` wait, the link probe and the soak are not in it.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
+}
+
+/// `machine.os_detail`: the OS release in parts, beside the free-text `os`
+/// and `kernel`. Windows fills `version` (`24H2`), `build` (`26100.2314`) and
+/// `edition` (`Enterprise`); Linux `distro`, `version` and sometimes
+/// `edition`, from os-release's `ID`, `VERSION_ID` and `VARIANT_ID`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OsDetail {
+    #[serde(default)]
+    pub distro: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub build: Option<String>,
+    #[serde(default)]
+    pub edition: Option<String>,
+}
+
+/// `machine.memory`: how the RAM is built, from the SMBIOS memory-device
+/// table. Absent without root on Linux, where that table is root-only — which
+/// says nothing about the memory, so it is never read as "no slots".
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Memory {
+    /// Sockets for system RAM, filled or not.
+    #[serde(default)]
+    pub slots: Option<u32>,
+    #[serde(default)]
+    pub populated: Option<u32>,
+    /// One per filled slot, in table order.
+    #[serde(default)]
+    pub modules: Vec<MemoryModule>,
+}
+
+/// One memory module. Anything the firmware reported as unknown is absent.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MemoryModule {
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    /// `DDR4`, `DDR5`, `LPDDR5`, … — open, so kept as text.
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    /// `DIMM`, `SODIMM`, `Row Of Chips` (soldered), …
+    #[serde(default)]
+    pub form_factor: Option<String>,
+    /// The module's rated speed, MT/s.
+    #[serde(default)]
+    pub speed_mts: Option<u32>,
+    /// What the memory controller runs it at, MT/s. Below `speed_mts` is
+    /// common and often the platform's limit rather than a fault, which is
+    /// why nothing here judges it.
+    #[serde(default)]
+    pub configured_speed_mts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +185,13 @@ pub struct Machine {
     /// Mains or battery and the power settings in force. 1.7.0+.
     #[serde(default)]
     pub power: Option<Power>,
+    /// The OS build, release and edition. A loadbearer release after 1.8.1.
+    #[serde(default)]
+    pub os_detail: Option<OsDetail>,
+    /// Memory slots and modules. A loadbearer release after 1.8.1, and only
+    /// as root on Linux.
+    #[serde(default)]
+    pub memory: Option<Memory>,
 }
 
 /// The power settings a run had. Windows records a power mode for plugged in
@@ -652,5 +736,125 @@ impl ResultFile {
         }
         out.extend(self.notes.iter().cloned());
         out
+    }
+}
+
+/// The blocks a loadbearer release after 1.8.1 adds, for the tests to put on a
+/// real fixture: none of the fixtures was taken by one. Each is shaped as that
+/// CLI writes it — every field optional, nothing written for what it could not
+/// read.
+#[cfg(test)]
+pub(crate) mod samples {
+    use serde_json::{Value, json};
+
+    /// The real fixture, as JSON to mutate.
+    pub(crate) fn fixture(name: &str) -> Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("json")
+    }
+
+    /// Windows-shaped: a run ID and duration, the build, display version and
+    /// edition, and two of four slots filled with matching SODIMMs held below
+    /// their rating.
+    pub(crate) fn windows(d: &mut Value) {
+        d["run"] = json!({
+            "id": "0f8b5a52-7c1e-4c39-9d0e-5a1f3b2c4d6e",
+            "started_at": "2026-09-09T14:42:01.1234567Z",
+            "duration_secs": 472.318
+        });
+        d["machine"]["os_detail"] = json!({
+            "version": "24H2", "build": "26100.2314", "edition": "Enterprise"
+        });
+        d["machine"]["memory"] = json!({
+            "slots": 4, "populated": 2,
+            "modules": [
+                {"size_bytes": 17179869184_u64, "type": "DDR5", "form_factor": "SODIMM",
+                 "speed_mts": 5600, "configured_speed_mts": 4800},
+                {"size_bytes": 17179869184_u64, "type": "DDR5", "form_factor": "SODIMM",
+                 "speed_mts": 5600, "configured_speed_mts": 4800}
+            ]
+        });
+    }
+
+    /// Linux-shaped, as root: the distribution, release and variant and no
+    /// build; one slot of two empty, and a module whose firmware reported no
+    /// speed at all. No `run.id`, as when the OS had no randomness to give.
+    pub(crate) fn linux_root(d: &mut Value) {
+        d["run"] = json!({ "started_at": "2026-09-09T10:00:00Z", "duration_secs": 95.5 });
+        d["machine"]["os_detail"] = json!({
+            "distro": "ubuntu", "version": "26.04", "edition": "server"
+        });
+        d["machine"]["memory"] = json!({
+            "slots": 2, "populated": 1,
+            "modules": [{"size_bytes": 8589934592_u64, "type": "DDR4", "form_factor": "DIMM"}]
+        });
+    }
+
+    /// Linux-shaped, unprivileged: os-release without a variant, and no
+    /// memory block at all.
+    pub(crate) fn linux_user(d: &mut Value) {
+        d["run"] = json!({ "id": "5b1d7e0c-3a2f-4e8b-9c6d-1e2f3a4b5c6d", "duration_secs": 61.0 });
+        d["machine"]["os_detail"] = json!({ "distro": "debian", "version": "13" });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(v: &serde_json::Value) -> ResultFile {
+        ResultFile::from_json(&v.to_string()).expect("parses")
+    }
+
+    #[test]
+    fn a_document_without_the_new_blocks_reads_as_unknown() {
+        let doc = parse(&samples::fixture("legacy-1.2.4.json"));
+        assert!(doc.run.is_none());
+        assert!(doc.machine.os_detail.is_none());
+        assert!(doc.machine.memory.is_none());
+    }
+
+    #[test]
+    fn the_new_blocks_are_read() {
+        let mut v = samples::fixture("win-modern.json");
+        samples::windows(&mut v);
+        let doc = parse(&v);
+        let run = doc.run.expect("run");
+        assert_eq!(
+            run.id.as_deref(),
+            Some("0f8b5a52-7c1e-4c39-9d0e-5a1f3b2c4d6e")
+        );
+        assert_eq!(run.duration_secs, Some(472.318));
+        let os = doc.machine.os_detail.expect("os_detail");
+        assert_eq!(os.build.as_deref(), Some("26100.2314"));
+        assert_eq!(os.distro, None);
+        let mem = doc.machine.memory.expect("memory");
+        assert_eq!((mem.slots, mem.populated), (Some(4), Some(2)));
+        assert_eq!(mem.modules[0].kind.as_deref(), Some("DDR5"));
+        assert_eq!(mem.modules[1].configured_speed_mts, Some(4800));
+    }
+
+    /// Empty blocks, nulls, and fields this build has never heard of — the
+    /// contract says a new optional field is not a breaking change, so one
+    /// inside a new block isn't either.
+    #[test]
+    fn empty_blocks_and_unknown_fields_inside_them_parse() {
+        let mut v = samples::fixture("win-modern.json");
+        v["run"] = json!({});
+        v["machine"]["os_detail"] = json!({ "codename": "noble", "version": null });
+        v["machine"]["memory"] = json!({
+            "channels": 2,
+            "modules": [{ "rank": 2, "voltage_mv": 1100 }, {}]
+        });
+        let doc = parse(&v);
+        assert!(doc.run.expect("run").id.is_none());
+        assert!(doc.machine.os_detail.expect("os").version.is_none());
+        let mem = doc.machine.memory.expect("memory");
+        assert_eq!(mem.slots, None, "absent, not zero");
+        assert_eq!(mem.modules.len(), 2);
+        assert!(mem.modules[0].size_bytes.is_none());
     }
 }

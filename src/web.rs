@@ -4083,6 +4083,161 @@ mod tests {
         );
     }
 
+    /// The fixtures, each machine re-measured later by a loadbearer that
+    /// records the run, the OS detail and the memory: Glasgow's Windows
+    /// machine with every block, one Edinburgh machine as root on Linux, the
+    /// other unprivileged. The 1.2.4 machine keeps none.
+    fn state_with_enriched_runs(config: &Config) -> Arc<AppState> {
+        use crate::schema::samples;
+        let state = state_for(config);
+        {
+            let mut idx = state.index.lock().expect("index");
+            for (name, enrich) in [
+                (
+                    "win-modern.json",
+                    samples::windows as fn(&mut serde_json::Value),
+                ),
+                ("linux-throttled.json", samples::linux_root),
+                ("low-end.json", samples::linux_user),
+            ] {
+                let mut doc = samples::fixture(name);
+                doc["timestamp"] = serde_json::json!("2026-09-10T09:00:00Z");
+                enrich(&mut doc);
+                idx.ingest_text(&doc.to_string(), &fixtures().join(format!("later-{name}")))
+                    .expect("ingested");
+            }
+        }
+        state.recompute().expect("recomputed");
+        state
+    }
+
+    /// The run, the OS detail and the memory, from the document to the
+    /// drilldown and the CSV through the real router — and a run without them
+    /// says nothing rather than zero.
+    #[tokio::test]
+    async fn the_run_os_detail_and_memory_reach_the_drilldown_and_the_csv() {
+        let state = state_with_enriched_runs(&Config::default());
+
+        let page = get(&state, "/api/machine/SN-WIN-0001", None).await.json();
+        let m = &page["machine"];
+        assert_eq!(m["os_edition"], "Enterprise");
+        assert_eq!(m["os_version"], "24H2");
+        assert_eq!(m["os_build"], "26100.2314");
+        assert_eq!(m["os_distro"], serde_json::Value::Null);
+        assert_eq!(m["memory_slots"], 4);
+        assert_eq!(m["memory_populated"], 2);
+        assert_eq!(m["memory_types"], serde_json::json!(["DDR5"]));
+        assert_eq!(m["run_duration_secs"], 472.318);
+        assert!(
+            m.get("memory_modules").is_none(),
+            "the snapshot does not carry the modules"
+        );
+        let modules = page["memory_modules"].as_array().expect("modules");
+        assert_eq!(modules.len(), 2);
+        assert_eq!(modules[0]["type"], "DDR5");
+        assert_eq!(modules[0]["speed_mts"], 5600);
+        assert_eq!(modules[0]["configured_speed_mts"], 4800);
+        let history = page["history"].as_array().expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["duration_secs"], serde_json::Value::Null);
+        assert_eq!(history[1]["duration_secs"], 472.318);
+        assert_eq!(
+            history[1]["run_uuid"],
+            "0f8b5a52-7c1e-4c39-9d0e-5a1f3b2c4d6e"
+        );
+
+        let (head, rows) = csv_of(&get(&state, "/api/machines.csv", None).await);
+        assert_eq!(
+            &head[..export::MACHINE_COLUMNS.len()],
+            export::MACHINE_COLUMNS
+        );
+        assert!(
+            head[export::MACHINE_COLUMNS.len()..]
+                .iter()
+                .all(|c| c.starts_with("tag:"))
+        );
+        let row = |host: &str| rows.iter().find(|r| r["hostname"] == host).expect(host);
+        let win = row("FLEET-WIN-01");
+        for (col, want) in [
+            ("os_edition", "Enterprise"),
+            ("os_version", "24H2"),
+            ("os_build", "26100.2314"),
+            ("os_distro", ""),
+            ("memory_slots", "4"),
+            ("memory_populated", "2"),
+            ("memory_types", "DDR5"),
+            ("memory_speed_mts", "5600"),
+            ("memory_configured_speed_mts", "4800"),
+            (
+                "memory_modules",
+                "17179869184:DDR5:SODIMM:5600:4800; 17179869184:DDR5:SODIMM:5600:4800",
+            ),
+            ("run_duration_secs", "472.318"),
+            ("run_uuid", "0f8b5a52-7c1e-4c39-9d0e-5a1f3b2c4d6e"),
+            ("tag:site", "glasgow"),
+        ] {
+            assert_eq!(win[col], want, "{col}");
+        }
+        let root = row("FLEET-LNX-01");
+        assert_eq!(root["os_distro"], "ubuntu");
+        assert_eq!(root["memory_modules"], "8589934592:DDR4:DIMM::");
+        assert_eq!(
+            root["memory_speed_mts"], "",
+            "no speed recorded, none written"
+        );
+        assert_eq!(root["run_uuid"], "");
+        let user = row("FLEET-LNX-02");
+        assert_eq!(user["memory_slots"], "", "unknown, not zero");
+        assert_eq!(user["memory_modules"], "");
+        let old = row("FLEET-OLD-01");
+        for col in &export::MACHINE_COLUMNS[34..] {
+            assert_eq!(old[*col], "", "{col} on a 1.2.4 run");
+        }
+
+        let legacy = get(&state, "/api/machine/FLEET-OLD-01", None).await.json();
+        assert_eq!(legacy["memory_modules"], serde_json::json!([]));
+        assert_eq!(legacy["machine"]["memory_slots"], serde_json::Value::Null);
+    }
+
+    /// The modules are delivered as drives are, through the caller's own view:
+    /// a viewer scoped to Glasgow gets the Glasgow machine's and cannot reach
+    /// an Edinburgh machine's at all, nor find it by its memory type.
+    #[tokio::test]
+    async fn a_scoped_viewer_sees_only_their_own_machines_memory() {
+        let state = state_with_enriched_runs(&oidc_config());
+        let glasgow = session(&state, Role::Viewer, &[&[("site", "glasgow")]]);
+
+        let mine = get(&state, "/api/machine/SN-WIN-0001", Some(&glasgow)).await;
+        assert_eq!(mine.status, StatusCode::OK);
+        assert_eq!(
+            mine.json()["memory_modules"].as_array().map(Vec::len),
+            Some(2)
+        );
+
+        let admin = session(&state, Role::Admin, &[]);
+        let all = get(&state, "/api/snapshot", Some(&admin)).await.json();
+        let edinburgh = all["machines"]
+            .as_array()
+            .expect("machines")
+            .iter()
+            .find(|m| m["hostname"] == "FLEET-LNX-01")
+            .expect("FLEET-LNX-01")["key"]
+            .as_str()
+            .expect("key")
+            .to_string();
+        let theirs = get(&state, &format!("/api/machine/{edinburgh}"), Some(&glasgow)).await;
+        assert_eq!(theirs.status, StatusCode::NOT_FOUND);
+        assert!(!theirs.body.contains("DDR4"), "{}", theirs.body);
+
+        let found = get(&state, "/api/snapshot?q=DDR4", Some(&glasgow))
+            .await
+            .json();
+        assert_eq!(found["machines"].as_array().map(Vec::len), Some(0));
+        let csv = get(&state, "/api/machines.csv", Some(&glasgow)).await;
+        assert!(!csv.body.contains("DDR4"), "{}", csv.body);
+        assert!(!csv.body.contains("ubuntu"), "{}", csv.body);
+    }
+
     #[tokio::test]
     async fn health_and_the_assets_stay_reachable_without_a_session() {
         let state = state_for(&oidc_config());

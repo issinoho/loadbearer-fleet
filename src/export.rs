@@ -214,7 +214,10 @@ fn tag_cells<'a>(m: Option<&'a MachineView>, keys: &'a [&str]) -> impl Iterator<
 /// The fixed columns of the machines table, in order. Named as the snapshot
 /// names the field wherever there is one, so the file and `/api/snapshot`
 /// can be read against each other.
-pub const MACHINE_COLUMNS: [&str; 34] = [
+///
+/// New columns go on the end of the fixed ones, before the tags, so a
+/// spreadsheet or script that reads by position keeps working.
+pub const MACHINE_COLUMNS: [&str; 46] = [
     "hostname",
     "machine_key",
     "key_kind",
@@ -249,7 +252,42 @@ pub const MACHINE_COLUMNS: [&str; 34] = [
     "disk_low_free_pct",
     "disk_low_free_bytes",
     "overridden_by",
+    "os_distro",
+    "os_version",
+    "os_build",
+    "os_edition",
+    "memory_slots",
+    "memory_populated",
+    "memory_types",
+    "memory_speed_mts",
+    "memory_configured_speed_mts",
+    "memory_modules",
+    "run_duration_secs",
+    "run_uuid",
 ];
+
+/// `size_bytes:type:form_factor:speed_mts:configured_speed_mts` per module,
+/// `; ` between modules, each part empty where the firmware didn't say:
+/// `17179869184:DDR5:SODIMM:5600:4800; 17179869184:DDR5:SODIMM:5600:4800`.
+/// One token per module rather than grouped, so a script counts modules by
+/// splitting; no part the CLI writes holds a `:` or a `;`.
+fn module_tokens(m: &MachineView) -> String {
+    let int = |v: Option<i64>| v.map(|n| n.to_string()).unwrap_or_default();
+    m.memory_modules
+        .iter()
+        .map(|x| {
+            [
+                int(x.size_bytes),
+                x.kind.clone().unwrap_or_default(),
+                x.form_factor.clone().unwrap_or_default(),
+                int(x.speed_mts),
+                int(x.configured_speed_mts),
+            ]
+            .join(":")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 /// The machines in view, one row each, by hostname.
 pub fn machines(snap: &Snapshot) -> String {
@@ -325,6 +363,24 @@ pub fn machines(snap: &Snapshot) -> String {
                     .collect::<Vec<_>>()
                     .join("; "),
             ),
+            opt(m.os_distro.as_deref()),
+            opt(m.os_version.as_deref()),
+            opt(m.os_build.as_deref()),
+            opt(m.os_edition.as_deref()),
+            Int(m.memory_slots),
+            Int(m.memory_populated),
+            text(m.memory_types.join("; ")),
+            // The slowest module's: memory runs at the pace of its slowest
+            // stick, so this is the figure to sort an estate by.
+            Int(m.memory_modules.iter().filter_map(|x| x.speed_mts).min()),
+            Int(m
+                .memory_modules
+                .iter()
+                .filter_map(|x| x.configured_speed_mts)
+                .min()),
+            text(module_tokens(m)),
+            Num(m.run_duration_secs),
+            opt(m.run_uuid.as_deref()),
         ];
         row(&mut out, cells.into_iter().chain(tag_cells(Some(m), &keys)));
     }

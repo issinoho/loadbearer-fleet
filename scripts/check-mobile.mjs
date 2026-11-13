@@ -74,13 +74,17 @@ const SIZES = [
 //
 // `report` is the printable report, grouped by site so every section it can
 // hold is there: a document rather than a tab, reached from the overview.
+//
+// `machine-memory` is a drilldown whose latest run carries the run, OS-detail
+// and memory blocks of a loadbearer release after 1.8.1, with a mixed set of
+// modules — the Memory line at its longest, and the module table under it.
 const VIEWS = ['overview', 'overview-quarter', 'cohorts', 'groups', 'components', 'components-split',
-  'lifecycle', 'lifecycle-keep', 'machines', 'drilled', 'machine', 'compare', 'report'];
+  'lifecycle', 'lifecycle-keep', 'machines', 'drilled', 'machine', 'machine-memory', 'compare', 'report'];
 
 /** The tab each view should mark as current. */
 const TAB_OF = {
   'overview-quarter': 'overview', 'lifecycle-keep': 'lifecycle', 'components-split': 'components', drilled: 'machines', machine: 'machines',
-  report: 'overview',
+  'machine-memory': 'machines', report: 'overview',
 };
 
 // The printed page as the browser lays it out: A4 portrait, the narrower of
@@ -89,7 +93,7 @@ const TAB_OF = {
 // and must drop its chrome; the views here must also fit the page, the report
 // above all, since paper cannot scroll sideways.
 const PRINT = { width: 703, height: 1123 };
-const PRINT_FITS = ['report', 'overview', 'lifecycle', 'machine'];
+const PRINT_FITS = ['report', 'overview', 'lifecycle', 'machine', 'machine-memory'];
 
 // A control smaller than this is a control you miss. 40px is the floor here
 // rather than Apple's 44 because the theme toggle is square and 44 looks
@@ -313,11 +317,29 @@ for (const f of readdirSync(join(root, 'tests/fixtures'))) {
   const doc = JSON.parse(readFileSync(join(root, 'tests/fixtures/win-modern.json'), 'utf8'));
   doc.timestamp = recent(2);
   doc.telemetry = { source: 'check', sample_count: 9, thermal_limited: true };
+  // What a loadbearer release after 1.8.1 adds, which no fixture has: the
+  // run, the OS detail, and four slots of three kinds of module.
+  const GiB = 1024 ** 3;
+  doc.run = { id: '0f8b5a52-7c1e-4c39-9d0e-5a1f3b2c4d6e', started_at: recent(2), duration_secs: 3725.4 };
+  doc.machine.os_detail = { version: '24H2', build: '26100.2314', edition: 'Enterprise' };
+  doc.machine.memory = {
+    slots: 4,
+    populated: 4,
+    modules: [
+      { size_bytes: 16 * GiB, type: 'DDR4', form_factor: 'Row Of Chips', speed_mts: 3200, configured_speed_mts: 2666 },
+      { size_bytes: 16 * GiB, type: 'DDR4', form_factor: 'Row Of Chips', speed_mts: 3200, configured_speed_mts: 2666 },
+      { size_bytes: 8 * GiB, type: 'DDR4', form_factor: 'SODIMM', speed_mts: 2666, configured_speed_mts: 2666 },
+      { size_bytes: 8 * GiB, type: 'LPDDR4X', form_factor: 'Row Of Chips', speed_mts: 4266 },
+    ],
+  };
   writeFileSync(join(collection, 'later-run.json'), JSON.stringify(doc));
   const arrived = JSON.parse(readFileSync(join(root, 'tests/fixtures/low-end.json'), 'utf8'));
   arrived.timestamp = recent(1);
   arrived.machine.hostname = 'WORKSTATION-WITH-A-VERY-LONG-HOSTNAME-07';
   arrived.machine.identity = { serial: 'SN-CHECK-ARRIVED', smbios_uuid: 'u-check-arrived', machine_id: 'm-check-arrived' };
+  // Unprivileged Linux: os-release and a run block, and no memory block.
+  arrived.run = { id: '5b1d7e0c-3a2f-4e8b-9c6d-1e2f3a4b5c6d', duration_secs: 61 };
+  arrived.machine.os_detail = { distro: 'debian', version: '13' };
   writeFileSync(join(collection, 'arrived.json'), JSON.stringify(arrived));
 }
 
@@ -347,6 +369,10 @@ if (!up) {
 // A real machine key, so the drilldown is rendered against something.
 const snapshot = await (await fetch(`${origin}/api/snapshot`)).json();
 const machineKey = snapshot.machines[0].key;
+// The machine whose latest run carries the memory layout: see `later-run`.
+const memoryKey = snapshot.machines.find((m) => m.hostname === 'FLEET-WIN-01')?.key;
+check('fixtures', !!memoryKey && snapshot.machines.find((m) => m.key === memoryKey).memory_slots === 4,
+  'the drilldown with a memory layout has none');
 // Three runs: the widest table a reader can ask for on a phone, short of four.
 const compareRuns = snapshot.machines.slice(0, 3).map((m) => m.run_id);
 const longestCpu = snapshot.machines.map((m) => m.cpu_model)
@@ -380,6 +406,7 @@ check('fixtures', snapshot.machines.length > 0, 'the fixtures produced no machin
 /** Where each view lives. */
 function hashOf(view) {
   if (view === 'machine') return `machine/${encodeURIComponent(machineKey)}`;
+  if (view === 'machine-memory') return `machine/${encodeURIComponent(memoryKey)}`;
   // A comparison with nothing chosen is only the picker, which is not the
   // layout worth checking — the table is.
   if (view === 'compare') return `compare/${compareRuns.join(',')}`;
@@ -600,8 +627,15 @@ try {
       check(where, m.topbarHeight <= ceiling,
         `the topbar is ${m.topbarHeight}px at ${size.width}px wide (ceiling ${ceiling}px)`);
 
-      // Read on load, which is a fresh navigation straight to this view.
-      const tabs = JSON.parse((await cdp.send('Runtime.evaluate', { expression: TABS, returnByValue: true })).result.value);
+      // Read on load, which is a fresh navigation straight to this view — but
+      // a frame after the view has drawn. A page long enough for a scrollbar
+      // narrows the strip once it has rendered, and the page's own
+      // ResizeObserver brings the current tab back into view on the next
+      // frame; measuring inside that frame failed about one run in three on
+      // the last tab, on a page that had put itself right by the time anybody
+      // could have looked.
+      await evaluate('new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))');
+      const tabs =JSON.parse((await cdp.send('Runtime.evaluate', { expression: TABS, returnByValue: true })).result.value);
       checkTabs(where, tabs, TAB_OF[view] || view);
 
       notes.push(`${where}: ${m.documentWidth}px wide, topbar ${m.topbarHeight}px, `

@@ -463,7 +463,10 @@ so it cannot describe a flag that does not exist.
 
 Rescanning is cheap and idempotent: every run is keyed by the SHA-256 of the
 document it came from, so an unchanged file is a no-op and a file the collector
-renamed on copy doesn't become a second run.
+renamed on copy doesn't become a second run. The random run ID that newer
+loadbearer releases write is recorded and shown, but it is not what makes two
+documents the same: `loadbearer score` carries it over to a re-scored copy,
+whose bytes — and numbers — differ.
 
 ## Identity, and why grouping is trustworthy
 
@@ -866,6 +869,34 @@ batteries. An index from an earlier version gains all of this on open, empty
 for the runs it already holds — `scan --reindex` fills them in from the
 documents.
 
+### The OS release, the memory, and how long a run took
+
+A loadbearer release after 1.8.1 records three more things with each run: the
+OS release in parts (on Windows the edition, the display version such as
+`24H2` and the build with its update revision; on Linux the distribution, its
+version and, where it sets one, the variant), the memory layout (how many slots,
+how many are filled, and each module's size, type, form factor and rated and
+running speed), and the run itself (a random run ID, when the benchmarks
+started and how long they took).
+
+The machine page adds what the OS line didn't already say — `Windows 11
+Enterprise · 24H2 · build 26100.2314` — and puts the layout on the Memory line:
+`32 GiB · 2 of 4 slots · 2 × 16 GiB DDR5 SODIMM, 5600 MT/s (running 4800)`.
+A mixed set of more kinds than fit on that line is listed in a **Memory** table
+instead. Memory held below its rated speed is shown side by side with the
+rating and is not a finding: it is common, and usually the platform's limit
+rather than a fault. **Measured** says how long the run took, the run's ID is
+beside it, and the score history's table has a **Took** column, as does a
+comparison. The Search box finds a machine by its edition, OS version or build
+and memory type — `24H2`, `Enterprise`, `DDR4`.
+
+Like the drives, the memory layout needs root on Linux, where the firmware
+table is root-only, so an unprivileged run has none and the Memory line says
+**layout not reported** — as Serial does — rather than guessing. Older runs
+record none of it. An index from an earlier version gains the columns and the
+module table on open, empty for the runs it already holds, and
+`scan --reindex` fills them in.
+
 ## The dashboard
 
 ```
@@ -883,8 +914,8 @@ one measure is spread across the estate, and every machine against every
 component), **lifecycle** (what
 each machine calls for — replace, repair, investigate, watch or keep — and
 why), a sortable **machine table**, and a **drilldown** per machine with its
-score history, its components, its findings in full, its drives, every
-subtest of its latest run, and — where a [threshold
+score history, its components, its findings in full, its drives, its OS
+release and memory layout, every subtest of its latest run, and — where a [threshold
 override](#thresholds-and-different-lines-for-some-machines) applies — the
 lines it was judged against instead. On a phone the seven tabs scroll sideways inside
 their strip, with the current one kept in view and a fade on the edge where
@@ -1142,7 +1173,15 @@ names what there is — judged against the caller's own view, so it names
 nothing they cannot see; and `GET /api/machine/{key}` is the drilldown payload.
 The snapshot carries the fleet-wide `thresholds` and the configured
 `threshold_overrides`, and each machine, there and in the drilldown, its
-`overridden_by`.
+`overridden_by`; its `os_distro`, `os_version`, `os_build` and `os_edition`;
+`memory_slots`, `memory_populated` and `memory_types`; and its latest run's
+`run_uuid` (loadbearer's random `run.id`, not the index's `run_id`) and
+`run_duration_secs` — each null (`memory_types` empty) where the run didn't
+record it. The drilldown
+adds `memory_modules`, one per filled slot (`size_bytes`, `type`,
+`form_factor`, `speed_mts`, `configured_speed_mts`), delivered as `drives` are,
+and each run in its `history` carries `duration_secs` and `run_uuid`; each run
+in a comparison carries `duration_secs`.
 `POST /api/triage` (`{ machine_key, code, action: "acknowledge" | "snooze" |
 "clear", until?, note? }`) acknowledges, snoozes or clears one finding;
 `GET /api/suppressions` lists the suppression rules the caller may see, and an
@@ -1190,11 +1229,22 @@ CPU's launch, or `firmware`), `live_critical` and `live_warning` (findings
 nobody has quieted), `taken_at` (the latest run), `age_days` (days since it),
 `runs`, `bios_version`, `bios_date`, `worst_drive_wear_pct`,
 `drive_power_on_hours`, `disk_low_mount`, `disk_low_free_pct`,
-`disk_low_free_bytes` (the fullest fixed volume), and `overridden_by` (the
+`disk_low_free_bytes` (the fullest fixed volume), `overridden_by` (the
 [threshold overrides](#thresholds-and-different-lines-for-some-machines) that
-apply, separated by `; `). Then one `tag:<key>` column per tag key any machine
-in the file carries, sorted by key; the prefix means a tag can never be
-mistaken for a fixed column.
+apply, separated by `; `), then from a loadbearer release after 1.8.1 —
+empty for a run that didn't record them, never zero — `os_distro`,
+`os_version`, `os_build` and `os_edition` (the OS release in parts),
+`memory_slots` and `memory_populated`, `memory_types` (the distinct module
+types, `; `-separated, usually one), `memory_speed_mts` and
+`memory_configured_speed_mts` (the slowest module's rated and running speed in
+MT/s), `memory_modules` (one `size_bytes:type:form_factor:speed_mts:configured_speed_mts`
+per module, `; `-separated, a part empty where the firmware didn't say — so
+`17179869184:DDR5:SODIMM:5600:4800; 17179869184:DDR5:SODIMM:5600:4800`),
+`run_duration_secs` (how long the latest run's benchmarks took) and `run_uuid`
+(its random run ID). New columns are added after these and before the tags,
+so a column's position never moves. Then one `tag:<key>` column per tag key
+any machine in the file carries, sorted by key; the prefix means a tag can
+never be mistaken for a fixed column.
 
 The findings file has one row per finding, most severe first: `severity`,
 `queue` (`machine`, `measurement` or `coverage`), `code`, `hostname`,

@@ -194,6 +194,12 @@ fn saturating(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
+/// A document's string trimmed, and `None` when that leaves nothing: an empty
+/// edition is not an edition called "", and should read as unrecorded.
+fn present(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// Columns added to an existing index in place.
 ///
 /// Deliberately *not* an `INDEX_VERSION` bump. A version change moves the old
@@ -207,7 +213,7 @@ fn saturating(v: u64) -> i64 {
 /// Rows written before the column existed keep `NULL`, which is the honest
 /// answer — see `scan --reindex` for filling them in from the documents.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
-    const ADDED: [(&str, &str, &str); 22] = [
+    const ADDED: [(&str, &str, &str); 31] = [
         ("subtest", "label", "TEXT"),
         ("subtest", "direction", "TEXT"),
         // Component ids are short and lower-case — `cpu`, `memory` — so a
@@ -250,6 +256,22 @@ fn add_missing_columns(conn: &Connection) -> Result<()> {
         ("run", "disk_low_mount", "TEXT"),
         ("run", "disk_low_free_pct", "REAL"),
         ("run", "disk_low_free_bytes", "INTEGER"),
+        // The `run` block of a loadbearer release after 1.8.1: its random ID,
+        // when the benchmarks started and how long they took. `run_` because
+        // `run.id` is this table's own row number. NULL for older documents.
+        ("run", "run_uuid", "TEXT"),
+        ("run", "run_started_at", "TEXT"),
+        ("run", "run_duration_secs", "REAL"),
+        // `machine.os_detail`, the OS release in parts beside `os`.
+        ("run", "os_distro", "TEXT"),
+        ("run", "os_version", "TEXT"),
+        ("run", "os_build", "TEXT"),
+        ("run", "os_edition", "TEXT"),
+        // `machine.memory`'s two counts; the modules are the `memory_module`
+        // table. NULL where the block is absent — Linux without root, or an
+        // older CLI — which is unknown, not "no slots".
+        ("run", "memory_slots", "INTEGER"),
+        ("run", "memory_populated", "INTEGER"),
     ];
 
     for (table, column, decl) in ADDED {
@@ -655,6 +677,23 @@ impl Index {
                  media_errors        INTEGER,
                  critical_warning    INTEGER,
                  PRIMARY KEY (run_id, position)
+             );
+
+             -- Every memory module from `machine.memory` (a loadbearer
+             -- release after 1.8.1), one row per filled slot. Added after the
+             -- fact like `drive`, and `IF NOT EXISTS` for the same reason: an
+             -- existing index gains it on open, with no rows for the runs it
+             -- already holds until `scan --reindex`.
+             CREATE TABLE IF NOT EXISTS memory_module (
+                 run_id               INTEGER NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+                 -- Order in the document, which is the firmware table's.
+                 position             INTEGER NOT NULL,
+                 size_bytes           INTEGER,
+                 type                 TEXT,
+                 form_factor          TEXT,
+                 speed_mts            INTEGER,
+                 configured_speed_mts INTEGER,
+                 PRIMARY KEY (run_id, position)
              );",
         )?;
         add_missing_columns(&conn)?;
@@ -813,8 +852,8 @@ impl Index {
     pub fn reingest_file(&mut self, path: &Path) -> Result<bool> {
         let text = read_document(path)?;
         let hash = content_hash(&text);
-        // Children go with it: `run` is the parent of component, subtest, tag
-        // and drive, all with ON DELETE CASCADE.
+        // Children go with it: `run` is the parent of component, subtest, tag,
+        // drive and memory_module, all with ON DELETE CASCADE.
         self.conn
             .execute("DELETE FROM run WHERE content_hash = ?1", params![hash])?;
         self.ingest_text(&text, path)
@@ -824,6 +863,8 @@ impl Index {
     /// from. Splitting this out from `ingest_file` keeps the identity of a run
     /// tied to its *content* rather than to having been read off a disk.
     pub fn ingest_text(&mut self, text: &str, source: &Path) -> Result<bool> {
+        // The bytes, never the document's own `run.id`: see `insert` for why
+        // the run ID is recorded but is no identity.
         let hash = content_hash(text);
 
         let existing: Option<i64> = self
@@ -895,6 +936,14 @@ impl Index {
         let power = doc.machine.power.clone().unwrap_or_default();
         let firmware = doc.machine.firmware.clone().unwrap_or_default();
         let fullest = doc.machine.fullest_fixed_volume();
+        // Recorded, and deliberately **not** an identity: the content hash is
+        // what makes two documents the same run, here and in `ingest_text`.
+        // The ID is something the document says about itself — a copy edited
+        // by hand, or a re-score, keeps it — so keying on it would let one
+        // document replace another that differs in what it measured.
+        let run = doc.run.clone().unwrap_or_default();
+        let os = doc.machine.os_detail.clone().unwrap_or_default();
+        let memory = doc.machine.memory.clone().unwrap_or_default();
         let tx = self.conn.transaction()?;
 
         tx.execute(
@@ -907,10 +956,13 @@ impl Index {
                  firmware_dated, firmware_likely_original, drive_power_on_hours,
                  drive_wear_pct, drive_hours_undercounted, power_plan, power_mode,
                  power_held_back, bios_version, bios_date, disk_low_mount,
-                 disk_low_free_pct, disk_low_free_bytes, ingested_at
+                 disk_low_free_pct, disk_low_free_bytes, run_uuid, run_started_at,
+                 run_duration_secs, os_distro, os_version, os_build, os_edition,
+                 memory_slots, memory_populated, ingested_at
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
                        ?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,
-                       ?35,?36,?37,?38,?39,?40,?41,?42,?43, datetime('now'))",
+                       ?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,
+                       ?51,?52, datetime('now'))",
             params![
                 key.value,
                 key.kind.as_str(),
@@ -955,9 +1007,37 @@ impl Index {
                 fullest.map(|(d, _)| d.mount_point.as_str()),
                 fullest.map(|(_, pct)| pct),
                 fullest.map(|(d, _)| saturating(d.available_bytes)),
+                present(run.id.as_deref()),
+                present(run.started_at.as_deref()),
+                // A negative span is a clock that went wrong, not a duration.
+                run.duration_secs.filter(|s| s.is_finite() && *s >= 0.0),
+                present(os.distro.as_deref()),
+                present(os.version.as_deref()),
+                present(os.build.as_deref()),
+                present(os.edition.as_deref()),
+                memory.slots,
+                memory.populated,
             ],
         )?;
         let run_id = tx.last_insert_rowid();
+
+        for (position, m) in memory.modules.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO memory_module
+                   (run_id, position, size_bytes, type, form_factor, speed_mts,
+                    configured_speed_mts)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    run_id,
+                    position as i64,
+                    m.size_bytes.map(saturating),
+                    present(m.kind.as_deref()),
+                    present(m.form_factor.as_deref()),
+                    m.speed_mts,
+                    m.configured_speed_mts,
+                ],
+            )?;
+        }
 
         for (position, d) in doc.machine.drives.iter().enumerate() {
             tx.execute(
@@ -1130,7 +1210,8 @@ impl Index {
         }
 
         // The child tables declare ON DELETE CASCADE and `foreign_keys` is on,
-        // so components, subtests, tags and drives go with their runs.
+        // so components, subtests, tags, drives and memory modules go with
+        // their runs.
         let removed = self
             .conn
             .execute("DELETE FROM run WHERE machine_key = ?1", [key])?;
@@ -1569,6 +1650,135 @@ mod tests {
             .unwrap()
     }
 
+    /// `with_drives`, plus the run, OS-detail and memory blocks of a
+    /// loadbearer release after 1.8.1, Windows-shaped.
+    fn with_everything() -> String {
+        let mut doc: serde_json::Value = serde_json::from_str(&with_drives()).unwrap();
+        crate::schema::samples::windows(&mut doc);
+        doc.to_string()
+    }
+
+    fn module_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM memory_module", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn the_run_os_detail_and_every_memory_module_are_indexed() {
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.ingest_text(&with_everything(), Path::new("x.json"))
+            .unwrap();
+        type Row = (
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let row: Row = idx
+            .conn
+            .query_row(
+                "SELECT run_uuid, run_started_at, run_duration_secs, os_distro, os_version,
+                        os_build, os_edition, memory_slots, memory_populated FROM run",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("0f8b5a52-7c1e-4c39-9d0e-5a1f3b2c4d6e".into()),
+                Some("2026-09-09T14:42:01.1234567Z".into()),
+                Some(472.318),
+                None,
+                Some("24H2".into()),
+                Some("26100.2314".into()),
+                Some("Enterprise".into()),
+                Some(4),
+                Some(2),
+            )
+        );
+        type ModuleRow = (i64, Option<i64>, Option<String>, Option<i64>, Option<i64>);
+        let modules: Vec<ModuleRow> = idx
+            .conn
+            .prepare(
+                "SELECT position, size_bytes, type, speed_mts, configured_speed_mts
+                   FROM memory_module ORDER BY position",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let one = (
+            Some(17_179_869_184),
+            Some("DDR5".to_string()),
+            Some(5600),
+            Some(4800),
+        );
+        assert_eq!(
+            modules,
+            [
+                (0, one.0, one.1.clone(), one.2, one.3),
+                (1, one.0, one.1, one.2, one.3)
+            ]
+        );
+    }
+
+    /// A document without the blocks — every fixture — records nothing for
+    /// them: NULL and no rows, never a zero.
+    #[test]
+    fn a_document_without_the_blocks_records_them_as_unknown() {
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.ingest_file(&fixture("legacy-1.2.4.json")).unwrap();
+        let (uuid, slots, edition): (Option<String>, Option<i64>, Option<String>) = idx
+            .conn
+            .query_row(
+                "SELECT run_uuid, memory_slots, os_edition FROM run",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((uuid, slots, edition), (None, None, None));
+        assert_eq!(module_rows(&idx.conn), 0);
+    }
+
+    /// Two documents with the same run ID are still two runs when their bytes
+    /// differ — a re-score carries the block over — and one document seen
+    /// twice is still one. The content hash is the identity, not the ID.
+    #[test]
+    fn the_run_id_is_not_what_makes_two_documents_the_same() {
+        let mut idx = Index::open_in_memory().unwrap();
+        let first = with_everything();
+        let mut rescored: serde_json::Value = serde_json::from_str(&first).unwrap();
+        rescored["overall"]["score"] = serde_json::json!(1.0);
+        assert!(idx.ingest_text(&first, Path::new("a.json")).unwrap());
+        assert!(
+            idx.ingest_text(&rescored.to_string(), Path::new("b.json"))
+                .unwrap()
+        );
+        assert!(!idx.ingest_text(&first, Path::new("c.json")).unwrap());
+        assert_eq!(idx.run_count().unwrap(), 2);
+    }
+
     #[test]
     fn every_drive_and_the_firmware_are_indexed() {
         let mut idx = Index::open_in_memory().unwrap();
@@ -1613,15 +1823,20 @@ mod tests {
     /// The same additive migration as the columns above, for a whole table:
     /// an index from before it gains the table and the columns on open, keeps
     /// its runs, and has nothing in them until a reindex.
+    ///
+    /// Two generations at once: what 0.9.0 lacked (the drive table, the
+    /// firmware and free-space columns) and what 0.11.0 lacked (the
+    /// memory-module table, the run and OS-detail columns, the memory counts).
     #[test]
-    fn an_older_index_gains_the_drive_table_and_firmware_columns() {
+    fn an_older_index_gains_the_drive_and_memory_tables_and_their_columns() {
         let dir = scratch("migrate-drives");
         let db = dir.join("i.db");
         let collection = dir.join("collection");
         std::fs::create_dir_all(&collection).unwrap();
-        std::fs::write(collection.join("x1.json"), with_drives()).unwrap();
+        std::fs::write(collection.join("x1.json"), with_everything()).unwrap();
 
-        // What an index written by 0.9.0 looks like.
+        // What an index written by 0.9.0 looks like — and, for the second
+        // half of the list, one written by 0.11.0.
         {
             let mut idx = Index::open(&db).unwrap();
             idx.scan(&collection).unwrap();
@@ -1632,30 +1847,63 @@ mod tests {
                      ALTER TABLE run DROP COLUMN bios_date;
                      ALTER TABLE run DROP COLUMN disk_low_mount;
                      ALTER TABLE run DROP COLUMN disk_low_free_pct;
-                     ALTER TABLE run DROP COLUMN disk_low_free_bytes;",
+                     ALTER TABLE run DROP COLUMN disk_low_free_bytes;
+
+                     DROP TABLE memory_module;
+                     ALTER TABLE run DROP COLUMN run_uuid;
+                     ALTER TABLE run DROP COLUMN run_started_at;
+                     ALTER TABLE run DROP COLUMN run_duration_secs;
+                     ALTER TABLE run DROP COLUMN os_distro;
+                     ALTER TABLE run DROP COLUMN os_version;
+                     ALTER TABLE run DROP COLUMN os_build;
+                     ALTER TABLE run DROP COLUMN os_edition;
+                     ALTER TABLE run DROP COLUMN memory_slots;
+                     ALTER TABLE run DROP COLUMN memory_populated;",
                 )
                 .unwrap();
         }
 
+        let later = |idx: &Index| -> (Option<String>, Option<String>, Option<f64>, Option<i64>) {
+            idx.conn
+                .query_row(
+                    "SELECT bios_date, os_build, run_duration_secs, memory_slots FROM run",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap()
+        };
+
         let mut idx = Index::open(&db).unwrap();
         assert_eq!(idx.run_count().unwrap(), 1, "the history is kept");
         assert_eq!(drive_rows(&idx.conn), 0, "the table is back, and empty");
-        let date: Option<String> = idx
-            .conn
-            .query_row("SELECT bios_date FROM run", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(date, None);
+        assert_eq!(module_rows(&idx.conn), 0, "this one too");
+        assert_eq!(later(&idx), (None, None, None, None));
+        // And the views read an index in that state without stumbling.
+        let snap = crate::analytics::snapshot(
+            &idx.conn,
+            &crate::analytics::Tuning::default(),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        assert_eq!(snap.machines[0].memory_slots, None);
 
         idx.scan(&collection).unwrap();
         assert_eq!(drive_rows(&idx.conn), 0, "a plain rescan cannot fill it");
+        assert_eq!(module_rows(&idx.conn), 0);
+        assert_eq!(later(&idx), (None, None, None, None));
 
         idx.rescan_all(&collection).unwrap();
         assert_eq!(drive_rows(&idx.conn), 2);
-        let date: Option<String> = idx
-            .conn
-            .query_row("SELECT bios_date FROM run", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(date.as_deref(), Some("2025-06-01"));
+        assert_eq!(module_rows(&idx.conn), 2);
+        assert_eq!(
+            later(&idx),
+            (
+                Some("2025-06-01".into()),
+                Some("26100.2314".into()),
+                Some(472.318),
+                Some(4)
+            )
+        );
         assert_eq!(idx.run_count().unwrap(), 1, "and not duplicated");
 
         drop(idx);
@@ -1663,18 +1911,28 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_a_machine_takes_its_drive_rows() {
+    fn forgetting_a_machine_takes_its_drive_and_memory_rows() {
         let mut idx = Index::open_in_memory().unwrap();
-        idx.ingest_text(&with_drives(), Path::new("x.json"))
+        idx.ingest_text(&with_everything(), Path::new("x.json"))
             .unwrap();
-        idx.ingest_file(&fixture("low-end.json")).unwrap();
+        // Another machine with modules of its own, which must stay.
+        let mut other = crate::schema::samples::fixture("low-end.json");
+        crate::schema::samples::linux_root(&mut other);
+        idx.ingest_text(&other.to_string(), Path::new("y.json"))
+            .unwrap();
         assert_eq!(drive_rows(&idx.conn), 2);
+        assert_eq!(module_rows(&idx.conn), 3);
 
         let key = idx.machines_matching("FLEET-WIN-01").unwrap()[0]
             .key
             .clone();
         idx.forget(&key).unwrap();
         assert_eq!(drive_rows(&idx.conn), 0);
+        assert_eq!(
+            module_rows(&idx.conn),
+            1,
+            "only the other machine's module is left"
+        );
         assert_eq!(idx.run_count().unwrap(), 1);
     }
 
