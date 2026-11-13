@@ -2755,6 +2755,151 @@ function memoryStorage(seed = {}) {
   location.hash = '';
 }
 
+/* ------------------------------------------------------- run status records */
+
+/**
+ * The binary's own snapshot of the fixtures plus some run status files: one
+ * for a fixture machine, newer than its result, and `never` for machines that
+ * have only ever been skipped. Through the binary, like every snapshot here,
+ * so the card and the line are drawn from the shape the server sends.
+ */
+function realSnapshotWithSkips(never) {
+  const target = process.env.CARGO_TARGET_DIR || 'target';
+  const exe = join(target, 'debug', process.platform === 'win32' ? 'loadbearer-fleet.exe' : 'loadbearer-fleet');
+  const dir = join(tmpdir(), `lbf-check-skips-${process.pid}`);
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  const db = join(dir, 'i.db');
+  const folder = join(dir, 'results');
+  mkdirSync(folder);
+  for (const name of ['win-modern.json', 'linux-throttled.json']) {
+    writeFileSync(join(folder, name), readFileSync(join('tests/fixtures', name)));
+  }
+  const winner = JSON.parse(readFileSync(join('tests/fixtures', 'win-modern.json'), 'utf8'));
+  writeFileSync(join(folder, 'status-known.json'), JSON.stringify({
+    schema: 'loadbearer.run-status/1',
+    timestamp: '2099-01-01T10:00:00Z',
+    reason: 'on_battery',
+    detail: 'on battery (62%), and --not-on-battery was given',
+    hostname: winner.machine.hostname,
+    identity: winner.machine.identity,
+  }));
+  for (let i = 0; i < never; i++) {
+    writeFileSync(join(folder, `status-never-${i}.json`), JSON.stringify({
+      schema: 'loadbearer.run-status/1',
+      timestamp: `2026-11-${String(1 + (i % 28)).padStart(2, '0')}T10:00:00Z`,
+      reason: i % 2 ? 'busy' : 'on_battery',
+      detail: i % 2 ? 'busy: the CPU was at 83%' : 'on battery (62%), and --not-on-battery was given',
+      hostname: `NEVER-${String(i).padStart(2, '0')}`,
+    }));
+  }
+  const run = (args) => {
+    const r = spawnSync(exe, ['--index', db, '--log-level', 'warn', ...args], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      console.error(`\n${exe} ${args.join(' ')} failed:\n${r.stderr || r.stdout}`);
+      process.exit(1);
+    }
+    return r.stdout;
+  };
+  try {
+    run(['scan', folder]);
+    return JSON.parse(run(['report', '--json']));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  globalThis.fetch = () => Promise.reject(new Error('no network in the geometry check'));
+  const cardOf = (h) => findAll(h, (n) => n.dataset?.card === 'unmeasured')[0];
+  const rowsOf = (card) => findAll(card, (n) => n.className === 'finding');
+
+  // Absent when there is none to list: not an empty card.
+  mod.state.snap = realSnapshotWithSkips(0);
+  check('unmeasured/none', mod.state.snap.unmeasured.length === 0 && mod.state.snap.summary.unmeasured === 0,
+    'the snapshot lists a machine that was never skipped');
+  let h = host(1200);
+  try {
+    await mod.renderOverview(h);
+    check('unmeasured/none', !cardOf(h) && !textOf(h).includes('Tried, never measured'),
+      'the card is drawn with nothing to say');
+  } catch (err) {
+    failures.push(`unmeasured/none: threw ${err.message}`);
+  }
+
+  // A few: each with its hostname, when and why.
+  mod.state.snap = realSnapshotWithSkips(3);
+  h = host(1200);
+  try {
+    await mod.renderOverview(h);
+    const card = cardOf(h);
+    check('unmeasured/few', !!card && rowsOf(card).length === 3, `expected 3 rows, got ${card ? rowsOf(card).length : 'no card'}`);
+    const text = card ? textOf(card) : '';
+    check('unmeasured/few', text.includes('Tried, never measured') && text.includes('NEVER-00')
+      && text.includes('skipped: on battery (62%), and --not-on-battery was given')
+      && text.includes('skipped: busy: the CPU was at 83%'), 'the card does not say who, and why');
+    check('unmeasured/few', !text.includes('Showing the'), 'a cap is announced with nothing over it');
+    check('unmeasured/few', !text.includes('undefined') && !text.includes('NaN'), 'undefined or NaN reached the page');
+    check('unmeasured/few', mod.state.snap.summary.machines === 2 && mod.state.snap.machines.length === 2,
+      'a machine only ever skipped became a machine');
+    // Newest first.
+    const order = rowsOf(card).map((r) => textOf(r).match(/NEVER-\d{2}/)[0]);
+    check('unmeasured/few', order.join() === 'NEVER-02,NEVER-01,NEVER-00', `order was ${order.join()}`);
+  } catch (err) {
+    failures.push(`unmeasured/few: threw ${err.message}`);
+  }
+
+  // More than the card lists: twenty, and how many there are.
+  mod.state.snap = realSnapshotWithSkips(27);
+  h = host(1200);
+  try {
+    await mod.renderOverview(h);
+    const card = cardOf(h);
+    check('unmeasured/capped', !!card && rowsOf(card).length === 20, `expected 20 rows, got ${card ? rowsOf(card).length : 'no card'}`);
+    const text = card ? textOf(card) : '';
+    check('unmeasured/capped', text.includes('27 machine(s)') && text.includes('Showing the 20 most recent of 27'),
+      'the total is not stated beside the cap');
+  } catch (err) {
+    failures.push(`unmeasured/capped: threw ${err.message}`);
+  }
+
+  // The machine page: the line only for a machine whose skip is newer than
+  // its latest run, and in the machine's own words.
+  {
+    const snap = realSnapshotWithSkips(0);
+    mod.state.snap = snap;
+    for (const m of snap.machines) {
+      globalThis.fetch = () => Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          machine: m, flags: snap.flags.filter((x) => x.machine_key === m.key), cohort: null, history: [], subtests: [],
+        }),
+        text: () => Promise.resolve(''),
+      });
+      const page = host(1200);
+      try {
+        await mod.renderMachine(page, m.key);
+        const text = textOf(page);
+        if (m.last_skip) {
+          check('machine/last-attempt', text.includes('Last attempt')
+            && text.includes('skipped: on battery (62%), and --not-on-battery was given'),
+          'the page does not say the collector tried since');
+        } else {
+          check('machine/last-attempt', !text.includes('Last attempt'), 'a line about an attempt that never happened');
+        }
+        check('machine/last-attempt', !text.includes('undefined') && !text.includes('NaN'), 'undefined or NaN reached the page');
+      } catch (err) {
+        failures.push(`machine/last-attempt: threw ${err.message}`);
+      }
+    }
+    check('machine/last-attempt', snap.machines.some((m) => m.last_skip) && snap.machines.some((m) => !m.last_skip),
+      'the fixtures need one machine with a newer skip and one without');
+  }
+  globalThis.fetch = () => Promise.reject(new Error('no network in the geometry check'));
+  mod.state.snap = snapshot;
+  notes.push('run status: the Overview card (none, a few, capped) and the machine page line');
+}
+
 /* ------------------------------------------------------------------ report */
 
 for (const n of notes) console.log(`  note  ${n}`);

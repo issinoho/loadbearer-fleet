@@ -1199,6 +1199,75 @@ mod tests {
         .unwrap()
     }
 
+    /// A machine that has only ever been skipped is not news. It is no finding
+    /// and no machine, so neither payload names it or counts it: a chat
+    /// channel is not where a list of machines that could not be measured
+    /// should end up.
+    #[test]
+    fn no_payload_names_a_machine_that_was_only_ever_skipped() {
+        let dir = std::env::temp_dir().join(format!("lbf-notify-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut skip = crate::schema::samples::run_status();
+        skip.as_object_mut().unwrap().remove("identity");
+        skip["hostname"] = serde_json::json!("UNMEASURED-HOST-7");
+        std::fs::write(dir.join("s.json"), skip.to_string()).unwrap();
+
+        let mut index = Index::open_in_memory().unwrap();
+        index
+            .ingest_file(
+                &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/win-modern.json"),
+            )
+            .unwrap();
+        index.scan(&dir).unwrap();
+        let mut snap = crate::analytics::snapshot(
+            index.conn(),
+            &Tuning::default(),
+            datetime!(2026-09-12 12:00 UTC),
+        )
+        .unwrap();
+        assert_eq!(snap.summary.unmeasured, 1, "it is in the snapshot");
+
+        // Something for the critical event to carry, and a baseline that
+        // knew nothing, so that every critical is new.
+        let m = snap.machines[0].clone();
+        snap.flags.push(flag(
+            &m.key,
+            m.hostname.as_deref().unwrap_or("H"),
+            "drive_failing",
+        ));
+        let mut before = snap.clone();
+        before.flags.clear();
+        let news = new_criticals(&before, &snap).expect("a baseline");
+
+        for out in [
+            digest_event(
+                "https://fleet.example.com",
+                DigestSchedule::Daily,
+                &snap,
+                None,
+                datetime!(2026-11-12 08:00 UTC),
+            ),
+            critical_event(
+                "https://fleet.example.com",
+                &news,
+                datetime!(2026-11-12 08:00 UTC),
+            ),
+        ] {
+            let text = String::from_utf8(out.body).expect("UTF-8").to_lowercase();
+            for word in [
+                "unmeasured",
+                "never measured",
+                "skipped",
+                "on_battery",
+                "tried",
+            ] {
+                assert!(!text.contains(word), "a payload carries a skipped machine");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A fleet whose every machine opted in to `--collect`, one without
     /// Secure Boot: neither payload says a word of it. A webhook goes to a
     /// chat channel, which is exactly where a list of unprotected machines

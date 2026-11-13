@@ -53,6 +53,8 @@ pub struct Runtime {
     pub scans_total: u64,
     pub scan_failures_total: u64,
     pub uploads_total: u64,
+    /// Run status records accepted, apart from results.
+    pub status_records_total: u64,
     pub uploads_limited_total: u64,
     pub tokens_unknown_total: u64,
     pub tokens_expired_total: u64,
@@ -73,6 +75,7 @@ impl Runtime {
             scans_total: 0,
             scan_failures_total: 0,
             uploads_total: 0,
+            status_records_total: 0,
             uploads_limited_total: 0,
             tokens_unknown_total: 0,
             tokens_expired_total: 0,
@@ -201,6 +204,12 @@ pub fn render(
 
     out.gauge("machines", "Machines in the index.", s.machines as f64);
     out.gauge("runs", "Result files indexed.", s.runs as f64);
+    out.gauge(
+        "machines_unmeasured",
+        "Machines that have told the server a scheduled run was skipped and have never been \
+         measured. Not in `machines`, which counts machines with a result.",
+        s.unmeasured as f64,
+    );
     out.gauge(
         "machines_flagged",
         "Machines carrying at least one warning or critical finding. Counts machines rather than \
@@ -357,6 +366,13 @@ pub fn render(
         runtime.uploads_total as f64,
     );
     out.counter(
+        "status_records_total",
+        "Run status records accepted through the upload endpoint since startup — a scheduled \
+         run that was skipped, on battery or because the machine was busy, telling the server \
+         it tried. Counted apart from results, and whether or not it replaced the record held.",
+        runtime.status_records_total as f64,
+    );
+    out.counter(
         "uploads_rate_limited_total",
         "Submissions refused for going too fast. Steadily above zero means a client in a loop \
          or a credential worth revoking — nothing here is a normal occurrence.",
@@ -460,6 +476,7 @@ mod tests {
             scans_total: 12,
             scan_failures_total: 1,
             uploads_total: 7,
+            status_records_total: 0,
             uploads_limited_total: 0,
             tokens_unknown_total: 2,
             tokens_expired_total: 0,

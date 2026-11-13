@@ -496,3 +496,70 @@ fn reference_writes_only_markdown_to_stdout() {
     );
     assert!(!text.contains('\u{1b}'), "stdout carried ANSI escape codes");
 }
+
+/// A machine that has only ever been skipped is one line of the printed
+/// report and a list in `--json`, and `forget` finds it by hostname — all
+/// through the real binary, with stdout still only the document.
+#[test]
+fn a_machine_only_ever_skipped_is_counted_in_report_and_forgettable() {
+    let dir = scratch("skipped");
+    let index = dir.join("i.db");
+    let index = index.to_str().expect("path");
+    let folder = dir.join("results");
+    std::fs::create_dir_all(&folder).expect("folder");
+    std::fs::copy(fixtures().join("win-modern.json"), folder.join("a.json")).expect("copy");
+    std::fs::write(
+        folder.join("status-x.json"),
+        serde_json::json!({
+            "schema": "loadbearer.run-status/1",
+            "timestamp": "2026-09-12T22:00:00Z",
+            "reason": "busy",
+            "detail": "busy: the CPU was at 80%",
+            "hostname": "NEVER-MEASURED-1",
+            "tags": { "site": "glasgow" },
+        })
+        .to_string(),
+    )
+    .expect("status file");
+
+    let scanned = stdout_of(&["--index", index, "scan", folder.to_str().expect("path")]);
+    assert!(scanned.contains("1 run status record(s) read"), "{scanned}");
+    assert!(
+        !scanned.contains("skipped "),
+        "not a rejected file: {scanned}"
+    );
+
+    let json = stdout_of(&["--index", index, "report", "--json"]);
+    let snap: serde_json::Value = serde_json::from_str(&json).expect("JSON");
+    assert_eq!(snap["summary"]["unmeasured"], 1);
+    assert_eq!(snap["unmeasured"][0]["hostname"], "NEVER-MEASURED-1");
+    assert_eq!(snap["summary"]["machines"], 1, "not a machine");
+
+    let text = stdout_of(&["--index", index, "report"]);
+    assert!(
+        text.contains("1 machine(s) tried and never measured"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("NEVER-MEASURED-1"),
+        "the line is a count: {text}"
+    );
+    assert!(!text.contains('\u{1b}'));
+
+    let plan = stdout_of(&["--index", index, "forget", "never-measured-1", "--dry-run"]);
+    assert!(plan.contains("would remove 0 run(s)"), "{plan}");
+    assert!(
+        plan.contains("would remove its run status record"),
+        "{plan}"
+    );
+    assert!(plan.contains("status-x.json"), "{plan}");
+    let done = stdout_of(&["--index", index, "forget", "NEVER-MEASURED-1"]);
+    assert!(done.contains("removed its run status record"), "{done}");
+
+    let after = stdout_of(&["--index", index, "report", "--json"]);
+    let snap: serde_json::Value = serde_json::from_str(&after).expect("JSON");
+    assert_eq!(snap["summary"]["unmeasured"], 0);
+    assert!(!after.contains("NEVER-MEASURED-1"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

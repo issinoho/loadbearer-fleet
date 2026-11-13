@@ -574,6 +574,11 @@ fn main() -> Result<()> {
                 if *reindex { "rebuilt" } else { "new" },
                 report.unchanged
             );
+            if report.statuses > 0 {
+                // Their own line: a skipped run's record is neither a result
+                // nor a rejected file.
+                println!("{} run status record(s) read", report.statuses);
+            }
             for (path, why) in &report.rejected {
                 // Rejections are reported, never fatal — one bad upload on a
                 // large share must not stop the rest being indexed.
@@ -596,7 +601,7 @@ fn main() -> Result<()> {
                 // a true statement about an empty index and a useless one: the
                 // question the reader actually has is whether they are looking
                 // at the right database.
-                [] if idx.machine_count()? == 0 => anyhow::bail!(
+                [] if idx.forgettable_count()? == 0 => anyhow::bail!(
                     "the index at {} holds no machines at all, so nothing could match \
                      {machine:?}. A service keeps its index where its configuration says — \
                      pass --config <file> to work on that one.",
@@ -607,7 +612,7 @@ fn main() -> Result<()> {
                      holds. Try the hostname, or the machine key the dashboard shows on the \
                      drilldown.",
                     config.server.index.display(),
-                    idx.machine_count()?
+                    idx.forgettable_count()?
                 ),
                 [one] => one.clone(),
                 // Hostnames get reissued, so two machines can share one. Which
@@ -661,6 +666,9 @@ fn main() -> Result<()> {
                 target.hostname.as_deref().unwrap_or("no hostname recorded"),
                 target.key
             );
+            if plan.statuses > 0 {
+                println!("{verb} its run status record");
+            }
             if !plan.archived.is_empty() {
                 println!("{verb} {} archived document(s)", plan.archived.len());
             }
@@ -1079,6 +1087,16 @@ fn print_report(snap: &analytics::Snapshot, show_all: bool) {
         "  {} machine(s) need attention — {} critical, {} warning, {} informational",
         s.machines_flagged, s.critical, s.warnings, s.info
     );
+    // Not in the machine count above: these have no result, only a record
+    // that a scheduled run was skipped. The names are on the dashboard and in
+    // `--json`.
+    if s.unmeasured > 0 {
+        println!(
+            "  {} machine(s) tried and never measured — a scheduled run was skipped on battery \
+             or because the machine was busy",
+            s.unmeasured
+        );
+    }
     // Said whenever an override changed anything, because a machine judged
     // against other lines looks, in a list of findings, like one judged
     // against the same lines and found fine.

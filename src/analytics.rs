@@ -691,6 +691,47 @@ pub struct MachineView {
     pub overridden_by: Vec<AppliedOverride>,
     pub run_id: i64,
     pub source_path: String,
+    /// The machine's latest run status record, **only when it is newer than
+    /// the latest run**: a collector that tried since and was skipped. An older
+    /// one says nothing the newer result does not. Set by the live `snapshot`
+    /// alone, never by a reconstruction of the past, which has only the latest
+    /// record to go on.
+    pub last_skip: Option<LastSkip>,
+}
+
+/// A skipped run, as the machine's own view carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LastSkip {
+    pub at: String,
+    /// `on_battery` or `busy` today; an open string.
+    pub reason: Option<String>,
+    /// The sentence the skip printed.
+    pub detail: Option<String>,
+}
+
+impl LastSkip {
+    /// The reason in words: `on_battery` as "on battery". Open, so whatever a
+    /// newer collector sends is shown as it came, underscores aside.
+    pub fn reason_words(&self) -> String {
+        self.reason
+            .as_deref()
+            .map(|r| r.replace('_', " "))
+            .unwrap_or_else(|| "no reason given".to_string())
+    }
+}
+
+/// A machine that has told the server a scheduled run was skipped and has
+/// never been measured. Not a `MachineView`: everything downstream of one
+/// assumes a run, and this has none. Listed apart, counted apart, and judged
+/// by nothing — it is not a finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unmeasured {
+    pub key: String,
+    pub hostname: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub at: String,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// What a machine's age estimate rests on.
@@ -1149,6 +1190,9 @@ pub struct Summary {
     pub configurations: Vec<(String, usize)>,
     /// Machines per lifecycle verdict; adds up to `machines`.
     pub lifecycle: LifecycleCounts,
+    /// Machines that have only ever been skipped — see `Unmeasured`. Not in
+    /// `machines`, and so in none of the counts above.
+    pub unmeasured: usize,
 }
 
 /// Quieted findings by how they were quieted.
@@ -1200,6 +1244,10 @@ pub struct Snapshot {
     pub machines: Vec<MachineView>,
     pub cohorts: Vec<Cohort>,
     pub flags: Vec<Flag>,
+    /// Machines tried and never measured, newest first. Empty in a
+    /// reconstruction of the past. Projected by scope and filter with the
+    /// machines — see `Filter::matches_unmeasured`.
+    pub unmeasured: Vec<Unmeasured>,
 }
 
 /// One row of the slim history query.
@@ -1363,7 +1411,89 @@ pub fn snapshot(conn: &Connection, th: &Tuning, now: OffsetDateTime) -> Result<S
             .unwrap_or_default();
         place(m, &runs, now);
     }
-    assess(machines, th, now)
+
+    // The latest skip per machine. Only the live snapshot has it: the table
+    // holds the newest record and nothing before it, so a reconstructed week
+    // given it would describe a past that never had that record. `assess` is
+    // shared, so what it reads off the machine is how the two differ.
+    let statuses = load_statuses(conn)?;
+    let by_key: HashMap<&str, &StatusRow> = statuses.iter().map(|s| (s.key.as_str(), s)).collect();
+    for m in &mut machines {
+        let newer = by_key.get(m.key.as_str()).filter(|s| {
+            matches!((instant(&s.at), instant(&m.taken_at)), (Some(skip), Some(run)) if skip > run)
+        });
+        m.last_skip = newer.map(|s| LastSkip {
+            at: s.at.clone(),
+            reason: s.reason.clone(),
+            detail: s.detail.clone(),
+        });
+    }
+    let measured: HashSet<&str> = machines.iter().map(|m| m.key.as_str()).collect();
+    let mut unmeasured: Vec<Unmeasured> = statuses
+        .iter()
+        .filter(|s| !measured.contains(s.key.as_str()))
+        .map(|s| Unmeasured {
+            key: s.key.clone(),
+            hostname: s.hostname.clone(),
+            tags: s.tags.clone(),
+            at: s.at.clone(),
+            reason: s.reason.clone(),
+            detail: s.detail.clone(),
+        })
+        .collect();
+    // Newest attempt first, then by key, so the order never depends on the
+    // table's.
+    unmeasured.sort_by(|a, b| (instant(&b.at), &a.key).cmp(&(instant(&a.at), &b.key)));
+
+    let mut snap = assess(machines, th, now)?;
+    snap.summary.unmeasured = unmeasured.len();
+    snap.unmeasured = unmeasured;
+    Ok(snap)
+}
+
+/// One run status record, as the index holds it.
+struct StatusRow {
+    key: String,
+    hostname: Option<String>,
+    tags: BTreeMap<String, String>,
+    at: String,
+    reason: Option<String>,
+    detail: Option<String>,
+}
+
+fn load_statuses(conn: &Connection) -> Result<Vec<StatusRow>> {
+    let mut tags: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    let mut stmt = conn.prepare("SELECT machine_key, key, value FROM run_status_tag")?;
+    for row in stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (key, k, v) = row?;
+        tags.entry(key).or_default().insert(k, v);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT machine_key, hostname, at, reason, detail FROM run_status ORDER BY machine_key",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(StatusRow {
+            key: r.get(0)?,
+            hostname: r.get(1)?,
+            tags: BTreeMap::new(),
+            at: r.get(2)?,
+            reason: r.get(3)?,
+            detail: r.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let mut row = row?;
+        row.tags = tags.remove(&row.key).unwrap_or_default();
+        out.push(row);
+    }
+    Ok(out)
 }
 
 /// The fleet as it was known at each of `cutoffs`, oldest first, handed to
@@ -1484,6 +1614,8 @@ fn assess(
         machines,
         cohorts,
         flags,
+        // Only the live snapshot knows these; see `snapshot`.
+        unmeasured: Vec::new(),
     })
 }
 
@@ -1797,6 +1929,8 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
             cohort_delta_pct: None,
             trend_pct: None,
             run_id,
+            // Set by the live `snapshot`, which alone reads the status table.
+            last_skip: None,
         })
     })? {
         out.push(row?);
@@ -2428,10 +2562,18 @@ fn evaluate(
                 format!("Last measured {age:.0} days ago"),
                 format!(
                     "Taken {} with loadbearer {}. After {} days a result describes the machine \
-                     as it was rather than as it is.",
+                     as it was rather than as it is.{}",
                     m.taken_at,
                     m.tool_version,
-                    figure(th.stale_days)
+                    figure(th.stale_days),
+                    // A collector that is still trying is not one that stopped,
+                    // which is the question this finding raises.
+                    m.last_skip.as_ref().map_or(String::new(), |skip| format!(
+                        " It last tried on {}: skipped, {}. The collector is running; the \
+                         machine was not in a state to measure.",
+                        skip.at,
+                        skip.reason_words()
+                    ))
                 ),
             );
         }
@@ -2605,6 +2747,8 @@ fn summarise(machines: &[MachineView], cohorts: &[Cohort], flags: &[Flag]) -> Su
             .map(str::to_string),
         configurations,
         lifecycle: LifecycleCounts::of(machines),
+        // Set where the list is, which `summarise` is not given.
+        unmeasured: 0,
     }
 }
 
@@ -2676,6 +2820,48 @@ pub fn scopes_allow(scopes: &[BTreeMap<String, String>], tags: &BTreeMap<String,
 }
 
 impl Filter {
+    /// Whether a machine that was only ever skipped is in view.
+    ///
+    /// Scope first, as for a machine, and the tag filters and the search box,
+    /// which say something about a hostname or a tag. Every filter that is
+    /// about a measurement — age, cohort, flag, lifecycle, posture, system
+    /// model, CPU, OS — empties the list instead: a machine with no result is
+    /// not within a number of days of one, and answering "none" is the true
+    /// reading where listing it would pretend otherwise.
+    fn matches_unmeasured(&self, u: &Unmeasured) -> bool {
+        if self.max_age_days.is_some()
+            || self.cohort.is_some()
+            || self.flag.is_some()
+            || self.lifecycle.is_some()
+            || self.posture.is_some()
+            || self.system_model.is_some()
+            || self.cpu_model.is_some()
+            || self.os.is_some()
+        {
+            return false;
+        }
+        if !scopes_allow(&self.scopes, &u.tags) {
+            return false;
+        }
+        for (k, v) in &self.tags {
+            if u.tags.get(k).map(String::as_str) != Some(v.as_str()) {
+                return false;
+            }
+        }
+        if let Some(q) = &self.search {
+            let q = q.to_lowercase();
+            let hit = [Some(u.key.as_str()), u.hostname.as_deref()]
+                .into_iter()
+                .flatten()
+                .chain(u.tags.values().map(String::as_str))
+                .any(|f| f.to_lowercase().contains(&q));
+            if !hit {
+                return false;
+            }
+        }
+        true
+    }
+
     fn matches(&self, m: &MachineView, flagged: &HashSet<&str>) -> bool {
         if let Some(days) = self.max_age_days
             && m.age_days.is_none_or(|a| a > days)
@@ -2863,16 +3049,29 @@ impl Snapshot {
             })
             .collect();
 
+        // Scope applied here, with the machines': a viewer is never told
+        // that a machine outside their scope has been skipped, in the list or
+        // in the count.
+        let unmeasured: Vec<Unmeasured> = self
+            .unmeasured
+            .iter()
+            .filter(|u| f.matches_unmeasured(u))
+            .cloned()
+            .collect();
+        let mut summary = summarise(&machines, &cohorts, &flags);
+        summary.unmeasured = unmeasured.len();
+
         Snapshot {
             version: self.version,
             build: self.build,
             generated_at: self.generated_at.clone(),
             thresholds: self.thresholds.clone(),
             threshold_overrides: self.threshold_overrides.clone(),
-            summary: summarise(&machines, &cohorts, &flags),
+            summary,
             machines,
             cohorts,
             flags,
+            unmeasured,
         }
     }
 }
@@ -3490,6 +3689,32 @@ mod tests {
                     .unwrap(),
                 "each synthetic run must be a document the index has not seen"
             );
+        }
+
+        /// A run status record for `host` — keyed as `add` keys it, by the
+        /// serial — put through the real upload path into a folder of its own.
+        pub(super) fn skip(&mut self, host: &str, at: &str, reason: &str, tags: &[(&str, &str)]) {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let text = json!({
+                "schema": "loadbearer.run-status/1",
+                "tool_version": "1.9.0",
+                "timestamp": at,
+                "status": "skipped",
+                "reason": reason,
+                "detail": format!("{} (62%), and --not-on-battery was given", reason.replace('_', " ")),
+                "hostname": host,
+                "identity": { "serial": format!("SN-{host}") },
+                "tags": tags.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
+            })
+            .to_string();
+            let status = crate::schema::RunStatus::from_json(&text).expect("a status record");
+            let dir = std::env::temp_dir().join(format!(
+                "lbf-skip-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            self.idx.accept_status(&status, &text, &dir).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         pub(super) fn ingest(&mut self, name: &str) {
@@ -6143,6 +6368,224 @@ mod tests {
         let before_anything = e.snap_as_of(datetime!(2026-01-01 00:00:00 UTC));
         assert_eq!(before_anything.summary.machines, 0);
         assert!(before_anything.flags.is_empty());
+    }
+
+    #[test]
+    fn a_skip_shows_on_a_machine_only_when_it_is_newer_than_its_latest_run() {
+        let mut e = Estate::new();
+        e.add("NEWER-SKIP", 1000.0, "2026-09-01T10:00:00Z");
+        e.add("OLDER-SKIP", 1000.0, "2026-09-08T10:00:00Z");
+        e.add("SAME-INSTANT", 1000.0, "2026-09-05T10:00:00Z");
+        e.add("NO-SKIP", 1000.0, "2026-09-08T10:00:00Z");
+        e.skip(
+            "NEWER-SKIP",
+            "2026-09-05T22:39:57.1934416Z",
+            "on_battery",
+            &[],
+        );
+        e.skip("OLDER-SKIP", "2026-09-07T22:00:00Z", "busy", &[]);
+        e.skip("SAME-INSTANT", "2026-09-05T10:00:00.000Z", "busy", &[]);
+
+        let s = e.snap();
+        let skip = machine(&s, "NEWER-SKIP").last_skip.as_ref().expect("newer");
+        assert_eq!(skip.reason.as_deref(), Some("on_battery"));
+        assert_eq!(skip.at, "2026-09-05T22:39:57.1934416Z");
+        assert!(skip.detail.as_deref().unwrap().contains("--not-on-battery"));
+        for host in ["OLDER-SKIP", "SAME-INSTANT", "NO-SKIP"] {
+            assert!(machine(&s, host).last_skip.is_none(), "{host}");
+        }
+        assert!(s.unmeasured.is_empty(), "all four have runs");
+    }
+
+    /// The headline, severity and code do not move, so triage and "what
+    /// changed" are unaffected; only the detail says the collector is running.
+    /// And the reconstruction of a past week is given no skip, so its detail is
+    /// what it always was.
+    #[test]
+    fn the_stale_detail_says_the_collector_is_running_live_and_not_in_a_past_week() {
+        let mut with = Estate::new();
+        with.add("PC-1", 1000.0, "2026-01-01T10:00:00Z");
+        let mut without = Estate::new();
+        without.add("PC-1", 1000.0, "2026-01-01T10:00:00Z");
+        with.skip("PC-1", "2026-09-05T22:00:00Z", "on_battery", &[]);
+
+        let live = with.snap();
+        let plain = without.snap();
+        let (a, b) = (
+            &flags_for(&live, "stale")[0],
+            &flags_for(&plain, "stale")[0],
+        );
+        assert_eq!(
+            (a.headline.as_str(), a.severity, a.code),
+            (b.headline.as_str(), b.severity, b.code)
+        );
+        assert!(a.detail.starts_with(&b.detail), "{}", a.detail);
+        assert!(
+            a.detail.contains(
+                "It last tried on 2026-09-05T22:00:00Z: skipped, on battery. The collector is \
+                 running; the machine was not in a state to measure."
+            ),
+            "{}",
+            a.detail
+        );
+        assert_eq!(
+            b.detail,
+            plain
+                .flags
+                .iter()
+                .find(|f| f.code == "stale")
+                .unwrap()
+                .detail
+        );
+
+        // A week in which the machine was stale as well, reconstructed on the
+        // same index: the sentence is not there, and the text is the one the
+        // index without any skip gives.
+        let cutoff = datetime!(2026-06-01 10:00:00 UTC);
+        let past = with.snap_as_of(cutoff);
+        let past_plain = without.snap_as_of(cutoff);
+        let (a, b) = (
+            &flags_for(&past, "stale")[0],
+            &flags_for(&past_plain, "stale")[0],
+        );
+        assert_eq!(a.detail, b.detail);
+        assert!(!a.detail.contains("collector is running"));
+        assert!(past.machines[0].last_skip.is_none());
+        assert!(past.unmeasured.is_empty());
+    }
+
+    /// A machine that has only ever been skipped is not a machine: it is in
+    /// its own list and count, and in none of the machine counts or findings.
+    #[test]
+    fn a_machine_only_ever_skipped_is_listed_apart_and_goes_with_its_first_result() {
+        let mut e = Estate::new();
+        e.add("PC-1", 1000.0, "2026-09-08T10:00:00Z");
+        e.skip(
+            "NEW-1",
+            "2026-09-08T22:00:00Z",
+            "busy",
+            &[("site", "glasgow")],
+        );
+
+        let s = e.snap();
+        assert_eq!(s.summary.machines, 1);
+        assert_eq!(s.machines.len(), 1);
+        assert_eq!(s.summary.unmeasured, 1);
+        let u = &s.unmeasured[0];
+        assert_eq!(u.hostname.as_deref(), Some("NEW-1"));
+        assert_eq!(u.key, "SN-NEW-1");
+        assert_eq!(u.reason.as_deref(), Some("busy"));
+        assert_eq!(u.tags.get("site").map(String::as_str), Some("glasgow"));
+        assert!(
+            s.flags.iter().all(|f| f.machine_key != u.key),
+            "not a finding"
+        );
+        assert_eq!(s.summary.stale + s.summary.partial, 0);
+
+        // Its first result arrives, taken before the skip: it is a machine
+        // now, with the skip as its last attempt.
+        e.add("NEW-1", 1000.0, "2026-09-08T12:00:00Z");
+        let s = e.snap();
+        assert!(s.unmeasured.is_empty());
+        assert_eq!(s.summary.unmeasured, 0);
+        assert_eq!(s.summary.machines, 2);
+        assert!(machine(&s, "NEW-1").last_skip.is_some());
+    }
+
+    #[test]
+    fn the_unmeasured_list_is_newest_first_and_scoped_like_the_machines() {
+        let mut e = Estate::new();
+        e.add("PC-1", 1000.0, "2026-09-08T10:00:00Z");
+        e.skip(
+            "G-OLD",
+            "2026-09-01T22:00:00Z",
+            "busy",
+            &[("site", "glasgow")],
+        );
+        e.skip(
+            "G-NEW",
+            "2026-09-05T22:00:00Z",
+            "on_battery",
+            &[("site", "glasgow")],
+        );
+        e.skip(
+            "E-1",
+            "2026-09-03T22:00:00Z",
+            "busy",
+            &[("site", "edinburgh")],
+        );
+        e.skip("NO-TAGS", "2026-09-04T22:00:00Z", "busy", &[]);
+        let s = e.snap();
+        let hosts = |s: &Snapshot| -> Vec<String> {
+            s.unmeasured
+                .iter()
+                .map(|u| u.hostname.clone().unwrap())
+                .collect()
+        };
+        assert_eq!(hosts(&s), ["G-NEW", "NO-TAGS", "E-1", "G-OLD"]);
+
+        let scoped = |scope: &[(&str, &str)]| Filter {
+            scopes: vec![
+                scope
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ],
+            ..Filter::default()
+        };
+        let glasgow = s.filtered(&scoped(&[("site", "glasgow")]));
+        assert_eq!(hosts(&glasgow), ["G-NEW", "G-OLD"]);
+        assert_eq!(glasgow.summary.unmeasured, 2, "the count is projected too");
+        let json = serde_json::to_string(&glasgow).unwrap();
+        assert!(
+            !json.contains("E-1") && !json.contains("NO-TAGS"),
+            "no trace of the others"
+        );
+
+        // Searching, or asking for the tag, cannot widen a scope.
+        let mut f = scoped(&[("site", "glasgow")]);
+        f.search = Some("E-1".into());
+        assert!(s.filtered(&f).unmeasured.is_empty());
+        let mut f = scoped(&[("site", "glasgow")]);
+        f.tags.insert("site".into(), "edinburgh".into());
+        assert!(s.filtered(&f).unmeasured.is_empty());
+
+        // Unscoped, the tag filters and the search box narrow it.
+        let mut f = Filter::default();
+        f.tags.insert("site".into(), "edinburgh".into());
+        assert_eq!(hosts(&s.filtered(&f)), ["E-1"]);
+        let f = Filter {
+            search: Some("g-new".into()),
+            ..Filter::default()
+        };
+        assert_eq!(hosts(&s.filtered(&f)), ["G-NEW"]);
+        assert_eq!(s.filtered(&f).summary.unmeasured, 1);
+
+        // A filter about measurements empties it rather than pretend.
+        for f in [
+            Filter {
+                max_age_days: Some(30.0),
+                ..Filter::default()
+            },
+            Filter {
+                cohort: Some("x".into()),
+                ..Filter::default()
+            },
+            Filter {
+                flag: Some("stale".into()),
+                ..Filter::default()
+            },
+            Filter {
+                lifecycle: Some(Verdict::Keep),
+                ..Filter::default()
+            },
+            Filter {
+                os: Some("Windows".into()),
+                ..Filter::default()
+            },
+        ] {
+            assert!(s.filtered(&f).unmeasured.is_empty(), "{f:?}");
+        }
     }
 
     /// Stale means "not measured for a while" *as of the date being looked

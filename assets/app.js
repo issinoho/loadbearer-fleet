@@ -2308,6 +2308,47 @@ function findingRow(f, machinesByKey) {
   ])]);
 }
 
+/** Why a run was skipped, in the sentence the collector printed where there is
+ *  one, and in the reason's words where there is not. Both are open strings. */
+function skipWords(skip) {
+  return skip.detail || (skip.reason ? skip.reason.replace(/_/g, ' ') : 'no reason given');
+}
+
+/** How many machines the "Tried, never measured" card lists before it says
+ *  how many more there are. */
+const UNMEASURED_SHOWN = 20;
+
+/** Machines that told the server a run was skipped and have never been
+ *  measured. Not findings and not in the queues: there is nothing to judge,
+ *  only a collector that is running and has not yet had its chance. Absent
+ *  when there are none, and built from the same rows as a finding so it wraps
+ *  the same way on a phone. */
+function unmeasuredCard(snap) {
+  const list = snap.unmeasured || [];
+  if (!list.length) return null;
+  const total = snap.summary.unmeasured ?? list.length;
+  return el('div', { class: 'card col-12', dataset: { card: 'unmeasured' } }, [
+    el('div', { class: 'card-head' }, [el('h3', { text: 'Tried, never measured' })]),
+    el('p', {
+      class: 'card-sub',
+      text: `${nf0.format(total)} machine(s) have told the server that a scheduled run was skipped, and have no `
+        + 'result yet. The collector is running; the machine was not in a state to be measured.',
+    }),
+    el('div', { class: 'finding-list' }, list.slice(0, UNMEASURED_SHOWN).map((u) => el('div', { class: 'finding' }, [
+      el('div', {}, [
+        el('div', { class: 'finding-head' }, [
+          el('span', { class: 'finding-who', text: u.hostname || u.key }),
+          el('span', { class: 'finding-queue', text: when(u.at) }),
+        ]),
+        el('p', { class: 'finding-detail', text: `skipped: ${skipWords(u)}` }),
+      ]),
+    ]))),
+    total > UNMEASURED_SHOWN
+      ? el('p', { class: 'card-note', text: `Showing the ${UNMEASURED_SHOWN} most recent of ${nf0.format(total)}.` })
+      : null,
+  ]);
+}
+
 /** "3 acknowledged · 1 snoozed · 12 suppressed", or null when none are. */
 function quietedWords(q) {
   if (!q) return null;
@@ -2497,7 +2538,7 @@ export async function renderOverview(main) {
   ]);
 
   main.append(actions, el('div', { class: 'grid' }, [
-    hero, tiles, changesSlot, gradeCard, findingsCard, spreadCard, list, configs, overTimeSlot,
+    hero, tiles, unmeasuredCard(state.snap), changesSlot, gradeCard, findingsCard, spreadCard, list, configs, overTimeSlot,
   ]));
 
   const [changes, timeline] = await Promise.all([
@@ -3903,6 +3944,9 @@ export async function renderMachine(main, key) {
     ...(uptime ? [['Uptime', uptime]] : []),
     ['Measured', `${when(m.taken_at)} (${ago(m.age_days)})${lasted ? ` · took ${lasted}` : ''}`
       + (elevation ? ` · ${elevation}` : '')],
+    // Only when the server holds a skip newer than this run: the collector
+    // tried since, and the machine was not in a state to be measured.
+    ...(m.last_skip ? [['Last attempt', `${when(m.last_skip.at)} — skipped: ${skipWords(m.last_skip)}`]] : []),
     ...(m.run_uuid ? [['Run ID', m.run_uuid]] : []),
     ['loadbearer', m.tool_version],
     ['Configuration', `${m.comparability.preset} · ${m.comparability.profile} · ${m.comparability.baseline} · ${m.comparability.build_isa}`],

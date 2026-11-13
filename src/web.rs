@@ -50,7 +50,7 @@ use tower_http::trace::TraceLayer;
 use crate::analytics::{
     self, Cohort, Detail, Filter, Flag, MachineView, Snapshot, Timeline, Tuning,
 };
-use crate::auth::{self, Authenticator, Caller, IngestTokens, Submitter, token_matches};
+use crate::auth::{self, Authenticator, Caller, IngestTokens, Principal, Submitter, token_matches};
 use crate::compare;
 use crate::config::{AuthMode, Config, DigestSchedule, Metrics as MetricsConfig};
 use crate::export;
@@ -873,7 +873,8 @@ struct MachinePayload {
 #[derive(Debug, Serialize)]
 struct UploadOutcome {
     /// `added` or `already indexed` — the second is a normal answer, not a
-    /// failure, because ingest is idempotent by content.
+    /// failure, because ingest is idempotent by content — or `recorded`, for
+    /// a run status record, whether or not it replaced the one held.
     outcome: &'static str,
     machine_key: String,
     hostname: Option<String>,
@@ -901,6 +902,11 @@ struct UploadOutcome {
 /// 4. **It parses, and it is in scope.** A contributor scoped to one site may
 ///    not submit a result claiming to be from another; the same
 ///    `scopes_allow` that decides what they may *read* decides this.
+///
+/// The document may be a result or a run status record (`loadbearer.run-status`,
+/// sent when a scheduled run is skipped on battery or because the machine is
+/// busy). Both go through every step above; only what is done with a parsed one
+/// differs. A status record is also held to a far smaller size than a result.
 ///
 /// The body size is capped at the route, at the same limit the scanner
 /// applies to a file on disk.
@@ -948,10 +954,21 @@ async fn post_upload(
     }
 
     // Parsed here as well as in the index, because the scope check needs the
-    // tags before anything is written, and a document that is not a result
-    // should be refused in the reader's own words.
-    let doc = crate::schema::ResultFile::from_json(&body)
-        .map_err(|e| AppError::bad_request(format!("{e:#}")))?;
+    // tags before anything is written, and a document that is not one of the
+    // two should be refused in the reader's own words.
+    let doc = match crate::schema::Document::from_json(&body) {
+        Ok(crate::schema::Document::Result(doc)) => doc,
+        Ok(crate::schema::Document::Status(status)) => {
+            return upload_status(&state, &who, &dir, &status, &body);
+        }
+        Err(e) if e.is::<crate::schema::StatusTooLarge>() => {
+            return Err(AppError::at(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("{e:#}"),
+            ));
+        }
+        Err(e) => return Err(AppError::bad_request(format!("{e:#}"))),
+    };
     if !analytics::scopes_allow(&who.scopes, &doc.tags) {
         // Deliberately not "your scope is X": that would tell a caller what
         // else exists. It says what they sent and what it needed.
@@ -978,6 +995,51 @@ async fn post_upload(
         outcome: if fresh { "added" } else { "already indexed" },
         machine_key: doc.machine_key().value,
         hostname: doc.machine.hostname.clone(),
+    }))
+}
+
+/// The run status half of [`post_upload`], after the gates it shares: scope,
+/// then one file per machine in `dir`.
+fn upload_status(
+    state: &AppState,
+    who: &Principal,
+    dir: &std::path::Path,
+    status: &crate::schema::RunStatus,
+    body: &str,
+) -> Result<Json<UploadOutcome>, AppError> {
+    // The same rule as a result's, so a contributor scoped to one site can
+    // only say its own machines were skipped.
+    if !analytics::scopes_allow(&who.scopes, &status.tags) {
+        return Err(AppError::forbidden(
+            "this record is not tagged as one you may submit. A scoped contributor may only \
+             submit what carries the tags their grant names — which means whoever runs \
+             loadbearer has to pass them with --tag.",
+        ));
+    }
+    let key = status.machine_key();
+    let replaced = {
+        let mut idx = state.index.lock().expect("index lock");
+        idx.accept_status(status, body, dir)
+            .map_err(|e| AppError::bad_request(format!("{e:#}")))?
+    };
+    state
+        .runtime
+        .lock()
+        .expect("runtime lock")
+        .status_records_total += 1;
+    // The machine and the reason, as for a result: the identity values are
+    // not logged beyond the key a result upload already logs.
+    tracing::info!(
+        by = %loggable(&who.subject),
+        machine = %loggable(&key.value),
+        reason = %loggable(status.reason.as_deref().unwrap_or("none given")),
+        replaced,
+        "run status uploaded"
+    );
+    Ok(Json(UploadOutcome {
+        outcome: "recorded",
+        machine_key: key.value,
+        hostname: status.hostname.clone(),
     }))
 }
 
@@ -1991,7 +2053,6 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::auth::Principal;
     use crate::config::{Auth, Grant, IngestToken, Role};
 
     fn fixtures() -> PathBuf {
@@ -4328,7 +4389,7 @@ mod tests {
         let row = |host: &str| rows.iter().find(|r| r["hostname"] == host).expect(host);
         let cells = |host: &str| -> Vec<String> {
             let r = row(host);
-            export::MACHINE_COLUMNS[46..]
+            export::MACHINE_COLUMNS[46..56]
                 .iter()
                 .map(|c| r[*c].clone())
                 .collect()
@@ -5853,5 +5914,314 @@ stale_days = 30
         );
         assert_eq!(snap["threshold_overrides"][0]["tags"]["site"], "edinburgh");
         assert_eq!(snap["threshold_overrides"][0]["set"]["stale_days"], 30.0);
+    }
+    // --- run status records --------------------------------------------------
+
+    /// A run status record for `host`, filed under its hostname alone unless
+    /// `identity` says otherwise.
+    fn a_skip(host: &str, at: &str, tags: serde_json::Value) -> String {
+        serde_json::json!({
+            "schema": "loadbearer.run-status/1",
+            "tool_version": "1.9.0",
+            "timestamp": at,
+            "status": "skipped",
+            "reason": "on_battery",
+            "detail": "on battery (62%), and --not-on-battery was given",
+            "hostname": host,
+            "tags": tags,
+        })
+        .to_string()
+    }
+
+    fn names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The same gate as a result, in the same order, and then one file per
+    /// machine.
+    #[tokio::test]
+    async fn a_run_status_record_gets_every_gate_a_result_does_and_is_kept_one_file_per_machine() {
+        let dir = std::env::temp_dir().join(format!("lbf-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let skip = a_skip("PC-NEW-1", "2026-09-11T22:00:00Z", serde_json::json!({}));
+
+        // No upload_dir: refused as a result is.
+        let closed = state_for(&oidc_config());
+        let admin = session(&closed, Role::Admin, &[]);
+        let shut = post_body(
+            &closed,
+            "/api/upload",
+            "application/json",
+            &skip,
+            Some(&admin),
+        )
+        .await;
+        assert_eq!(shut.status, StatusCode::BAD_REQUEST);
+        assert!(shut.body.contains("upload_dir"), "{}", shut.body);
+
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        let state = state_for(&config);
+        let post = |body: String, cookie: Option<String>, ct: &'static str| {
+            let state = Arc::clone(&state);
+            async move { post_body(&state, "/api/upload", ct, &body, cookie.as_deref()).await }
+        };
+        let viewer = session(&state, Role::Viewer, &[]);
+        let contributor = session(&state, Role::Contributor, &[]);
+
+        assert_eq!(
+            post(skip.clone(), None, "application/json").await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        let refused = post(skip.clone(), Some(viewer), "application/json").await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        let wrong = post(
+            skip.clone(),
+            Some(contributor.clone()),
+            "application/x-www-form-urlencoded",
+        )
+        .await;
+        assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
+        assert!(names_in(&dir).is_empty(), "nothing refused is written");
+
+        // Accepted: the exact shape, with the new word.
+        let ok = post(skip.clone(), Some(contributor.clone()), "application/json").await;
+        assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+        assert_eq!(
+            ok.json(),
+            serde_json::json!({
+                "outcome": "recorded",
+                "machine_key": "PC-NEW-1",
+                "hostname": "PC-NEW-1",
+            })
+        );
+        let held = names_in(&dir);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(
+            held[0].starts_with("status-") && held[0].ends_with(".json"),
+            "{held:?}"
+        );
+        assert!(
+            !held[0].contains("PC-NEW"),
+            "never named from what the sender chose"
+        );
+
+        // Newer replaces it; the file is still the one file.
+        let newer = a_skip("PC-NEW-1", "2026-09-12T22:00:00Z", serde_json::json!({}));
+        let again = post(newer.clone(), Some(contributor.clone()), "application/json").await;
+        assert_eq!(again.json()["outcome"], "recorded");
+        assert_eq!(names_in(&dir), held);
+        assert_eq!(std::fs::read_to_string(dir.join(&held[0])).unwrap(), newer);
+
+        // Older is acknowledged and dropped: the file keeps the newer one.
+        let older = a_skip("PC-NEW-1", "2026-09-01T22:00:00Z", serde_json::json!({}));
+        let dropped = post(older, Some(contributor.clone()), "application/json").await;
+        assert_eq!(dropped.status, StatusCode::OK);
+        assert_eq!(dropped.json()["outcome"], "recorded");
+        assert_eq!(std::fs::read_to_string(dir.join(&held[0])).unwrap(), newer);
+
+        // Another machine, another file; a result still goes in as before.
+        post(
+            a_skip("PC-NEW-2", "2026-09-12T22:00:00Z", serde_json::json!({})),
+            Some(contributor.clone()),
+            "application/json",
+        )
+        .await;
+        assert_eq!(names_in(&dir).len(), 2);
+        let result = post(
+            a_later_run(serde_json::json!({})),
+            Some(contributor.clone()),
+            "application/json",
+        )
+        .await;
+        assert_eq!(result.json()["outcome"], "added");
+
+        // Too big for one, and not a doorway for a result-sized document;
+        // another major is refused as a result's is.
+        let mut big: serde_json::Value = serde_json::from_str(&skip).unwrap();
+        big["detail"] = serde_json::json!("x".repeat(crate::schema::MAX_STATUS_BYTES));
+        let big = post(
+            big.to_string(),
+            Some(contributor.clone()),
+            "application/json",
+        )
+        .await;
+        assert_eq!(big.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", big.body);
+        let mut major: serde_json::Value = serde_json::from_str(&skip).unwrap();
+        major["schema"] = serde_json::json!("loadbearer.run-status/2");
+        let major = post(
+            major.to_string(),
+            Some(contributor.clone()),
+            "application/json",
+        )
+        .await;
+        assert_eq!(major.status, StatusCode::BAD_REQUEST);
+        assert!(major.body.contains("schema major 2"), "{}", major.body);
+        assert_eq!(names_in(&dir).len(), 3, "the refused two are not written");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scope check a result gets, on the token a machine really uses.
+    #[tokio::test]
+    async fn a_site_scoped_token_records_skips_for_its_own_site_only() {
+        let dir = std::env::temp_dir().join(format!("lbf-statusscope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.ingest.tokens = vec![token("site-glasgow", "s3cret", &[("site", "glasgow")])];
+        let state = state_for(&config);
+
+        let mine = a_skip(
+            "GLA-1",
+            "2026-09-12T22:00:00Z",
+            serde_json::json!({ "site": "glasgow" }),
+        );
+        let ok = post_token(&state, &mine, "s3cret").await;
+        assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+        assert_eq!(names_in(&dir).len(), 1);
+
+        for tags in [
+            serde_json::json!({ "site": "edinburgh" }),
+            serde_json::json!({}),
+        ] {
+            let theirs = a_skip("EDI-1", "2026-09-12T22:00:00Z", tags);
+            let refused = post_token(&state, &theirs, "s3cret").await;
+            assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+            assert!(refused.body.contains("--tag"), "{}", refused.body);
+        }
+        assert_eq!(names_in(&dir).len(), 1, "nothing refused reaches the disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A machine that has only ever been skipped is a Glasgow machine or an
+    /// Edinburgh one like any other, to whoever may see it: through the
+    /// snapshot, its count, a search, the CSV and the machine page.
+    #[tokio::test]
+    async fn an_unmeasured_machine_is_seen_only_by_those_whose_scope_holds_it() {
+        let dir = std::env::temp_dir().join(format!("lbf-unmeasured-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let mut config = oidc_config();
+        config.server.upload_dir = Some(dir.clone());
+        config.metrics.enabled = true;
+        let state = state_for(&config);
+        let admin = session(&state, Role::Admin, &[]);
+        let glasgow = session(&state, Role::Viewer, &[&[("site", "glasgow")]]);
+
+        let before = get(&state, "/api/snapshot", Some(&admin)).await.json();
+        assert_eq!(before["summary"]["unmeasured"], 0);
+        assert_eq!(before["unmeasured"], serde_json::json!([]));
+
+        for (host, site) in [("GLA-NEW", "glasgow"), ("EDI-NEW", "edinburgh")] {
+            let r = post_body(
+                &state,
+                "/api/upload",
+                "application/json",
+                &a_skip(
+                    host,
+                    "2026-09-12T22:00:00Z",
+                    serde_json::json!({ "site": site }),
+                ),
+                Some(&admin),
+            )
+            .await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+        }
+        // A record for a machine that has results, newer than its latest.
+        let r = post_body(
+            &state,
+            "/api/upload",
+            "application/json",
+            &serde_json::json!({
+                "schema": "loadbearer.run-status/1",
+                "timestamp": "2026-12-01T10:00:00Z",
+                "reason": "busy",
+                "detail": "busy: the CPU was at 80%",
+                "identity": { "serial": "SN-WIN-0001" },
+                "tags": { "site": "glasgow" },
+            })
+            .to_string(),
+            Some(&admin),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+        state.recompute().expect("recompute");
+
+        let all = get(&state, "/api/snapshot", Some(&admin)).await.json();
+        assert_eq!(all["summary"]["unmeasured"], 2);
+        assert_eq!(all["unmeasured"].as_array().unwrap().len(), 2);
+        assert_eq!(all["summary"]["machines"], before["summary"]["machines"]);
+        let win = all["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["hostname"] == "FLEET-WIN-01")
+            .unwrap();
+        assert_eq!(win["last_skip"]["reason"], "busy");
+        assert_eq!(win["last_skip"]["detail"], "busy: the CPU was at 80%");
+
+        let mine = get(&state, "/api/snapshot", Some(&glasgow)).await;
+        assert!(!mine.body.contains("EDI-NEW"), "{}", mine.body);
+        let mine = mine.json();
+        assert_eq!(mine["summary"]["unmeasured"], 1);
+        assert_eq!(mine["unmeasured"][0]["hostname"], "GLA-NEW");
+
+        // A search, or the other site's tag, cannot reach past the scope.
+        for q in ["q=EDI-NEW", "tags=site%3Dedinburgh"] {
+            let r = get(&state, &format!("/api/snapshot?{q}"), Some(&glasgow)).await;
+            assert!(!r.body.contains("EDI-NEW"), "{q}");
+            assert_eq!(r.json()["summary"]["unmeasured"], 0, "{q}");
+        }
+        let found = get(&state, "/api/snapshot?q=EDI-NEW", Some(&admin))
+            .await
+            .json();
+        assert_eq!(found["unmeasured"][0]["hostname"], "EDI-NEW");
+
+        // Never a machine: no page, in anyone's view.
+        let page = get(&state, "/api/machine/GLA-NEW", Some(&admin)).await;
+        assert_eq!(page.status, StatusCode::NOT_FOUND);
+
+        // The machines table: only machines, the skip columns filled for the
+        // one with a newer skip, and nothing of the other site.
+        let csv = get(&state, "/api/machines.csv", Some(&glasgow)).await;
+        assert!(
+            !csv.body.contains("EDI-NEW") && !csv.body.contains("GLA-NEW"),
+            "{}",
+            csv.body
+        );
+        let (_, rows) = csv_of(&csv);
+        let row = rows
+            .iter()
+            .find(|r| r["hostname"] == "FLEET-WIN-01")
+            .unwrap();
+        assert_eq!(row["last_skip_at"], "2026-12-01T10:00:00Z");
+        assert_eq!(row["last_skip_reason"], "busy");
+        assert!(
+            rows.iter()
+                .filter(|r| r["hostname"] != "FLEET-WIN-01")
+                .all(|r| r["last_skip_at"].is_empty() && r["last_skip_reason"].is_empty())
+        );
+
+        // Counted, in aggregate and by nothing per machine.
+        let scrape = get(&state, "/metrics", None).await.body;
+        assert!(
+            scrape.contains("loadbearer_fleet_status_records_total 3"),
+            "{scrape}"
+        );
+        assert!(
+            scrape.contains("loadbearer_fleet_machines_unmeasured 2"),
+            "{scrape}"
+        );
+        assert!(!scrape.contains("GLA-NEW") && !scrape.contains("EDI-NEW"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

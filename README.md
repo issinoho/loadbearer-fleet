@@ -264,8 +264,10 @@ tells you the index is safe to delete. Inside the folder it is an ordinary
 result file that a rebuild finds again.
 
 Anything submitted is checked before it is kept — it must parse as a
-`loadbearer.result/1`, it must be under 16 MB, and a contributor whose grant is
-scoped to a site may only submit results tagged for that site. The file is
+`loadbearer.result/1` (or as a [run status record](#a-skipped-run-tells-the-server-so),
+the one other document the endpoint takes), it must be under 16 MB, and a
+contributor whose grant is scoped to a site may only submit results tagged for
+that site. The file is
 named from the *document*, never from the request. The
 [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API#submitting-a-result)
 page has the whole of it, including `POST /api/upload` for scripting.
@@ -370,6 +372,76 @@ is the one file besides the collection folder that has to be [backed
 up](#backup-restore-and-moving-to-another-server) — and on a version a release
 does not understand, the server refuses to start rather than set it aside and
 begin empty.
+
+### A skipped run tells the server so
+
+A machine that keeps being skipped — on battery, or too busy for `--if-idle` —
+and one whose collector has stopped both look the same from here: stale. A
+loadbearer release after 1.8.1 closes that gap. When a scheduled run is skipped
+for either reason, and only when it has an `--upload` target, it posts a **run
+status record** to the same endpoint, with the same token, as
+`loadbearer.run-status/1`:
+
+```json
+{"schema":"loadbearer.run-status/1","tool_version":"1.9.0","timestamp":"2026-11-13T22:39:57Z",
+ "status":"skipped","reason":"on_battery","detail":"on battery (62%), and --not-on-battery was given",
+ "hostname":"PC-0142","identity":{"serial":"…"},"tags":{"site":"glasgow"}}
+```
+
+It carries the machine's identity and tags and nothing else about it — no
+inventory, no power state, nothing opted into with `--collect`. `status` and
+`reason` are open strings, and unknown fields are ignored, like the result
+reader. The record goes through every check a result does, in the same order,
+including the tag scope: a token scoped to Glasgow can only say Glasgow machines
+were skipped. It is filed under the **same machine key** a result from that
+machine gets, by the same code, so the two meet. It is a few hundred bytes, and
+one over 64 KB is refused (`413`). The answer is `200` with
+`{"outcome":"recorded","machine_key":…,"hostname":…}`.
+
+**It is kept as one file per machine, and that file is replaced.** It lands in
+`upload_dir` as `status-<16 hex digits of the key's SHA-256>.json` — a name no
+result can have, and nothing the sender chose — written through a temporary
+file and a rename. A record whose `timestamp` is not newer than the file
+already there is acknowledged and dropped. It is not archived: `archive_dir`
+is for results, and a status record is a statement about now. Like everything
+else it is **derived**: a scan reads `status-*.json` (or a status file dropped
+in the folder by anything else) into a `run_status` table, one row per machine
+and the newest wins, `scan --reindex` rebuilds it, and a status file is **not a
+rejected file** — it has its own count (`scan` prints "N run status record(s)
+read") and is in neither `scan_files_rejected` nor the rejected list. As with a
+result, deleting a status file from the folder leaves the row until
+`forget`.
+
+What the dashboard does with it:
+
+- **A machine with results** shows `last_skip` (when, `reason`, `detail`) only
+  when the record is **newer than its latest run**; an older one says nothing
+  the result does not. The machine page has one line for it, *Last attempt*,
+  and the **stale** finding's detail gains a sentence — "It last tried on …:
+  skipped, on battery. The collector is running; the machine was not in a state
+  to measure." Its headline, severity and code are unchanged, so triage and
+  "what changed" are unaffected, and the sentence is **live only**: a past
+  week on the timeline is judged without it, as it was, because the table holds
+  just the latest record. The machines CSV has `last_skip_at` and
+  `last_skip_reason`, empty when there is none.
+- **A machine that has only ever been skipped** is not a machine — it has no
+  run for anything downstream to read. It is listed apart as `unmeasured` in
+  the snapshot (key, hostname, tags, when, reason, detail) and counted in
+  `summary.unmeasured`, and the Overview has a **Tried, never measured** card
+  for it, shown only when there is one, listing the twenty most recent with the
+  total. It is no finding, in no queue, and in neither the webhook nor the
+  digest. Both the list and the count are projected through the caller's scope
+  exactly as machines are; the tag filters and the search box narrow it, and a
+  filter about a measurement (age, cohort, finding, lifecycle, posture, model,
+  CPU, OS) empties it. `report` prints a line with the count and `report
+  --json` carries the list. Its first result makes it an ordinary machine.
+- **`forget`** finds it by hostname or key and removes its status row; like a
+  result file, the status file in the collection folder is reported rather
+  than deleted.
+
+Two metrics: `status_records_total` counts the records accepted (whether or not
+they replaced one) and `machines_unmeasured` is the fleet-wide count; neither
+has a machine label.
 
 ### Name the collected copy per run, not per machine
 
@@ -578,7 +650,7 @@ means an estate owner reads a thermal caveat as a failing asset:
 | --- | --- | --- |
 | **machine** | a hardware decision — repair, replace, reassign | low grade, cohort outlier, regression, one weak component, worn battery, failing or worn drive, media errors, nearly full disk, firmware behind its peers or simply old, Secure Boot read as off |
 | **measurement** | the number can't be trusted until collection is fixed | thermally limited, run on battery, held back by its power settings, partial run, RAM-backed disk target, unstable CPU timings |
-| **coverage** | about the data we hold, not about the machine | stale result, attributed by hostname only, no peer group |
+| **coverage** | about the data we hold, not about the machine | stale result (which says so when the collector has since [tried and been skipped](#a-skipped-run-tells-the-server-so)), attributed by hostname only, no peer group |
 
 Every threshold lives in one struct with its reasoning attached, and every one
 can be set in the configuration file — see [below](#thresholds-and-different-lines-for-some-machines).
@@ -1301,13 +1373,18 @@ record it; and `run_collect` (what the latest run asked for with `--collect`,
 sorted — empty for none), `run_elevated`, `booted_at`, `uptime_secs`,
 `firmware_mode`, `secure_boot`, `tpm_present`, `tpm_version`,
 `disk_encryption` and `disk_encryption_method`, each null where it was not
-read: `run_collect` is what tells "not asked" (category missing) from "asked,
+read, and `last_skip` (`at`, `reason`, `detail`; null unless a [run status
+record](#a-skipped-run-tells-the-server-so) is newer than the latest run): `run_collect` is what tells "not asked" (category missing) from "asked,
 could not be read" (category listed) — see [Uptime, elevation and security
 posture](#uptime-elevation-and-security-posture-where-a-run-asked). The drilldown
 adds `memory_modules`, one per filled slot (`size_bytes`, `type`,
 `form_factor`, `speed_mts`, `configured_speed_mts`), delivered as `drives` are,
 and each run in its `history` carries `duration_secs` and `run_uuid`; each run
 in a comparison carries `duration_secs`.
+The snapshot also carries `unmeasured` — the machines only ever skipped, scoped
+and filtered like the machines — and `summary.unmeasured`; `POST /api/upload`
+answers a run status record `recorded` where a result is `added` or `already
+indexed`.
 `POST /api/triage` (`{ machine_key, code, action: "acknowledge" | "snooze" |
 "clear", until?, note? }`) acknowledges, snoozes or clears one finding;
 `GET /api/suppressions` lists the suppression rules the caller may see, and an
@@ -1374,7 +1451,9 @@ per module, `; `-separated, a part empty where the firmware didn't say — so
 `run_collect` (the categories it asked for, `; `-separated), `run_elevated`,
 `booted_at` and `uptime_secs` (as of the run), `firmware_mode`,
 `secure_boot`, `tpm_present`, `tpm_version`, `disk_encryption` and
-`disk_encryption_method`. **These ten tell the three states apart**: a cell
+`disk_encryption_method`, then `last_skip_at` and `last_skip_reason` (a [run
+status record](#a-skipped-run-tells-the-server-so) newer than the latest run,
+empty when there is none). **The ten before them tell the three states apart**: a cell
 is empty where the run did not ask for its category, `unknown` where it asked
 and the CLI could not read that part, `not_applicable` where the fact cannot
 exist on that machine (`secure_boot` on a `bios` boot, `tpm_version` with no
@@ -1930,9 +2009,12 @@ unless these go:
 
 So a decommissioned machine, or a removal request, is three rungs:
 
-1. Delete its result files from the collection folder.
+1. Delete its result files — and its `status-*.json`, if it ever reported a
+   [skipped run](#a-skipped-run-tells-the-server-so) — from the collection
+   folder.
 2. `loadbearer-fleet forget <machine>` — index rows, archived copies and its
-   triage.
+   triage. A machine known only from a status record is found and forgotten
+   too, and `forget` says it removed "its run status record".
 3. Nothing else. Sessions hold no fleet data and metrics carry no machine
    labels.
 
@@ -1985,7 +2067,7 @@ Three of them are worth alerting on:
 | --- | --- |
 | `scan_last_success_timestamp_seconds` | **Collection has stopped.** The failure that hides every other one, because a dashboard full of yesterday's green looks exactly like a healthy estate. |
 | `newest_run_age_seconds` | The *machines* have stopped reporting — a different fault from this service having stopped reading. |
-| `scan_files_rejected` | Something is writing files this can't parse. One is a truncated upload; a hundred is a broken collector. |
+| `scan_files_rejected` | Something is writing files this can't parse. One is a truncated upload; a hundred is a broken collector. A [run status record](#a-skipped-run-tells-the-server-so) is not one. |
 
 `findings` and `machines_flagged` count every finding, whether or not somebody
 has [acknowledged, snoozed or suppressed](#acknowledge-snooze-suppress) it, so

@@ -366,6 +366,43 @@ for (const f of readdirSync(join(root, 'tests/fixtures'))) {
     firmware_mode: 'uefi', secure_boot: false, tpm: { present: false }, disk_encryption: { system_volume: 'none_detected' },
   };
   writeFileSync(join(collection, 'arrived.json'), JSON.stringify(arrived));
+
+  // Run status records, as a collector's skipped runs leave them: one for
+  // every machine above, an hour old and so newer than its result, with a
+  // reason that is a single long token — the line on its page has to break
+  // it — and twenty-two for machines that have only ever been skipped, the
+  // first with a hostname and a sentence long enough to test a phone, so the
+  // "Tried, never measured" card is laid out at its cap.
+  const skipFor = (doc, extra = {}) => ({
+    schema: 'loadbearer.run-status/1',
+    tool_version: '1.9.0',
+    timestamp: recent(1 / 24),
+    status: 'skipped',
+    reason: 'on_battery',
+    detail: 'on battery (62%), and --not-on-battery was given',
+    hostname: doc.machine.hostname,
+    ...(doc.machine.identity ? { identity: doc.machine.identity } : {}),
+    ...extra,
+  });
+  const longToken = 'lid_closed_and_the_machine_is_hibernating_in_a_cupboard_on_the_third_floor_of_the_east_wing';
+  const everyone = readdirSync(join(root, 'tests/fixtures')).map((f2) => JSON.parse(readFileSync(join(root, 'tests/fixtures', f2), 'utf8')));
+  for (const [i, doc] of [...everyone, arrived].entries()) {
+    writeFileSync(join(collection, `status-${i}.json`), JSON.stringify(skipFor(doc, { detail: `skipped: ${longToken}` })));
+  }
+  for (let i = 0; i < 22; i++) {
+    const hostname = i === 0 ? 'NEVER-MEASURED-WITH-A-HOSTNAME-LONG-ENOUGH-TO-TEST-A-PHONE-00' : `NEVER-MEASURED-${String(i).padStart(2, '0')}`;
+    writeFileSync(join(collection, `status-never-${i}.json`), JSON.stringify({
+      schema: 'loadbearer.run-status/1',
+      timestamp: recent(2 + i / 100),
+      status: 'skipped',
+      reason: i === 0 ? longToken : 'busy',
+      detail: i === 0
+        ? `busy: the CPU was at 83%, over the limit of 20% that --if-idle allows, ${longToken}`
+        : 'busy: the CPU was at 83%, over the limit of 20% that --if-idle allows',
+      hostname,
+      tags: { site: i % 2 ? 'glasgow' : 'edinburgh' },
+    }));
+  }
 }
 
 // Ingest only ever reads the collection folder, and the index it derives goes
@@ -410,6 +447,9 @@ const compareRuns = snapshot.machines.slice(0, 3).map((m) => m.run_id);
 const longestCpu = snapshot.machines.map((m) => m.cpu_model)
   .reduce((a, b) => (b.length > a.length ? b : a), '');
 check('fixtures', snapshot.machines.length > 0, 'the fixtures produced no machines');
+check('fixtures', snapshot.summary.unmeasured === 22 && snapshot.unmeasured.length === 22
+  && snapshot.machines.every((m) => m.last_skip),
+'the status records did not produce 22 machines never measured and a last attempt on every other');
 
 // Two findings quieted through the API, as a person would quiet them, so the
 // quieted line — who, when, a long note, Undo — is laid out at every size as
@@ -616,6 +656,17 @@ try {
         continue;
       }
       const m = JSON.parse(result.result.value);
+
+      // The two things a run status record adds to a page, there to be laid
+      // out: the card on the overview, the line on a machine's page.
+      if (view === 'overview') {
+        check(where, await evaluate(`document.querySelectorAll('[data-card="unmeasured"] .finding').length === 20`),
+          'the "Tried, never measured" card does not list 20 of the 22');
+      }
+      if (['machine', 'machine-memory', 'machine-security'].includes(view)) {
+        check(where, await evaluate(`document.querySelector('main').innerText.includes('Last attempt')`),
+          'the machine page has no Last attempt line');
+      }
 
       check(where, m.bodyText > 200, `rendered almost nothing (${m.bodyText} chars)`);
       // Not exact: a desktop Chrome spends ~15px of it on a classic scrollbar.

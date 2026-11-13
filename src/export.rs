@@ -221,7 +221,7 @@ fn tag_cells<'a>(m: Option<&'a MachineView>, keys: &'a [&str]) -> impl Iterator<
 ///
 /// New columns go on the end of the fixed ones, before the tags, so a
 /// spreadsheet or script that reads by position keeps working.
-pub const MACHINE_COLUMNS: [&str; 56] = [
+pub const MACHINE_COLUMNS: [&str; 58] = [
     "hostname",
     "machine_key",
     "key_kind",
@@ -278,6 +278,8 @@ pub const MACHINE_COLUMNS: [&str; 56] = [
     "tpm_version",
     "disk_encryption",
     "disk_encryption_method",
+    "last_skip_at",
+    "last_skip_reason",
 ];
 
 /// What an opt-in fact's cell says when there is no value — the three states
@@ -461,6 +463,12 @@ pub fn machines(snap: &Snapshot) -> String {
                     .as_deref()
                     .is_some_and(|d| d != "encrypted"),
             ),
+            // A skipped run newer than the latest result; empty when there is
+            // none, which is the usual case, not an unknown.
+            m.last_skip
+                .as_ref()
+                .map_or_else(|| text(""), |s| utc(&s.at)),
+            opt(m.last_skip.as_ref().and_then(|s| s.reason.as_deref())),
         ];
         row(&mut out, cells.into_iter().chain(tag_cells(Some(m), &keys)));
     }

@@ -114,8 +114,19 @@ It:
   can only ever move the dashboard within itself. The list belongs to the
   browser profile rather than the account, so anyone using that profile can
   read the names;
-- **accepts submitted results only through one route.** `POST /api/upload`,
-  from a signed-in `contributor` or an ingest token. Five things are checked
+- **accepts submitted documents only through one route.** `POST /api/upload`,
+  from a signed-in `contributor` or an ingest token, takes two documents: a
+  result and a **run status record** (`loadbearer.run-status/1`), which a
+  loadbearer run posts when it was skipped because the machine was on battery
+  or busy. A status record goes through every check below, in the same order,
+  and the same tag scope: a token scoped to one site can only say that site's
+  machines were skipped. It holds the machine's hostname, identity block and
+  tags, a reason and a sentence, and no other inventory — nothing opted into
+  with `--collect` — so what it adds to what a result upload already puts on
+  the server is that a machine *tried*. It is refused over 64 KB, and is kept
+  as one file per machine whose name is a hash of the machine key, replaced by
+  a newer record, written through a temporary file and a rename. Nothing the
+  sender sent is used as a path. Five things are checked
   before a byte is kept, and the first two — who the caller is, and whether
   they are inside their per-credential rate limit — are answered **before the
   request body is read at all**, so an unauthenticated or over-limit caller
