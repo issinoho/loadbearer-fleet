@@ -5,6 +5,104 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## 0.10.0 - Fri, 13 Nov 2026
+
+**The fleet over time, a decision for every machine, and a way to say "in
+hand".** Findings now cover drives, disks and firmware; the Overview shows
+what changed and how the estate has moved week by week; each machine carries
+a lifecycle verdict; and a finding can be acknowledged, snoozed or
+suppressed, sent to a webhook, and judged against thresholds you set.
+
+**Upgrading: there is a new file to back up.** What people acknowledge,
+snooze and suppress is kept in a **state file** beside the index —
+`fleet-index.state.db` next to `fleet-index.db`, or wherever `[server] state`
+says. Unlike the index it is not derived and nothing can rebuild it. `backup`
+copies it beside the index snapshot; add it to whatever backs up the server.
+Drive, BIOS and volume details for runs already indexed fill in on
+`scan --reindex`.
+
+### Added
+
+- **Six findings from data loadbearer already collects**: `drive_failing`
+  (the drive's own critical warning), `drive_media_errors`, `drive_worn` (80%
+  of rated endurance, critical at 100%, or under 20% spare),
+  `disk_nearly_full` (under 10% free on a fixed volume, critical under 5%),
+  `firmware_behind_peers` (90 days or more behind the newest BIOS on the same
+  system model) and `firmware_old` (over four years old when no peer shows a
+  newer one). The machine page gains a Drives table, the BIOS version and the
+  fullest volume.
+
+- **Groups**: a tab, `GET /api/groups?by=` and `report --by` group the
+  machines in view by `tag:<key>`, `model`, `cpu` or `os`. The headline for
+  each group is how its members run against identical machines, not raw
+  score, which mostly measures how old a site's hardware is. `model`, `cpu`
+  and `os` are also new exact-match filters.
+
+- **The fleet over time**: the Overview gains a "What changed" card (over 1,
+  4 or 13 weeks: findings new, worse, eased and resolved, machines added,
+  grades moved) and "Over time" charts. Also `GET /api/timeline`,
+  `GET /api/changes` and `report --changes`. The past is reconstructed from
+  the runs already indexed, so there is history from the first day and it
+  survives an index rebuild.
+
+- **Lifecycle**: every machine carries a verdict — replace, repair,
+  investigate, watch or keep — with the reasons for it, drawn from its
+  findings and its age. A Lifecycle tab, a `lifecycle=` filter and
+  `report --lifecycle`.
+
+- **Acknowledge, snooze, suppress.** A contributor or admin can acknowledge
+  or snooze a finding on a machine in their scope, with a note; an admin can
+  suppress a rule for one machine, a tag match or the whole fleet. A quieted
+  finding is still computed and still counts towards the lifecycle verdict
+  and the history; it stops counting as needing attention. An
+  acknowledgement or snooze lapses if the finding gets worse and does not
+  carry over to a recurrence, and a snooze ends by itself. `POST /api/triage`,
+  `GET`/`POST /api/suppressions`, `DELETE /api/suppressions/{id}`.
+  Suppressing by tag is API-only for now.
+
+- **`[notify]`: a webhook for new critical findings, and a digest.** Off
+  unless `webhook_url` is set, and then one JSON POST per scan listing the
+  findings that are newly critical and not quieted. `digest = "daily"` or
+  `"weekly"` sends a summary at `digest_at`, UTC. With `secret` set, each
+  request is signed with HMAC-SHA256 in `X-Loadbearer-Signature`. The URL
+  must be https unless it is loopback, because the payload carries hostnames
+  and finding text for the whole fleet. `loadbearer-fleet notify test` sends
+  a test event. A server without `[notify]` still makes no outbound
+  connection beyond sign-in.
+
+- **`[thresholds]`**: every line the rules judge by can now be set in the
+  config file, and `[[thresholds.overrides]]` sets different ones for the
+  machines a rule picks by tags, system model or CPU model — a lab that is
+  measured yearly, a kiosk model with a small disk. The first matching rule
+  wins for each threshold. The machine page and `report` name any override
+  that changed how a machine was judged. A change takes effect at restart
+  and re-judges history too.
+
+- **Metrics**: `findings_live{severity}`, `machines_flagged_live` and
+  `findings_quieted{state}` count what triage has left, and
+  `notifications_total{event,result}` counts webhook deliveries.
+
+### Changed
+
+- **The summary's `critical`, `warnings`, `info` and `machines_flagged`**, in
+  the API and on the dashboard, count live findings only; what has been
+  quieted is in the new `quieted` counts. With nothing acknowledged, snoozed
+  or suppressed the numbers are what they were. In `/metrics`, `findings` and
+  `machines_flagged` still count every finding, so an alert written on them
+  means what it did.
+
+- **`report --all`** lists quieted findings as well as info ones.
+
+- **The detail text of eight findings** quotes the line the machine was
+  judged against, now that it can differ between machines.
+
+- **`backup`** writes the state file's copy beside the index snapshot, and
+  **`forget`** also clears that machine's acknowledgements, snoozes and its
+  own suppression rules.
+
+- **Roles**: a contributor may acknowledge and snooze; an admin may also
+  suppress. `/api/me` says which.
+
 ## 0.9.0 - Fri, 30 Oct 2026
 
 **Ingest tokens you generate rather than invent, and that the server never has
