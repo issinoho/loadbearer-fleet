@@ -66,17 +66,20 @@ const APP_JS: &str = include_str!("../assets/app.js");
 // else instead of needing `include_bytes!` and a binary in the repository.
 const LOGO_SVG: &str = include_str!("../assets/logo-mark.svg");
 
-/// The fleet-wide analysis: the snapshot, and the timeline whose newest point
-/// *is* that snapshot. Cached together and replaced together, so a request
-/// never projects one generation's timeline through another's snapshot.
+/// The fleet-wide analysis: the snapshot, the timeline whose newest point
+/// *is* that snapshot, and the subtests of the runs it stands on. Cached
+/// together and replaced together, so a request never projects one
+/// generation's timeline or measurements through another's snapshot.
 struct Analysis {
     snapshot: Arc<Snapshot>,
     timeline: Arc<Timeline>,
+    measures: Arc<analytics::Measures>,
 }
 
 impl Analysis {
     /// The whole of what a rescan or an external change has to rebuild. The
-    /// timeline is built here and nowhere else, so no request pays for it.
+    /// timeline and the measurements are built here and nowhere else, so no
+    /// request pays for either.
     fn compute(index: &Index, tuning: &Tuning) -> Result<Self> {
         let now = OffsetDateTime::now_utc();
         let snapshot = analytics::snapshot(index.conn(), tuning, now)?;
@@ -87,9 +90,11 @@ impl Analysis {
             now,
             analytics::TIMELINE_WEEKS,
         )?;
+        let measures = analytics::Measures::load(index.conn(), &snapshot)?;
         Ok(Self {
             snapshot: Arc::new(snapshot),
             timeline: Arc::new(timeline),
+            measures: Arc::new(measures),
         })
     }
 }
@@ -681,6 +686,106 @@ async fn get_changes(
     let analysis = state.analysis();
     let view = visible_in(&analysis.snapshot, &state, &caller, filter);
     Ok(Json(analysis.timeline.changes(&view, window)))
+}
+
+/// What `/api/distribution` takes beyond the filter.
+#[derive(Debug, Deserialize, Default)]
+struct DistributionParams {
+    /// `overall`, a component, or `component/subtest`; absent for overall.
+    measure: Option<String>,
+    /// A configuration key, `preset|profile|baseline|build_isa`; absent for
+    /// the one with the most machines.
+    config: Option<String>,
+    /// A grouping dimension, as `by=` on `/api/groups`.
+    split: Option<String>,
+}
+
+/// How one measure is spread across the caller's machines.
+///
+/// Projected through `visible_in` like every other read, so the filter and
+/// the scope have been applied before anything is counted: the bins, the
+/// quantiles, the configurations offered and the machines left out are all
+/// made of the caller's machines. The subtests come from the cache beside the
+/// snapshot, of the same generation, so this costs the projection and a pass
+/// over the machines in view — no index lock, no query.
+async fn get_distribution(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Query(params): Query<DistributionParams>,
+    Query(filter): Query<FilterParams>,
+) -> Result<Json<analytics::Distribution>, AppError> {
+    // The shape of the request is judged before the fleet is looked at.
+    let measure = match params.measure.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(s) => s
+            .parse::<analytics::Measure>()
+            .map_err(AppError::bad_request)?,
+        None => analytics::Measure::Overall,
+    };
+    let split = params
+        .split
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.parse::<analytics::GroupBy>())
+        .transpose()
+        .map_err(AppError::bad_request)?;
+    let analysis = state.analysis();
+    let view = visible_in(&analysis.snapshot, &state, &caller, filter);
+    // Whether the measure and configuration exist is judged against the
+    // caller's view alone, so a refusal names only what they can see.
+    let d = analytics::distribution(
+        &view,
+        &analysis.measures,
+        &measure,
+        params.config.as_deref(),
+        split.as_ref(),
+    )
+    .map_err(AppError::bad_request)?;
+    Ok(Json(d))
+}
+
+/// What `/api/heatmap` takes beyond the filter.
+#[derive(Debug, Deserialize, Default)]
+struct HeatmapParams {
+    /// `cohort` (the default) or `grade`.
+    encoding: Option<String>,
+    /// `host`, `overall` (the default) or a graded component.
+    sort: Option<String>,
+    /// `asc` (the default) or `desc`.
+    dir: Option<String>,
+}
+
+/// The caller's machines against every graded component, sorted and capped
+/// at `HEATMAP_ROWS`. Projected exactly as `get_distribution` is, and
+/// built from the snapshot alone: the projection and one sort.
+async fn get_heatmap(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Query(params): Query<HeatmapParams>,
+    Query(filter): Query<FilterParams>,
+) -> Result<Json<analytics::Heatmap>, AppError> {
+    let some = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    let encoding = some(params.encoding)
+        .map(|s| s.parse::<analytics::Encoding>())
+        .transpose()
+        .map_err(AppError::bad_request)?
+        .unwrap_or_default();
+    let sort = some(params.sort)
+        .map(|s| s.parse::<analytics::HeatSort>())
+        .transpose()
+        .map_err(AppError::bad_request)?
+        .unwrap_or_default();
+    let descending = match some(params.dir).as_deref().map(str::trim) {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(other) => {
+            return Err(AppError::bad_request(format!(
+                "{other:?} is not a sort direction. Use asc or desc"
+            )));
+        }
+    };
+    let view = visible(&state, &caller, filter);
+    let h = analytics::heatmap(&view, encoding, &sort, descending, analytics::HEATMAP_ROWS)
+        .map_err(AppError::bad_request)?;
+    Ok(Json(h))
 }
 
 /// Everything the drilldown needs for one machine, in one round trip.
@@ -1508,6 +1613,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/groups", get(get_groups))
         .route("/api/timeline", get(get_timeline))
         .route("/api/changes", get(get_changes))
+        .route("/api/distribution", get(get_distribution))
+        .route("/api/heatmap", get(get_heatmap))
         .route("/api/machine/{key}", get(get_machine))
         .route("/api/compare", get(get_compare))
         .route("/api/rescan", post(post_rescan))
@@ -3069,6 +3176,167 @@ mod tests {
         .await;
         assert_eq!(narrowed.status, StatusCode::OK, "{}", narrowed.body);
         assert_eq!(narrowed.json()["machines"], 2);
+    }
+
+    /// A distribution and a heatmap are made of the caller's machines and
+    /// nothing else: no count, bin, configuration or "left out" figure says
+    /// anything about a machine outside the scope, and a measure only machines
+    /// outside it have is refused exactly as one nobody has would be.
+    #[tokio::test]
+    async fn a_scoped_viewer_sees_the_components_of_their_own_machines_only() {
+        let state = state_for(&oidc_config());
+        let admin = session(&state, Role::Admin, &[]);
+        let edinburgh = session(&state, Role::Viewer, &[&[("site", "edinburgh")]]);
+
+        let all = get(&state, "/api/distribution?measure=cpu", Some(&admin)).await;
+        assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+        let all = all.json();
+        assert_eq!(all["machines"], 4);
+        assert_eq!(all["included"], 4);
+
+        let mine = get(&state, "/api/distribution?measure=cpu", Some(&edinburgh)).await;
+        assert_eq!(mine.status, StatusCode::OK, "{}", mine.body);
+        let mine = mine.json();
+        assert_eq!(mine["machines"], 2);
+        assert_eq!(mine["included"], 2);
+        assert_eq!(mine["left_out"].as_array().expect("left out").len(), 0);
+        assert_eq!(mine["overall_machines"], 2);
+        let offered: u64 = mine["configurations"]
+            .as_array()
+            .expect("configurations")
+            .iter()
+            .map(|c| c["machines"].as_u64().expect("count"))
+            .sum();
+        assert_eq!(offered, 2, "configurations count only their machines");
+        let binned: u64 = mine["bins"]
+            .as_array()
+            .expect("bins")
+            .iter()
+            .map(|b| b["machines"].as_u64().expect("count"))
+            .sum();
+        assert_eq!(binned, 2);
+        // The bin edges are drawn from their values alone: the Glasgow
+        // machine's faster CPU is not inside them.
+        let top = mine["bins"].as_array().unwrap().last().unwrap()["hi"]
+            .as_f64()
+            .unwrap();
+        let fastest = all["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["value"].as_f64().unwrap())
+            .fold(f64::MIN, f64::max);
+        assert!(top < fastest, "{top} reaches {fastest}");
+        for g in mine["measures"].as_array().expect("measures") {
+            assert!(g["machines"].as_u64().unwrap() <= 2, "{g}");
+        }
+        assert!(
+            !mine["measures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|g| g["measure"] == "gpu"),
+            "only the Glasgow machine has a GPU result"
+        );
+        assert!(!mine.to_string().contains("FLEET-WIN-01"));
+
+        // A measure only an out-of-scope machine has: refused, as if nobody did.
+        let gpu = get(&state, "/api/distribution?measure=gpu", Some(&edinburgh)).await;
+        assert_eq!(gpu.status, StatusCode::BAD_REQUEST, "{}", gpu.body);
+        assert!(!gpu.body.contains("FLEET-WIN-01"), "{}", gpu.body);
+        let gpu = get(&state, "/api/distribution?measure=gpu", Some(&admin)).await;
+        assert_eq!(gpu.status, StatusCode::OK, "{}", gpu.body);
+
+        // The heatmap likewise, and the filter cannot widen either.
+        let h = get(&state, "/api/heatmap", Some(&edinburgh)).await;
+        assert_eq!(h.status, StatusCode::OK, "{}", h.body);
+        let h = h.json();
+        assert_eq!(h["machines"], 2);
+        assert_eq!(h["shown"], 2);
+        assert!(!h.to_string().contains("FLEET-WIN-01"));
+        let elsewhere = get(&state, "/api/heatmap?tags=site%3Dglasgow", Some(&edinburgh))
+            .await
+            .json();
+        assert_eq!(elsewhere["machines"], 0);
+        assert_eq!(elsewhere["rows"].as_array().unwrap().len(), 0);
+        let none = get(
+            &state,
+            "/api/distribution?tags=site%3Dglasgow",
+            Some(&edinburgh),
+        )
+        .await;
+        assert_eq!(none.status, StatusCode::OK, "{}", none.body);
+        assert_eq!(none.json()["machines"], 0);
+    }
+
+    /// The filter narrows both views as it narrows every other, numbers and
+    /// all, and arrives on one query string with each view's own parameters.
+    #[tokio::test]
+    async fn the_filter_applies_to_the_distribution_and_the_heatmap() {
+        let state = state_for(&Config::default());
+        let d = get(
+            &state,
+            "/api/distribution?measure=disk%2Fseq_read&tags=site%3Dedinburgh&since_days=36500\
+             &split=tag%3Aring",
+            None,
+        )
+        .await;
+        assert_eq!(d.status, StatusCode::OK, "{}", d.body);
+        let d = d.json();
+        assert_eq!(d["machines"], 2);
+        assert_eq!(d["included"], 2);
+        assert_eq!(d["split"]["by"], "tag:ring");
+        assert_eq!(d["split"]["groups"].as_array().unwrap().len(), 2);
+
+        let h = get(
+            &state,
+            "/api/heatmap?q=FLEET-OLD&encoding=grade&sort=cpu&dir=desc",
+            None,
+        )
+        .await;
+        assert_eq!(h.status, StatusCode::OK, "{}", h.body);
+        let h = h.json();
+        assert_eq!(h["machines"], 1);
+        assert_eq!(h["encoding"], "grade");
+        assert_eq!(h["sort"], "cpu");
+        assert_eq!(h["dir"], "desc");
+        assert_eq!(h["cap"], analytics::HEATMAP_ROWS);
+    }
+
+    /// Asking for something that is not there is a mistake to be told about,
+    /// not an empty chart that reads as an answer.
+    #[tokio::test]
+    async fn an_unknown_measure_configuration_or_sort_is_a_bad_request() {
+        let state = state_for(&Config::default());
+        for uri in [
+            "/api/distribution?measure=floppy",
+            "/api/distribution?measure=disk%2Fnope",
+            "/api/distribution?measure=a%2Fb%2Fc",
+            "/api/distribution?config=quick%7Cx%7Cy%7Cz",
+            "/api/distribution?split=hostname",
+            "/api/heatmap?encoding=rainbow",
+            "/api/heatmap?sort=network",
+            "/api/heatmap?dir=sideways",
+        ] {
+            let r = get(&state, uri, None).await;
+            assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.body);
+            assert!(!r.body.is_empty(), "{uri} should say why");
+        }
+        let ok = get(&state, "/api/distribution", None).await;
+        assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+        assert_eq!(ok.json()["measure"], "overall");
+        let key = ok.json()["config"].as_str().unwrap().to_string();
+        let chosen = get(
+            &state,
+            &format!(
+                "/api/distribution?measure=cpu&config={}",
+                key.replace('|', "%7C")
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(chosen.status, StatusCode::OK, "{}", chosen.body);
+        assert_eq!(chosen.json()["config"], key.as_str());
     }
 
     /// The timeline and the changes are projected onto the caller's current

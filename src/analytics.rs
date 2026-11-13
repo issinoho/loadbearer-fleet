@@ -96,9 +96,14 @@
 //! their own condition is not; a weak component is read off the benchmark, so
 //! it counts as a performance figure here.
 
+mod components;
 mod thresholds;
 mod timeline;
 
+pub use components::{
+    Distribution, Encoding, HEATMAP_ROWS, HeatSort, Heatmap, Measure, Measures, distribution,
+    heatmap,
+};
 pub use thresholds::{AppliedOverride, FIELDS, Override, Tuning, field};
 pub use timeline::{
     BySeverity, CHANGE_WINDOWS, Changes, FindingChange, TIMELINE_WEEKS, Timeline, TimelineView,
@@ -326,6 +331,11 @@ pub struct ComponentView {
     /// False for a component measured but deliberately kept out of the overall
     /// grade — `network` and `gpu`. It must not drive a machine-level flag.
     pub graded: bool,
+    /// Percentage difference from the median of the same component across the
+    /// machine's cohort, or `None` when fewer than `min_cohort` of them
+    /// measured it. Worked out across the whole index, like the cohort's own
+    /// median — see `components`.
+    pub cohort_delta_pct: Option<f64>,
 }
 
 /// One drive's health counters, as recorded with a run. Everything but the
@@ -1265,6 +1275,7 @@ fn assess(
             m.cohort_delta_pct = pct_delta(score, c.median);
         }
     }
+    components::place_cohort_deltas(&mut machines, th.min_cohort);
 
     let firmware = newest_firmware(&machines);
     let flags = evaluate(&machines, &by_id, &firmware, th);
@@ -1401,6 +1412,8 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
                     score: r.get(2)?,
                     grade: r.get(3)?,
                     graded: r.get(4)?,
+                    // Set by `assess`, against the cohort.
+                    cohort_delta_pct: None,
                 },
             ))
         })? {
@@ -1766,12 +1779,11 @@ fn evaluate(
         // part to replace, not a machine to retire. Ungraded components
         // (network, gpu) are excluded because loadbearer deliberately keeps
         // them out of the grade — they measure the OS and the cooling.
+        //
+        // The rule itself is `components::is_weak`, which the heatmap reads
+        // too, so a cell can never disagree with this finding.
         for c in m.components.iter().filter(|c| c.graded) {
-            let Some(rank) = grade_rank(&c.grade) else {
-                continue;
-            };
-            let overall = grade_rank(&m.grade).unwrap_or(rank);
-            if rank >= 4 && rank >= overall + 2 {
+            if components::is_weak(&m.grade, c) {
                 push(
                     Severity::Warning,
                     FlagKind::Machine,
@@ -3108,7 +3120,7 @@ mod tests {
 
     /// `snapshot` takes its clock as an argument, so every test pins it and the
     /// staleness rules get exercised rather than tiptoed around.
-    fn now() -> OffsetDateTime {
+    pub(super) fn now() -> OffsetDateTime {
         datetime!(2026-09-09 12:00:00 UTC)
     }
 
@@ -3137,13 +3149,13 @@ mod tests {
     /// reader and the SQL as well as the rules. Nothing here fabricates a
     /// result from nothing: the shape, the subtests and the spread are all
     /// measured, and only the identity and the headline figures are moved.
-    struct Estate {
-        idx: Index,
+    pub(super) struct Estate {
+        pub(super) idx: Index,
         base: Value,
     }
 
     impl Estate {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let text = std::fs::read_to_string(fixture_path("win-modern.json")).expect("fixture");
             Estate {
                 idx: Index::open_in_memory().unwrap(),
@@ -3151,11 +3163,11 @@ mod tests {
             }
         }
 
-        fn add(&mut self, host: &str, score: f64, taken: &str) {
+        pub(super) fn add(&mut self, host: &str, score: f64, taken: &str) {
             self.add_with(host, score, taken, |_| {});
         }
 
-        fn add_with(
+        pub(super) fn add_with(
             &mut self,
             host: &str,
             score: f64,
@@ -3179,11 +3191,11 @@ mod tests {
             );
         }
 
-        fn ingest(&mut self, name: &str) {
+        pub(super) fn ingest(&mut self, name: &str) {
             assert!(self.idx.ingest_file(&fixture_path(name)).unwrap());
         }
 
-        fn snap(&self) -> Snapshot {
+        pub(super) fn snap(&self) -> Snapshot {
             self.snap_at(now())
         }
 

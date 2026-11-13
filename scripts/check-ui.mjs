@@ -1067,6 +1067,261 @@ async function renderGroupsWith(name, grouping) {
   }
 }
 
+/*
+ * The Components view's two charts. The histogram: a dozen bins at a desktop's
+ * width and a phone's, one bin of identical values (a zero range, where a
+ * naive scale divides by nothing), a chosen bin, and the three quantile marks
+ * landing on top of each other. Beyond the shared audit, each mark label gets
+ * a line of its own, so they cannot print over each other.
+ */
+for (const [label, bins, width, marks] of [
+  ['dozen', Array.from({ length: 12 }, (_, i) => ({ lo: i * 250, hi: (i + 1) * 250, machines: (i * 7) % 11 })), 700,
+    [{ label: 'p10', value: 400 }, { label: 'median', value: 1510 }, { label: 'p90', value: 2600 }]],
+  ['dozen-phone', Array.from({ length: 12 }, (_, i) => ({ lo: 100000 + i * 25000, hi: 100000 + (i + 1) * 25000, machines: i + 1 })), 320,
+    [{ label: 'p10', value: 110000 }, { label: 'median', value: 112000 }, { label: 'p90', value: 114000 }]],
+  ['identical', [{ lo: 1000, hi: 1000, machines: 40 }], 700,
+    [{ label: 'p10', value: 1000 }, { label: 'median', value: 1000 }, { label: 'p90', value: 1000 }]],
+  ['one-machine', [{ lo: 0.42, hi: 0.42, machines: 1 }], 320, []],
+]) {
+  const h = host(width);
+  mod.histogramChart(h, { bins, marks, selected: label === 'dozen' ? 3 : null, onSelect: () => {}, caption: 'MiB/s — higher is better' });
+  auditChart(`histogramChart/${label}`, h);
+  const root = h.children.find((c) => c.tagName === 'svg');
+  if (root) {
+    const named = root.children.filter((c) => c.tagName === 'text' && /^(p10|median|p90) /.test(textOf(c)));
+    check(`histogramChart/${label}`, named.length === marks.length, `${named.length} quantile label(s) for ${marks.length}`);
+    check(`histogramChart/${label}`, new Set(named.map((t) => t.attrs.y)).size === named.length,
+      'two quantile labels share a line and print over each other');
+    const hits = root.children.filter((c) => c.tagName === 'rect' && c.attrs.fill === 'transparent');
+    check(`histogramChart/${label}`, hits.length === bins.length, `${hits.length} hit target(s) for ${bins.length} bin(s)`);
+  }
+}
+{
+  const h = host();
+  mod.histogramChart(h, { bins: [] });
+  check('histogramChart/none', !h.children.some((c) => c.tagName === 'svg') && textOf(h).includes('Nothing to draw'),
+    'an empty histogram drew a frame or said nothing');
+}
+for (const [label, rows, width] of [
+  ['groups', [
+    { label: 'glasgow', p10: 900, median: 1010, p90: 1200, machines: 30 },
+    { label: 'EDINBURGH-WITH-A-LONG-SITE-NAME', p10: 700, median: 800, p90: 950, machines: 6 },
+    { label: '2024', p10: 1000, median: 1000, p90: 1000, machines: 4 },
+  ], 700],
+  ['one-flat', [{ label: 'only', p10: 5, median: 5, p90: 5, machines: 4 }], 320],
+]) {
+  const h = host(width);
+  mod.rangeChart(h, { rows, onSelect: () => {} });
+  auditChart(`rangeChart/${label}`, h);
+}
+
+/*
+ * The Components view fetches its own distribution and heatmap. Answered first
+ * with what the binary says about the fixtures — four machines on four CPUs,
+ * so every cell has no peer group — then with synthetic shapes for every state
+ * the real ones cannot reach: one machine, nobody, a split, a chosen bin, a
+ * capped grid of a large estate with weak, empty and unmeasured cells, the
+ * grade encoding, and the server refusing a hand-edited measure.
+ */
+function realReport(args) {
+  const target = process.env.CARGO_TARGET_DIR || 'target';
+  const exe = join(target, 'debug', process.platform === 'win32' ? 'loadbearer-fleet.exe' : 'loadbearer-fleet');
+  const db = join(tmpdir(), `lbf-check-cmp-${process.pid}-${args.join('').replace(/[^a-z]/gi, '')}.db`);
+  const run = (a) => {
+    const r = spawnSync(exe, ['--index', db, '--log-level', 'warn', ...a], { encoding: 'utf8' });
+    if (r.status !== 0) {
+      console.error(`\n${exe} ${a.join(' ')} failed:\n${r.stderr || r.stdout}`);
+      process.exit(1);
+    }
+    return r.stdout;
+  };
+  try {
+    run(['scan', 'tests/fixtures']);
+    return JSON.parse(run(['report', ...args, '--json']));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try { rmSync(db + suffix); } catch { /* already gone */ }
+    }
+  }
+}
+
+async function renderComponentsWith(name, { distribution, heatmap, settings = {} }) {
+  const answer = (body) => (body instanceof Error
+    ? { ok: false, text: () => Promise.resolve(body.message) }
+    : { ok: true, json: () => Promise.resolve(body), text: () => Promise.resolve('') });
+  globalThis.fetch = (url) => {
+    const u = String(url);
+    if (u.startsWith('/api/distribution')) return Promise.resolve(answer(distribution));
+    if (u.startsWith('/api/heatmap')) return Promise.resolve(answer(heatmap));
+    return Promise.resolve({ ok: false, text: () => Promise.resolve('unexpected request') });
+  };
+  Object.assign(mod.state, {
+    measure: null, config: null, split: null, bin: null, encoding: null, hsort: null, hdir: null, ...settings,
+  });
+  const h = host(1200);
+  try {
+    await mod.renderComponents(h);
+  } catch (err) {
+    failures.push(`${name}: threw ${err.message}`);
+    return null;
+  }
+  const text = textOf(h);
+  check(name, text.length > 40, 'rendered almost no text');
+  check(name, !text.includes('undefined'), 'the word "undefined" reached the page');
+  check(name, !text.includes('NaN'), 'the word "NaN" reached the page');
+  check(name, !text.includes('[object'), 'an object reached the page as text');
+  notes.push(`${name}: ${auditTree(name, h)} chart(s), ${text.length} chars of text`);
+  return h;
+}
+
+/** The heatmap's body rows. */
+function heatRows(h) {
+  let rows = [];
+  walk(h, (n) => {
+    if (n.tagName === 'table' && String(n.className).includes('heatmap')) {
+      rows = n.children.find((c) => c.tagName === 'tbody')?.children || [];
+    }
+  });
+  return rows;
+}
+
+{
+  const overall = realReport(['--distribution', 'overall']);
+  const latency = realReport(['--distribution', 'memory/latency']);
+  const heat = realReport(['--heatmap']);
+  check('components', overall.bins.reduce((a, b) => a + b.machines, 0) === overall.included,
+    'the bins the binary produced do not add up to the machines drawn');
+  check('components', overall.included + overall.left_out.reduce((a, l) => a + l.machines, 0) === overall.machines,
+    'drawn and left out do not add up to the machines in view');
+
+  const real = await renderComponentsWith('components', { distribution: overall, heatmap: heat });
+  if (real) {
+    const text = textOf(real);
+    for (const want of ['Components across the fleet', 'Overall score', 'thorough · general', 'Every machine, by component',
+      'no peers', 'At each end', 'median']) {
+      check('components', text.includes(want), `missing ${JSON.stringify(want)}`);
+    }
+    check('components', heatRows(real).length === heat.rows.length, `${heatRows(real).length} heatmap row(s) for ${heat.rows.length}`);
+  }
+
+  const sub = await renderComponentsWith('components/subtest', { distribution: latency, heatmap: heat });
+  if (sub) {
+    const text = textOf(sub);
+    check('components/subtest', text.includes('lower is better'), 'a lower-is-better measure does not say so');
+    check('components/subtest', text.includes('Left out'), 'the legacy run without the subtest was not counted out');
+  }
+
+  // No direction recorded: said, not implied.
+  const undirected = await renderComponentsWith('components/no-direction', {
+    distribution: { ...latency, direction: null, direction_note: 'No direction is recorded for this measure on some or all of these runs, so this view does not say which end is better.' },
+    heatmap: heat,
+  });
+  if (undirected) {
+    const text = textOf(undirected);
+    check('components/no-direction', text.includes('neither end is called better') && !text.includes('lower is better'),
+      'a measure with no direction implies one');
+  }
+
+  // One machine: one bin, no quantile marks to collide, both ends the same.
+  const one = overall.values[0];
+  const single = {
+    ...overall, machines: 1, included: 1, left_out: [], values: [{ ...one, bin: 0 }],
+    bins: [{ lo: one.value, hi: one.value, machines: 1 }], p10: one.value, median: one.value, p90: one.value,
+    configurations: [{ ...overall.configurations[0], machines: 1 }], overall_machines: 1,
+  };
+  await renderComponentsWith('components/single', {
+    distribution: single, heatmap: { ...heat, machines: 1, shown: 1, rows: heat.rows.slice(0, 1) },
+  });
+
+  // Nobody in view.
+  const empty = await renderComponentsWith('components/empty', {
+    distribution: {
+      ...overall, machines: 0, included: 0, left_out: [], values: [], bins: [], p10: null, median: null, p90: null,
+      config: null, config_label: null, configurations: [], overall_machines: 0, measures: [], dimensions: ['model', 'cpu', 'os'],
+    },
+    heatmap: { ...heat, machines: 0, shown: 0, rows: [], components: [], weak: 0, without_peers: 0 },
+  });
+  if (empty) {
+    const text = textOf(empty);
+    check('components/empty', text.includes('No machine in view has this measure') && text.includes('No machines in view'),
+      'an empty view did not say so');
+  }
+
+  // A large estate: capped, sorted on a column, with every kind of cell.
+  const template = heat.rows[0];
+  const comps = heat.components;
+  const deltas = [-31, -19, -8, -2, 0, 3, 9, 17, 40, null];
+  const bigRows = Array.from({ length: 200 }, (_, i) => ({
+    ...template,
+    key: `SN-HEAT-${i}`,
+    hostname: i === 3 ? 'WORKSTATION-WITH-A-VERY-LONG-HOSTNAME-07' : `HEAT-${String(i).padStart(3, '0')}`,
+    cohort_delta_pct: deltas[i % deltas.length],
+    cells: comps.map((c, j) => ({
+      component: c,
+      measured: (i + j) % 13 !== 0,
+      score: 400 + ((i * 37 + j * 91) % 1300),
+      grade: ['S', 'A', 'B', 'C', 'D', 'F'][(i + j) % 6],
+      cohort_delta_pct: deltas[(i + j * 3) % deltas.length],
+      weak: (i + j) % 17 === 0,
+    })),
+  }));
+  const big = { ...heat, machines: 1340, shown: 200, cap: 200, rows: bigRows, weak: 31, without_peers: 12, sort: comps[0], dir: 'asc' };
+  const nf = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+  const capped = await renderComponentsWith('components/capped', { distribution: overall, heatmap: big });
+  if (capped) {
+    const text = textOf(capped);
+    check('components/capped', text.includes(`Showing 200 of ${nf.format(1340)} machines`) && text.includes('Filter to narrow'),
+      'the cap is not stated');
+    check('components/capped', heatRows(capped).length === 200, `${heatRows(capped).length} row(s) for 200`);
+    check('components/capped', text.includes('weak') && text.includes('no peers') && text.includes('—'),
+      'a weak, a no-peer or an unmeasured cell is missing');
+    // Every cell carries its value for a screen reader, not just a colour.
+    let unlabelled = 0;
+    walk(capped, (n) => {
+      if (n.tagName === 'td' && String(n.className).startsWith('heat') && !n.attrs['aria-label']) unlabelled += 1;
+    });
+    check('components/capped', unlabelled === 0, `${unlabelled} heatmap cell(s) without an accessible label`);
+    let sorted = null;
+    walk(capped, (n) => { if (n.tagName === 'th' && n.attrs['aria-sort'] === 'ascending') sorted = textOf(n); });
+    check('components/capped', sorted && sorted.startsWith(comps[0]), `the sorted column is not marked: ${sorted}`);
+  }
+  await renderComponentsWith('components/grade', { distribution: overall, heatmap: { ...big, encoding: 'grade' }, settings: { encoding: 'grade' } });
+
+  // A split, with a thin group and the machines with no value; and a bin chosen.
+  const split = {
+    ...overall,
+    split: {
+      by: 'tag:site',
+      groups: [
+        { value: 'glasgow', machines: 9, median: 1100, p10: 900, p90: 1300, thin: false },
+        { value: 'edinburgh', machines: 2, median: 800, p10: 760, p90: 840, thin: true },
+        { value: null, machines: 5, median: 1000, p10: 950, p90: 1200, thin: false },
+      ],
+    },
+  };
+  const splitView = await renderComponentsWith('components/split', { distribution: split, heatmap: heat, settings: { split: 'tag:site', bin: 0 } });
+  if (splitView) {
+    const text = textOf(splitView);
+    check('components/split', text.includes('(untagged)') && text.includes('left off'), 'the split did not explain a thin group');
+    check('components/split', !text.includes('At each end'), 'a chosen bin still showed both ends');
+  }
+
+  // The server refusing a hand-edited measure: its reason and the way back,
+  // with the heatmap unaffected.
+  const refused = await renderComponentsWith('components/refused', {
+    distribution: new Error('no machine in view has a component called "floppy". Those in view: cpu, disk'),
+    heatmap: heat,
+  });
+  if (refused) {
+    const text = textOf(refused);
+    check('components/refused', text.includes('called "floppy"') && text.includes('overall score instead'),
+      "the server's reason and the way back were not shown");
+    check('components/refused', text.includes('Every machine, by component'), 'one refusal took the heatmap with it');
+  }
+  Object.assign(mod.state, { measure: null, config: null, split: null, bin: null, encoding: null, hsort: null, hdir: null });
+  globalThis.fetch = () => Promise.reject(new Error('no network in the geometry check'));
+}
+
 // The drilldown fetches its own detail, so the fetch is answered with a payload
 // assembled from the snapshot plus a synthetic history - the branch that only
 // appears once a machine has been measured more than once.

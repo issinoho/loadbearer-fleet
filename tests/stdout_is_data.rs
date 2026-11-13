@@ -122,6 +122,73 @@ fn report_by_writes_the_groups_to_stdout() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `report --distribution` and `report --heatmap` print a summary, and with
+/// `--json` the documents `/api/distribution` and `/api/heatmap` send. A
+/// measure no machine has is refused, on stderr, with what there is.
+#[test]
+fn report_distribution_and_heatmap_write_to_stdout() {
+    let dir = scratch("report-components");
+    let index = dir.join("i.db");
+    let index = index.to_str().expect("path");
+    stdout_of(&["--index", index, "scan", fixtures().to_str().expect("path")]);
+
+    let parse = |json: &str| -> serde_json::Value {
+        serde_json::from_str(json).unwrap_or_else(|e| {
+            panic!(
+                "stdout did not parse as JSON ({e}). The first 200 bytes were:\n{}",
+                &json[..json.len().min(200)]
+            )
+        })
+    };
+    let json = stdout_of(&[
+        "--index",
+        index,
+        "report",
+        "--distribution",
+        "disk/seq_read",
+        "--json",
+    ]);
+    let d = parse(&json);
+    assert_eq!(d["measure"], "disk/seq_read");
+    let binned: u64 = d["bins"]
+        .as_array()
+        .expect("bins")
+        .iter()
+        .map(|b| b["machines"].as_u64().expect("count"))
+        .sum();
+    assert_eq!(Some(binned), d["included"].as_u64(), "the bins add up");
+    assert!(!json.contains('\u{1b}'), "stdout carried ANSI escape codes");
+
+    let json = stdout_of(&["--index", index, "report", "--heatmap", "--json"]);
+    let h = parse(&json);
+    assert_eq!(h["machines"], 4);
+    assert_eq!(h["rows"].as_array().expect("rows").len(), 4);
+
+    let text = stdout_of(&["--index", index, "report", "--distribution", "overall"]);
+    assert!(
+        text.starts_with("Overall score"),
+        "stdout should open with the measure, got:\n{}",
+        &text[..text.len().min(200)]
+    );
+    let text = stdout_of(&["--index", index, "report", "--heatmap"]);
+    assert!(text.starts_with("Against identical machines"), "{text}");
+    assert!(text.contains("FLEET-WIN-01"), "{text}");
+
+    let refused = Command::new(EXE)
+        .args(["--index", index, "report", "--distribution", "floppy"])
+        .output()
+        .expect("run the binary");
+    assert!(!refused.status.success(), "an unknown measure must fail");
+    assert!(refused.stdout.is_empty(), "and print nothing to stdout");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("cpu"),
+        "the refusal says what there is: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `report --changes` prints a summary, and with `--json` the same document
 /// `/api/changes` sends. A window that is not one of the three is refused, on
 /// stderr, rather than answered with a comparison against a date nobody asked
