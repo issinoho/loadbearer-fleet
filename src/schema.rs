@@ -754,6 +754,173 @@ pub struct MachineKey {
     pub kind: KeyKind,
 }
 
+/// The key for a machine from what a document says about it. The one
+/// implementation, shared by a result and a run status record, so the two from
+/// one machine are filed under one key.
+fn key_from(identity: Option<&Identity>, hostname: Option<&str>) -> MachineKey {
+    let id = identity.cloned().unwrap_or_default();
+    for (kind, value) in [
+        (KeyKind::Serial, id.serial),
+        (KeyKind::SmbiosUuid, id.smbios_uuid),
+        (KeyKind::MachineId, id.machine_id),
+        (KeyKind::Hostname, hostname.map(str::to_string)),
+    ] {
+        if let Some(v) = value {
+            let v = v.trim();
+            if !v.is_empty() {
+                return MachineKey {
+                    value: v.to_string(),
+                    kind,
+                };
+            }
+        }
+    }
+    // Nothing at all to key on. Falling back to the source path would make
+    // every re-run look like a new machine, so say so explicitly instead.
+    MachineKey {
+        value: "unidentified".to_string(),
+        kind: KeyKind::Hostname,
+    }
+}
+
+/// The schema family of a run status record: what a loadbearer run tells the
+/// server when it was skipped because the machine was on battery or busy.
+pub const STATUS_SCHEMA_FAMILY: &str = "loadbearer.run-status/";
+pub const STATUS_SCHEMA_MAJOR: u32 = 1;
+
+/// The most a run status record may weigh. One is a few hundred bytes — a
+/// reason, a sentence, an identity block and some tags — so anything near this
+/// is not one, and an uploader should not be able to make the server keep
+/// sixteen megabytes per machine under the name of one.
+pub const MAX_STATUS_BYTES: usize = 64 * 1024;
+
+/// A run that did not happen, and why: `loadbearer.run-status/1`.
+///
+/// Tolerant like the result reader: unknown fields are ignored, the open
+/// strings (`status`, `reason`) stay strings, and only what the record cannot
+/// be filed without — the schema and when it was made — is required. It holds
+/// attribution (hostname, identity, tags) and nothing about the machine's
+/// hardware, by the sender's own rule.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunStatus {
+    pub schema: String,
+    /// RFC 3339: when the record was made, and what tells two from one machine
+    /// apart. There is no run behind it.
+    pub timestamp: String,
+    #[serde(default)]
+    pub tool_version: Option<String>,
+    /// `skipped` is the only value so far.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// A short stable word: `on_battery` or `busy` today.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The sentence the skip printed.
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub identity: Option<Identity>,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+}
+
+/// A status record over [`MAX_STATUS_BYTES`]. A type of its own so the upload
+/// can answer 413 rather than 400.
+#[derive(Debug)]
+pub struct StatusTooLarge;
+
+impl std::fmt::Display for StatusTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a run status record is a few hundred bytes; this is over the {MAX_STATUS_BYTES} \
+             byte limit for one"
+        )
+    }
+}
+
+impl std::error::Error for StatusTooLarge {}
+
+impl RunStatus {
+    /// Parse, refusing anything that is not this schema family at a major this
+    /// build reads — a result document included.
+    pub fn from_json(text: &str) -> anyhow::Result<Self> {
+        if text.len() > MAX_STATUS_BYTES {
+            return Err(StatusTooLarge.into());
+        }
+        let doc: RunStatus = serde_json::from_str(text)?;
+        let Some(rest) = doc.schema.strip_prefix(STATUS_SCHEMA_FAMILY) else {
+            anyhow::bail!(
+                "not a loadbearer run status record (schema {:?})",
+                doc.schema
+            );
+        };
+        let major: u32 = rest
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .parse()
+            .map_err(|_| anyhow::anyhow!("unreadable schema version in {:?}", doc.schema))?;
+        if major != STATUS_SCHEMA_MAJOR {
+            anyhow::bail!(
+                "run status record uses schema major {major}, this build reads \
+                 {STATUS_SCHEMA_MAJOR} (fields have been removed, renamed or retyped — upgrade \
+                 the dashboard)"
+            );
+        }
+        // Compared as instants, to keep one record per machine, so a timestamp
+        // that is not one cannot be filed.
+        if time::OffsetDateTime::parse(
+            doc.timestamp.trim(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_err()
+        {
+            anyhow::bail!("the run status record's timestamp is not RFC 3339");
+        }
+        Ok(doc)
+    }
+
+    /// The key a result from the same machine would have: the same function,
+    /// over the same identity block and hostname.
+    pub fn machine_key(&self) -> MachineKey {
+        key_from(self.identity.as_ref(), self.hostname.as_deref())
+    }
+}
+
+/// Either document a collector sends: a result, or a run status record. The
+/// one entry point the upload and the scanner share, so neither can accept a
+/// document the other would refuse.
+#[derive(Debug, Clone)]
+pub enum Document {
+    Result(Box<ResultFile>),
+    Status(Box<RunStatus>),
+}
+
+impl Document {
+    /// Decide by `schema` first, then hand the text to that document's own
+    /// reader. A text with no readable `schema` goes to the result reader,
+    /// whose refusals are the ones people already know.
+    pub fn from_json(text: &str) -> anyhow::Result<Self> {
+        #[derive(Deserialize)]
+        struct Peek {
+            #[serde(default)]
+            schema: Option<String>,
+        }
+        let is_status = serde_json::from_str::<Peek>(text)
+            .ok()
+            .and_then(|p| p.schema)
+            .is_some_and(|s| s.starts_with(STATUS_SCHEMA_FAMILY));
+        if is_status {
+            RunStatus::from_json(text).map(|s| Self::Status(Box::new(s)))
+        } else {
+            ResultFile::from_json(text).map(|r| Self::Result(Box::new(r)))
+        }
+    }
+}
+
 impl ResultFile {
     /// Parse, and refuse a schema major this build doesn't understand rather
     /// than silently misreading it.
@@ -785,29 +952,10 @@ impl ResultFile {
     /// unset, and reissued between machines — which is the whole reason
     /// loadbearer started recording the others.
     pub fn machine_key(&self) -> MachineKey {
-        let id = self.machine.identity.clone().unwrap_or_default();
-        for (kind, value) in [
-            (KeyKind::Serial, id.serial),
-            (KeyKind::SmbiosUuid, id.smbios_uuid),
-            (KeyKind::MachineId, id.machine_id),
-            (KeyKind::Hostname, self.machine.hostname.clone()),
-        ] {
-            if let Some(v) = value {
-                let v = v.trim();
-                if !v.is_empty() {
-                    return MachineKey {
-                        value: v.to_string(),
-                        kind,
-                    };
-                }
-            }
-        }
-        // Nothing at all to key on. Falling back to the source path would make
-        // every re-run look like a new machine, so say so explicitly instead.
-        MachineKey {
-            value: "unidentified".to_string(),
-            kind: KeyKind::Hostname,
-        }
+        key_from(
+            self.machine.identity.as_ref(),
+            self.machine.hostname.as_deref(),
+        )
     }
 
     /// True when the run completed but not everything ran, so its figures are
@@ -999,6 +1147,25 @@ pub(crate) mod samples {
         d["machine"]["boot"] = json!({ "booted_at": "2026-09-09T10:41:28Z", "uptime_secs": 14492 });
         d["machine"]["security"] = json!({ "firmware_mode": "uefi", "secure_boot": false });
     }
+
+    /// A run status record, as the CLI writes one for a run skipped on
+    /// battery: attribution and the reason, nothing about the hardware. The
+    /// identity is the one `win-modern.json` carries, so it is filed under
+    /// the same key as that result.
+    pub(crate) fn run_status() -> Value {
+        let result = fixture("win-modern.json");
+        json!({
+            "schema": "loadbearer.run-status/1",
+            "tool_version": "1.9.0",
+            "timestamp": "2026-09-10T22:39:57.1934416Z",
+            "status": "skipped",
+            "reason": "on_battery",
+            "detail": "on battery (62%), and --not-on-battery was given",
+            "hostname": result["machine"]["hostname"],
+            "identity": result["machine"]["identity"],
+            "tags": { "site": "glasgow" }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1122,5 +1289,113 @@ mod tests {
         );
         assert!(doc.machine.boot.expect("b").uptime_secs.is_none());
         assert_eq!(Collected::of(&[]).text(), None);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn status_text(v: &serde_json::Value) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn a_status_record_is_read_and_filed_under_the_key_a_result_from_the_machine_gets() {
+        let record = samples::run_status();
+        let Document::Status(status) = Document::from_json(&status_text(&record)).expect("reads")
+        else {
+            panic!("a run status record is not a result");
+        };
+        assert_eq!(status.reason.as_deref(), Some("on_battery"));
+        assert_eq!(status.tags.get("site").map(String::as_str), Some("glasgow"));
+
+        let result = ResultFile::from_json(&samples::fixture("win-modern.json").to_string())
+            .expect("a result");
+        assert_eq!(status.machine_key(), result.machine_key());
+        assert_eq!(status.machine_key().kind, KeyKind::Serial);
+    }
+
+    /// Hostname alone, and nothing at all, key as a result would.
+    #[test]
+    fn a_status_record_with_less_identity_falls_back_as_a_result_does() {
+        let mut v = samples::run_status();
+        v.as_object_mut().unwrap().remove("identity");
+        let Document::Status(s) = Document::from_json(&status_text(&v)).unwrap() else {
+            panic!("status");
+        };
+        assert_eq!(s.machine_key().kind, KeyKind::Hostname);
+
+        let bare =
+            json!({ "schema": "loadbearer.run-status/1", "timestamp": "2026-09-10T22:00:00Z" });
+        let Document::Status(s) = Document::from_json(&status_text(&bare)).unwrap() else {
+            panic!("status");
+        };
+        assert_eq!(s.machine_key().value, "unidentified");
+        assert!(s.reason.is_none() && s.tags.is_empty());
+    }
+
+    #[test]
+    fn unknown_fields_and_open_values_are_tolerated() {
+        let mut v = samples::run_status();
+        v["status"] = json!("deferred");
+        v["reason"] = json!("lid_closed");
+        v["next_try"] = json!({ "at": "tomorrow" });
+        let Document::Status(s) = Document::from_json(&status_text(&v)).unwrap() else {
+            panic!("status");
+        };
+        assert_eq!(s.status.as_deref(), Some("deferred"));
+        assert_eq!(s.reason.as_deref(), Some("lid_closed"));
+    }
+
+    #[test]
+    fn a_status_record_is_never_a_result_and_a_result_never_a_status() {
+        let record = status_text(&samples::run_status());
+        assert!(ResultFile::from_json(&record).is_err());
+        let result = samples::fixture("win-modern.json").to_string();
+        assert!(RunStatus::from_json(&result).is_err());
+        assert!(matches!(
+            Document::from_json(&result),
+            Ok(Document::Result(_))
+        ));
+
+        // The schema string decides, whatever else is in the document: a full
+        // result carrying the status schema is refused as a result, and one
+        // carrying the result schema is refused as a status record.
+        let mut v = samples::fixture("win-modern.json");
+        v["schema"] = json!("loadbearer.run-status/1");
+        assert!(ResultFile::from_json(&v.to_string()).is_err());
+        let mut v = samples::run_status();
+        v["schema"] = json!("loadbearer.result/1");
+        assert!(RunStatus::from_json(&v.to_string()).is_err());
+        assert!(Document::from_json(&v.to_string()).is_err());
+    }
+
+    #[test]
+    fn another_major_is_refused_in_the_result_readers_style() {
+        let mut v = samples::run_status();
+        v["schema"] = json!("loadbearer.run-status/2");
+        let e = Document::from_json(&status_text(&v)).unwrap_err();
+        assert!(format!("{e:#}").contains("schema major 2"), "{e:#}");
+        v["schema"] = json!("loadbearer.run-status/x");
+        assert!(Document::from_json(&status_text(&v)).is_err());
+    }
+
+    #[test]
+    fn a_timestamp_that_is_not_a_time_is_refused() {
+        let mut v = samples::run_status();
+        v["timestamp"] = json!("last Tuesday");
+        assert!(Document::from_json(&status_text(&v)).is_err());
+        v.as_object_mut().unwrap().remove("timestamp");
+        assert!(Document::from_json(&status_text(&v)).is_err());
+    }
+
+    #[test]
+    fn an_oversized_status_record_is_refused_as_such() {
+        let mut v = samples::run_status();
+        v["detail"] = json!("x".repeat(MAX_STATUS_BYTES));
+        let e = Document::from_json(&status_text(&v)).unwrap_err();
+        assert!(e.is::<StatusTooLarge>());
     }
 }

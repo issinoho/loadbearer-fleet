@@ -9,6 +9,35 @@ notes, so each one has to stand on its own.
 
 ### Added
 
+- **A skipped run tells the server so.** A loadbearer release after 1.8.1
+  posts a **run status record** (`loadbearer.run-status/1`) to
+  `POST /api/upload` when a scheduled run is skipped because the machine was
+  on battery or busy, which until now answered `400`: it only knew results.
+  Fleet could not tell a machine that keeps trying and keeps being skipped from
+  one whose collector had stopped; both only looked stale. The record goes
+  through every check a result does, tag scope included, is filed under the key
+  a result from that machine gets, and is kept as one file per machine
+  (`status-<hash>.json` in `upload_dir`) replaced by a newer record — an
+  older one is acknowledged and dropped, one over 64 KB is refused, and the
+  answer is `{"outcome":"recorded",…}`. It is derived like everything else: a
+  scan reads status files into a `run_status` table (created on open, no
+  format change), `scan --reindex` rebuilds it, and a status file is not a
+  rejected file — `scan` counts it apart and `scan_files_rejected` leaves it
+  out. A machine with results shows `last_skip` when the record is newer than
+  its latest run: one *Last attempt* line on its page, two machines-CSV columns
+  (`last_skip_at`, `last_skip_reason`), and a sentence on its **stale**
+  finding saying the collector is running and why the last attempt did not
+  measure — the finding's headline, severity and code unchanged, and the
+  sentence only ever in the live view, never in a reconstructed past week. A
+  machine that has *only* ever been skipped is not a machine: it is listed as
+  `unmeasured` (and `summary.unmeasured`), scoped and filtered with the
+  machines, in a **Tried, never measured** card on the Overview that is shown
+  only when there is one, in `report` and `report --json`, and as the
+  unlabelled gauge `machines_unmeasured`; `status_records_total` counts the
+  records accepted. It is no finding and in neither the webhook nor the digest.
+  `forget` finds such a machine by hostname or key and removes its record,
+  reporting the status file still in the folder as it does a result's.
+
 - **The OS release, the memory layout and how long a run took**, from a
   loadbearer release after 1.8.1. The machine page's OS line adds the edition,
   display version and build it didn't already say (`Windows 11 Enterprise ·

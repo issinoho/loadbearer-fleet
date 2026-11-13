@@ -44,7 +44,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-use crate::schema::{Collected, ResultFile};
+use crate::schema::{Collected, Document, ResultFile, RunStatus};
 
 /// Bumped when the derived tables change shape. A mismatch rebuilds from the
 /// folder rather than migrating — see `set_aside` for what happens to the old
@@ -175,6 +175,21 @@ fn upload_name(doc: &ResultFile, hash: &str) -> String {
         .collect();
 
     format!("{safe}-{stamp}-{}.json", &hash[..8])
+}
+
+/// The file a machine's run status record lives in: `status-` and the first 16
+/// hex digits of the SHA-256 of its machine key. The key is whatever the
+/// machine said it was, so it never reaches a filename itself, and the prefix
+/// keeps the file apart from any result file's name (`<host>-<stamp>-<hash>`)
+/// while saying what it is to someone looking at the folder.
+pub fn status_name(machine_key: &str) -> String {
+    format!("status-{}.json", &content_hash(machine_key)[..16])
+}
+
+/// A status record's timestamp as an instant, or `None` where it is not RFC
+/// 3339.
+fn status_instant(at: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(at.trim(), &time::format_description::well_known::Rfc3339).ok()
 }
 
 /// A document's identity. sha2 0.11 returns a hybrid-array `Array`, which has
@@ -482,7 +497,8 @@ pub struct Index {
     archive: Option<std::path::PathBuf>,
 }
 
-/// A machine that `forget` could act on.
+/// A machine that `forget` could act on. `runs` is 0 for one known only from
+/// its run status records.
 #[derive(Debug, Clone)]
 pub struct Forgettable {
     pub key: String,
@@ -494,8 +510,10 @@ pub struct Forgettable {
 #[derive(Debug, Default, Clone)]
 pub struct ForgetPlan {
     pub runs: i64,
+    /// 1 when the machine has a run status record, which is removed with it.
+    pub statuses: i64,
     pub archived: Vec<std::path::PathBuf>,
-    /// Result files still in the collection folder. While any of these exist,
+    /// Result files, and the status file, still in the collection folder. While any of these exist,
     /// the next scan will index the machine again — which is the one thing
     /// about removal that surprises people, so it is reported rather than
     /// assumed.
@@ -505,10 +523,25 @@ pub struct ForgetPlan {
 /// What one scan did, for logging and for the UI's "last refreshed" line.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScanReport {
+    /// Result files met. A run status file is counted in `statuses` and in
+    /// none of these, so `seen` is still `ingested` + `unchanged` + the files
+    /// among `rejected`.
     pub seen: usize,
     pub ingested: usize,
     pub unchanged: usize,
+    /// Run status files met, new or not. Not a rejection: a skipped run's
+    /// record is a document this reads, just not a result.
+    pub statuses: usize,
     pub rejected: Vec<(String, String)>,
+}
+
+/// What reading one document came to.
+enum Ingested {
+    /// A result; `true` when it was new.
+    Run(bool),
+    /// A run status record, whether it was kept, replaced something, or was
+    /// not newer than what is held.
+    Status,
 }
 
 impl Index {
@@ -716,6 +749,31 @@ impl Index {
                  speed_mts            INTEGER,
                  configured_speed_mts INTEGER,
                  PRIMARY KEY (run_id, position)
+             );
+
+             -- The latest run status record per machine: a skipped run, which
+             -- is not a run and so is not in `run`. One row per machine key,
+             -- the newest by its own timestamp. Added after the fact like
+             -- `drive`, `IF NOT EXISTS` for the same reason, and derived the
+             -- same way: `scan --reindex` rebuilds it from the folder.
+             CREATE TABLE IF NOT EXISTS run_status (
+                 machine_key  TEXT PRIMARY KEY,
+                 hostname     TEXT,
+                 status       TEXT,
+                 reason       TEXT,
+                 detail       TEXT,
+                 at           TEXT NOT NULL,
+                 tool_version TEXT,
+                 source_path  TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 ingested_at  TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS run_status_hash ON run_status(content_hash);
+             CREATE TABLE IF NOT EXISTS run_status_tag (
+                 machine_key TEXT NOT NULL REFERENCES run_status(machine_key) ON DELETE CASCADE,
+                 key         TEXT NOT NULL,
+                 value       TEXT NOT NULL,
+                 PRIMARY KEY (machine_key, key)
              );",
         )?;
         add_missing_columns(&conn)?;
@@ -780,24 +838,190 @@ impl Index {
             if !is_document(path) {
                 continue;
             }
-            report.seen += 1;
-            let outcome = if reindex {
-                self.reingest_file(path)
-            } else {
-                self.ingest_file(path)
-            };
-            match outcome {
-                Ok(true) => report.ingested += 1,
-                Ok(false) => report.unchanged += 1,
-                Err(e) => report
-                    .rejected
-                    .push((path.display().to_string(), format!("{e:#}"))),
+            match self.ingest_path(path, reindex) {
+                Ok(Ingested::Run(true)) => {
+                    report.seen += 1;
+                    report.ingested += 1;
+                }
+                Ok(Ingested::Run(false)) => {
+                    report.seen += 1;
+                    report.unchanged += 1;
+                }
+                Ok(Ingested::Status) => report.statuses += 1,
+                Err(e) => {
+                    report.seen += 1;
+                    report
+                        .rejected
+                        .push((path.display().to_string(), format!("{e:#}")));
+                }
             }
         }
         Ok(report)
     }
 
+    /// Read one file of the collection folder as whichever document it is.
+    /// With `reindex`, what is indexed from these same bytes is dropped
+    /// first, so it is rebuilt rather than skipped.
+    ///
+    /// The ordinary path short-circuits on the content hash, which is what
+    /// makes a rescan of ten thousand files cheap — and also means a *new
+    /// column* is never filled in for a document that has not changed. The
+    /// rebuild is the way to pick one up: the run is deleted and rebuilt from
+    /// the same bytes, so nothing about it changes except what this build now
+    /// records.
+    fn ingest_path(&mut self, path: &Path, reindex: bool) -> Result<Ingested> {
+        let text = read_document(path)?;
+        let hash = content_hash(&text);
+        if reindex {
+            // Children go with a run: `run` is the parent of component,
+            // subtest, tag, drive and memory_module, all ON DELETE CASCADE.
+            self.conn
+                .execute("DELETE FROM run WHERE content_hash = ?1", params![hash])?;
+            self.conn.execute(
+                "DELETE FROM run_status WHERE content_hash = ?1",
+                params![hash],
+            )?;
+        }
+        self.ingest_document(&text, path, &hash)
+    }
+
+    fn ingest_document(&mut self, text: &str, source: &Path, hash: &str) -> Result<Ingested> {
+        // Known by its bytes, as either kind, before anything is parsed: the
+        // rescan of a share is mostly this.
+        let known_run: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM run WHERE content_hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if known_run.is_some() {
+            return Ok(Ingested::Run(false));
+        }
+        let known_status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT machine_key FROM run_status WHERE content_hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if known_status.is_some() {
+            return Ok(Ingested::Status);
+        }
+        match Document::from_json(text).with_context(|| format!("parsing {}", source.display()))? {
+            Document::Result(doc) => {
+                self.keep(text, hash)?;
+                self.insert(&doc, source, hash)?;
+                Ok(Ingested::Run(true))
+            }
+            Document::Status(status) => {
+                self.ingest_status(&status, source, hash)?;
+                Ok(Ingested::Status)
+            }
+        }
+    }
+
+    /// Keep a run status record if it is the newest held for its machine.
+    ///
+    /// One row per machine, replaced by a newer record and left alone by an
+    /// older or equal one, so scanning a folder holding several files from one
+    /// machine ends on the newest whatever order they are met in. Timestamps
+    /// are compared as instants, not text. Returns whether the row changed.
+    fn ingest_status(&mut self, st: &RunStatus, source: &Path, hash: &str) -> Result<bool> {
+        let key = st.machine_key().value;
+        let at = st.timestamp.trim();
+        let held: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT at FROM run_status WHERE machine_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(held) = held
+            && let (Some(held), Some(new)) = (status_instant(&held), status_instant(at))
+            && new <= held
+        {
+            return Ok(false);
+        }
+        let tx = self.conn.transaction()?;
+        // Its tags go with it, by the cascade.
+        tx.execute(
+            "DELETE FROM run_status WHERE machine_key = ?1",
+            params![key],
+        )?;
+        tx.execute(
+            "INSERT INTO run_status
+                 (machine_key, hostname, status, reason, detail, at, tool_version,
+                  source_path, content_hash, ingested_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))",
+            params![
+                key,
+                present(st.hostname.as_deref()),
+                present(st.status.as_deref()),
+                present(st.reason.as_deref()),
+                present(st.detail.as_deref()),
+                at,
+                present(st.tool_version.as_deref()),
+                source.display().to_string(),
+                hash,
+            ],
+        )?;
+        for (k, v) in &st.tags {
+            tx.execute(
+                "INSERT OR REPLACE INTO run_status_tag (machine_key, key, value)
+                 VALUES (?1, ?2, ?3)",
+                params![key, k, v],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Take a run status record submitted through the dashboard.
+    ///
+    /// Written to `dir` first, as one file per machine under a name made from
+    /// the machine key's hash alone ([`status_name`]) — never from anything
+    /// the sender chose — and replaced by a newer record through a temporary
+    /// file and a rename, like a result. A record not newer than the file
+    /// already there is dropped, and the sender is told it was recorded: the
+    /// answer to "the server has this or something better" is yes. Nothing is
+    /// archived: the archive is for results, and a status record is replaced.
+    ///
+    /// Returns whether the record replaced what was held.
+    pub fn accept_status(&mut self, status: &RunStatus, text: &str, dir: &Path) -> Result<bool> {
+        let key = status.machine_key();
+        let target = dir.join(status_name(&key.value));
+        if let Ok(held) = std::fs::read_to_string(&target)
+            && let Ok(held) = RunStatus::from_json(&held)
+            && let (Some(held), Some(new)) = (
+                status_instant(&held.timestamp),
+                status_instant(&status.timestamp),
+            )
+            && new <= held
+        {
+            return Ok(false);
+        }
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating the upload directory {}", dir.display()))?;
+        let hash = content_hash(text);
+        let partial = dir.join(format!(
+            "{hash}.{}-{}.partial",
+            std::process::id(),
+            PARTIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        write_new(&partial, text)?;
+        std::fs::rename(&partial, &target)
+            .with_context(|| format!("moving {} into place", partial.display()))?;
+        self.ingest_status(status, &target, &hash)
+    }
+
     /// Returns whether the file was new. `false` means it was already indexed.
+    /// A result only: the scan reads a file through `ingest_path`, which also
+    /// takes a run status record, so this is what the tests use.
+    #[cfg(test)]
     pub fn ingest_file(&mut self, path: &Path) -> Result<bool> {
         let text = read_document(path)?;
         self.ingest_text(&text, path)
@@ -862,23 +1086,6 @@ impl Index {
             )?;
         }
         Ok(fresh)
-    }
-
-    /// Ingest a file that may already be indexed, replacing what is there.
-    ///
-    /// The ordinary path short-circuits on the content hash, which is what
-    /// makes a rescan of ten thousand files cheap — and also means a *new
-    /// column* is never filled in for a document that has not changed. This is
-    /// the way to pick up one: the run is deleted and rebuilt from the same
-    /// bytes, so nothing about it changes except what this build now records.
-    pub fn reingest_file(&mut self, path: &Path) -> Result<bool> {
-        let text = read_document(path)?;
-        let hash = content_hash(&text);
-        // Children go with it: `run` is the parent of component, subtest, tag,
-        // drive and memory_module, all with ON DELETE CASCADE.
-        self.conn
-            .execute("DELETE FROM run WHERE content_hash = ?1", params![hash])?;
-        self.ingest_text(&text, path)
     }
 
     /// Ingest a document already in memory, recording `source` as where it came
@@ -1204,21 +1411,57 @@ impl Index {
     pub fn machines_matching(&self, needle: &str) -> Result<Vec<Forgettable>> {
         // Key first, then hostname, because the key is what the index is
         // actually organised by and an operator will usually type a hostname.
+        //
+        // A machine known only from its run status records is as forgettable
+        // as one with runs, so the keys come from both tables.
         let mut stmt = self.conn.prepare(
-            "SELECT machine_key, hostname, COUNT(*) FROM run
+            "SELECT machine_key FROM run
                WHERE machine_key = ?1 COLLATE NOCASE OR hostname = ?1 COLLATE NOCASE
-               GROUP BY machine_key ORDER BY machine_key",
+             UNION
+             SELECT machine_key FROM run_status
+               WHERE machine_key = ?1 COLLATE NOCASE OR hostname = ?1 COLLATE NOCASE
+             ORDER BY machine_key",
         )?;
-        let rows = stmt
-            .query_map([needle], |r| {
-                Ok(Forgettable {
-                    key: r.get(0)?,
-                    hostname: r.get(1)?,
-                    runs: r.get(2)?,
-                })
-            })?
+        let keys = stmt
+            .query_map([needle], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = Vec::with_capacity(keys.len());
+        for key in keys {
+            let (hostname, runs): (Option<String>, i64) = self.conn.query_row(
+                "SELECT hostname, COUNT(*) FROM run WHERE machine_key = ?1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let hostname = match hostname {
+                Some(h) => Some(h),
+                None => self
+                    .conn
+                    .query_row(
+                        "SELECT hostname FROM run_status WHERE machine_key = ?1",
+                        [&key],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten(),
+            };
+            rows.push(Forgettable {
+                key,
+                hostname,
+                runs,
+            });
+        }
         Ok(rows)
+    }
+
+    /// Machines `forget` could be asked about: those with a run, and those
+    /// known only from a run status record.
+    pub fn forgettable_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM (SELECT machine_key FROM run
+                                   UNION SELECT machine_key FROM run_status)",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// What `forget` would do, without doing it.
@@ -1247,6 +1490,23 @@ impl Index {
                 plan.sources_still_present.push(source);
             }
         }
+        // The run status record: a row, and a file in the collection folder
+        // that is reported like a result file, because it brings the machine
+        // back to the list of those tried and never measured all the same.
+        let status_source: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT source_path FROM run_status WHERE machine_key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(source) = status_source {
+            plan.statuses = 1;
+            if Path::new(&source).exists() {
+                plan.sources_still_present.push(source);
+            }
+        }
         plan.sources_still_present.sort();
         plan.sources_still_present.dedup();
         Ok(plan)
@@ -1262,7 +1522,7 @@ impl Index {
     /// machine straight back.
     pub fn forget(&mut self, key: &str) -> Result<ForgetPlan> {
         let plan = self.forget_plan(key)?;
-        if plan.runs == 0 {
+        if plan.runs == 0 && plan.statuses == 0 {
             return Ok(plan);
         }
 
@@ -1273,6 +1533,9 @@ impl Index {
             .conn
             .execute("DELETE FROM run WHERE machine_key = ?1", [key])?;
         debug_assert_eq!(removed as i64, plan.runs);
+        // Its tags go with it.
+        self.conn
+            .execute("DELETE FROM run_status WHERE machine_key = ?1", [key])?;
 
         for doc in &plan.archived {
             std::fs::remove_file(doc)
@@ -2677,5 +2940,259 @@ mod tests {
             "1.5.0+ marks the all-core subtests peak-reported; \
              comparing a peak against a median would be meaningless"
         );
+    }
+    // --- run status records ------------------------------------------------
+
+    /// A run status record for a machine known only by hostname, so it shares
+    /// no key with any fixture result.
+    fn status_for(host: &str, at: &str, reason: &str) -> String {
+        let mut v = crate::schema::samples::run_status();
+        v.as_object_mut().unwrap().remove("identity");
+        v["hostname"] = serde_json::json!(host);
+        v["timestamp"] = serde_json::json!(at);
+        v["reason"] = serde_json::json!(reason);
+        v.to_string()
+    }
+
+    fn status_rows(idx: &Index) -> Vec<(String, String, String)> {
+        let mut stmt = idx
+            .conn
+            .prepare("SELECT machine_key, at, reason FROM run_status ORDER BY machine_key")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_scan_reads_a_status_file_into_its_own_table_and_count_and_does_not_reject_it() {
+        let dir = scratch("status-scan");
+        let results = dir.join("results");
+        std::fs::create_dir_all(&results).unwrap();
+        std::fs::copy(fixture("win-modern.json"), results.join("PC-01.json")).unwrap();
+        std::fs::write(
+            results.join("dropped-by-a-collector.json"),
+            status_for("PC-77", "2026-09-10T22:00:00Z", "busy"),
+        )
+        .unwrap();
+
+        let mut idx = Index::open_in_memory().unwrap();
+        let report = idx.scan(&results).unwrap();
+        assert_eq!(report.statuses, 1);
+        assert_eq!((report.seen, report.ingested, report.unchanged), (1, 1, 0));
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        assert_eq!(idx.run_count().unwrap(), 1, "it is not a run");
+        assert_eq!(status_rows(&idx).len(), 1);
+
+        // Idempotent: the same file again is no new row and not a rejection.
+        let again = idx.scan(&results).unwrap();
+        assert_eq!(again.statuses, 1);
+        assert_eq!((again.seen, again.ingested, again.unchanged), (1, 0, 1));
+        assert!(again.rejected.is_empty());
+        assert_eq!(status_rows(&idx).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reindexing_rebuilds_the_status_table_from_the_folder() {
+        let dir = scratch("status-reindex");
+        std::fs::write(
+            dir.join("a.json"),
+            status_for("PC-77", "2026-09-10T22:00:00Z", "busy"),
+        )
+        .unwrap();
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.scan(&dir).unwrap();
+
+        // A row this build once wrote differently: a plain scan leaves it,
+        // because the bytes are unchanged, and a reindex corrects it.
+        idx.conn
+            .execute("UPDATE run_status SET reason = 'stale-shape'", [])
+            .unwrap();
+        idx.scan(&dir).unwrap();
+        assert_eq!(status_rows(&idx)[0].2, "stale-shape");
+        let report = idx.rescan_all(&dir).unwrap();
+        assert_eq!(report.statuses, 1);
+        assert_eq!(status_rows(&idx)[0].2, "busy");
+        assert_eq!(status_rows(&idx).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_newest_record_per_machine_wins_whatever_order_the_files_are_met_in() {
+        let dir = scratch("status-newest");
+        std::fs::write(
+            dir.join("a-newer.json"),
+            status_for("PC-77", "2026-09-10T22:00:00Z", "busy"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("z-older.json"),
+            status_for("PC-77", "2026-09-09T22:00:00Z", "on_battery"),
+        )
+        .unwrap();
+        // Offsets are compared as instants: this one is the earliest of the three.
+        std::fs::write(
+            dir.join("m-offset.json"),
+            status_for("PC-77", "2026-09-10T23:30:00+05:00", "on_battery"),
+        )
+        .unwrap();
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.scan(&dir).unwrap();
+        let rows = status_rows(&idx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, "busy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_uploaded_status_record_is_one_file_per_machine_replaced_by_a_newer_one() {
+        let dir = scratch("status-upload");
+        let uploads = dir.join("uploads");
+        let archive = dir.join("archive");
+        let mut idx = Index::open_in_memory()
+            .unwrap()
+            .with_archive(Some(&archive))
+            .unwrap();
+        let accept = |idx: &mut Index, host: &str, at: &str, reason: &str| {
+            let text = status_for(host, at, reason);
+            let status = crate::schema::RunStatus::from_json(&text).unwrap();
+            idx.accept_status(&status, &text, &uploads).unwrap()
+        };
+
+        assert!(accept(&mut idx, "PC-77", "2026-09-10T22:00:00Z", "busy"));
+        let files = |d: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(files(&uploads), [status_name("PC-77")]);
+        assert!(status_name("PC-77").starts_with("status-"));
+
+        // Newer: replaces, still one file, and the file holds the newer text.
+        assert!(accept(
+            &mut idx,
+            "PC-77",
+            "2026-09-11T22:00:00Z",
+            "on_battery"
+        ));
+        assert_eq!(files(&uploads).len(), 1);
+        let held = std::fs::read_to_string(uploads.join(status_name("PC-77"))).unwrap();
+        assert!(held.contains("on_battery"));
+        assert_eq!(status_rows(&idx)[0].2, "on_battery");
+
+        // Older, and equal: acknowledged and dropped, file and row untouched.
+        assert!(!accept(&mut idx, "PC-77", "2026-09-10T01:00:00Z", "busy"));
+        assert!(!accept(
+            &mut idx,
+            "PC-77",
+            "2026-09-11T22:00:00Z",
+            "on_battery"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(uploads.join(status_name("PC-77"))).unwrap(),
+            held
+        );
+        assert_eq!(status_rows(&idx)[0].2, "on_battery");
+
+        // Another machine, another file. Nothing is archived, and no partial
+        // file is left behind.
+        accept(&mut idx, "PC-78", "2026-09-10T22:00:00Z", "busy");
+        assert_eq!(files(&uploads).len(), 2);
+        assert!(files(&uploads).iter().all(|n| n.ends_with(".json")));
+        assert!(!archive.exists() || files(&archive).is_empty());
+
+        // And the folder alone brings the table back.
+        let mut fresh = Index::open_in_memory().unwrap();
+        let report = fresh.scan(&uploads).unwrap();
+        assert_eq!(report.statuses, 2);
+        assert_eq!(status_rows(&fresh).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_takes_a_machine_known_only_from_its_status_record() {
+        let dir = scratch("status-forget");
+        let source = dir.join("s.json");
+        std::fs::write(&source, status_for("PC-77", "2026-09-10T22:00:00Z", "busy")).unwrap();
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.scan(&dir).unwrap();
+
+        let found = idx.machines_matching("pc-77").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].runs, found[0].hostname.as_deref()),
+            (0, Some("PC-77"))
+        );
+        assert_eq!(idx.forgettable_count().unwrap(), 1);
+
+        let plan = idx.forget_plan(&found[0].key).unwrap();
+        assert_eq!((plan.runs, plan.statuses), (0, 1));
+        assert_eq!(plan.sources_still_present.len(), 1, "{plan:?}");
+        assert_eq!(status_rows(&idx).len(), 1, "a plan changes nothing");
+
+        idx.forget(&found[0].key).unwrap();
+        assert!(status_rows(&idx).is_empty());
+        let tags: i64 = idx
+            .conn
+            .query_row("SELECT COUNT(*) FROM run_status_tag", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tags, 0);
+        assert!(idx.machines_matching("PC-77").unwrap().is_empty());
+
+        // Like a result file, the one in the folder brings it back until it goes.
+        idx.scan(&dir).unwrap();
+        assert_eq!(status_rows(&idx).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_a_machine_with_runs_takes_its_status_record_too() {
+        let dir = scratch("status-forget-both");
+        let mut idx = Index::open_in_memory().unwrap();
+        idx.ingest_file(&fixture("win-modern.json")).unwrap();
+        // The status fixture shares win-modern's identity, so one key.
+        std::fs::write(
+            dir.join("s.json"),
+            crate::schema::samples::run_status().to_string(),
+        )
+        .unwrap();
+        idx.scan(&dir).unwrap();
+        let found = idx.machines_matching("FLEET-WIN-01").unwrap();
+        assert_eq!(found.len(), 1, "one machine, not two");
+        assert_eq!(found[0].runs, 1);
+
+        let plan = idx.forget(&found[0].key).unwrap();
+        assert_eq!((plan.runs, plan.statuses), (1, 1));
+        assert_eq!(idx.run_count().unwrap(), 0);
+        assert!(status_rows(&idx).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_index_from_before_run_status_gains_the_tables_and_keeps_its_history() {
+        let dir = scratch("status-migrate");
+        let db = dir.join("i.db");
+        {
+            let mut idx = Index::open(&db).unwrap();
+            idx.ingest_file(&fixture("win-modern.json")).unwrap();
+            idx.conn
+                .execute_batch("DROP TABLE run_status_tag; DROP TABLE run_status;")
+                .unwrap();
+        }
+        let mut idx = Index::open(&db).unwrap();
+        assert_eq!(idx.run_count().unwrap(), 1, "the history is kept");
+        assert!(status_rows(&idx).is_empty(), "the table is back, and empty");
+        let text = status_for("PC-77", "2026-09-10T22:00:00Z", "busy");
+        let status = crate::schema::RunStatus::from_json(&text).unwrap();
+        idx.accept_status(&status, &text, &dir.join("uploads"))
+            .unwrap();
+        assert_eq!(status_rows(&idx).len(), 1);
+        drop(idx);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
