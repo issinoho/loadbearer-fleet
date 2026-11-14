@@ -43,6 +43,8 @@ class FakeNode {
     this.textContent = '';
     this.className = '';
     this.hidden = false;
+    // As an input's is until somebody types: empty, not missing.
+    this.value = '';
     this.listeners = {};
   }
 
@@ -2087,6 +2089,132 @@ function heatRows(h) {
     failures.push(`triage/send: threw ${err.message}`);
   }
   globalThis.document.querySelector = () => null;
+}
+
+// Suppressing by tag, through the panel. An admin opens Suppress on a live
+// finding, chooses "Machines tagged…", and is offered the tags the fleet
+// carries — a key and a value in selects, starting at this machine's own tag.
+// What has to hold: the request is the existing one with `tags` and no machine
+// key; and once the server has applied it (here, by the same rule: every tag
+// matches), the finding is quiet on a machine with the tag and live on one
+// without. A caller who may not suppress is never offered it, and a fleet with
+// no tags is not offered a choice it cannot fill.
+{
+  const tagOf = (m) => m.tags?.site;
+  const warn = snapshot.flags.filter((f) => f.severity !== 'info');
+  const first = warn.find((f) => tagOf(snapshot.machines.find((x) => x.key === f.machine_key)));
+  const a = first && snapshot.machines.find((x) => x.key === first.machine_key);
+  const b = a && snapshot.machines.find((x) => tagOf(x) && tagOf(x) !== tagOf(a));
+  check('triage/tags', !!(a && b), 'the fixtures need two machines on different sites, one with a warning');
+  if (a && b) {
+    // The same finding on both, so the one rule has two machines to meet.
+    const live = [
+      { ...first, headline: 'Shared finding' },
+      { ...first, machine_key: b.key, hostname: b.hostname, headline: 'Shared finding' },
+    ];
+    const world = { ...snapshot, flags: live, summary: { ...snapshot.summary, quieted: { acknowledged: 0, snoozed: 0, suppressed: 0 } } };
+    const rowOf = (h, m) => findAll(h, (n) => n.className === 'finding' || n.className === 'finding finding-quieted')
+      .find((n) => textOf(n).includes(m.hostname || m.key));
+    const buttonIn = (root, text) => findAll(root, (n) => n.tagName === 'button' && n.textContent === text)[0];
+    const render = (state_) => {
+      mod.state.snap = state_;
+      mod.state.me = { role: 'admin', may_triage: true, may_suppress: true };
+      const h = host(1200);
+      mod.renderOverview(h);
+      return h;
+    };
+    globalThis.fetch = () => Promise.reject(new Error('no network in the geometry check'));
+    const seen = [];
+    try {
+      mod.state.showQuiet = true;
+      const h = render(world);
+      const row = rowOf(h, a);
+      check('triage/tags', !!row, `no row for ${a.hostname}`);
+      await fire(buttonIn(row, 'Suppress'));
+      const panel = findAll(row, (n) => n.className === 'triage-panel')[0];
+      check('triage/tags', !!buttonIn(panel, 'Machines tagged…'), 'the panel does not offer a tag');
+      await fire(buttonIn(panel, 'Machines tagged…'));
+
+      const [keySel, valueSel] = findAll(panel, (n) => n.tagName === 'select');
+      check('triage/tags', !!keySel && !!valueSel, 'the tag step has no key and value selects');
+      const optionsOf = (s) => s.children.map((o) => o.attrs.value);
+      const known = new Map();
+      for (const m of snapshot.machines) {
+        for (const [k, v] of Object.entries(m.tags || {})) (known.get(k) || known.set(k, new Set()).get(k)).add(v);
+      }
+      check('triage/tags', JSON.stringify(optionsOf(keySel)) === JSON.stringify([...known.keys()].sort()),
+        `the keys offered are ${optionsOf(keySel)}`);
+      check('triage/tags', a.tags[keySel.value] === valueSel.value,
+        'it does not start at a tag this machine carries');
+      // Pick the site by hand, as a person would: key, then value.
+      keySel.value = 'site';
+      await fire(keySel, 'change');
+      check('triage/tags', JSON.stringify(optionsOf(valueSel)) === JSON.stringify([...known.get('site')].sort()),
+        `the values offered are ${optionsOf(valueSel)}`);
+      check('triage/tags', valueSel.value === tagOf(a), 'changing the key did not move the value to this machine\'s');
+      check('triage/tags', keySel.attrs['aria-label'] && valueSel.attrs['aria-label'],
+        'the selects have no accessible name');
+      const note = findAll(panel, (n) => n.tagName === 'input')[0];
+      note.value = 'a site-wide quirk';
+      globalThis.fetch = (url, opts) => {
+        seen.push({ url: String(url), method: opts?.method, type: opts?.headers?.['Content-Type'], body: opts?.body });
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}), text: () => Promise.resolve('') });
+      };
+      await fire(buttonIn(panel, 'Suppress for this tag'));
+      // The overview's history cards fetch too, and may fail, as above.
+      globalThis.fetch = () => Promise.reject(new Error('no network in the geometry check'));
+      const sent = JSON.parse(seen[0]?.body || '{}');
+      check('triage/tags', seen[0]?.url === '/api/suppressions' && seen[0]?.method === 'POST'
+        && seen[0]?.type === 'application/json', `sent ${seen[0]?.method} ${seen[0]?.url}`);
+      check('triage/tags', sent.code === first.code && sent.note === 'a site-wide quirk'
+        && JSON.stringify(sent.tags) === JSON.stringify({ site: tagOf(a) }) && !('machine_key' in sent),
+      'the rule is not this finding, by this tag, with the note, and no machine');
+
+      // The server applies it to every machine carrying the tags.
+      const quiet = {
+        state: 'suppressed', by: 'Admin', at: '2026-09-09T12:00:00Z', note: sent.note, rule: 1,
+        reach: 'tags', tags: sent.tags,
+      };
+      const after = {
+        ...world,
+        flags: world.flags.map((f) => {
+          const m = snapshot.machines.find((x) => x.key === f.machine_key);
+          return Object.entries(sent.tags).every(([k, v]) => m.tags?.[k] === v)
+            ? { ...f, triage: quiet, headline: `${f.headline} [suppressed]` } : f;
+        }),
+        summary: { ...world.summary, quieted: { acknowledged: 0, snoozed: 0, suppressed: 1 } },
+      };
+      const h2 = render(after);
+      check('triage/tags', textOf(rowOf(h2, a)).includes(`Suppressed where site=${tagOf(a)}`),
+        'the machine with the tag does not show the rule');
+      check('triage/tags', !textOf(rowOf(h2, b)).includes('Suppressed'), 'the machine without the tag was suppressed');
+      check('triage/tags', !!buttonIn(rowOf(h2, a), 'Remove rule') && !buttonIn(rowOf(h2, b), 'Remove rule'),
+        'the rule can be lifted from the machine it quiets, and only there');
+      mod.state.showQuiet = false;
+      const h3 = render(after);
+      check('triage/tags', !rowOf(h3, a) && !!rowOf(h3, b), 'the queue should hide the suppressed one and keep the other');
+
+      // Not offered: to a caller who may not suppress, or where nothing is tagged.
+      mod.state.showQuiet = true;
+      mod.state.me = { role: 'contributor', may_triage: true, may_suppress: false };
+      mod.state.snap = world;
+      const hc = host(1200);
+      mod.renderOverview(hc);
+      check('triage/tags', !buttonIn(hc, 'Suppress'), 'a contributor was offered Suppress');
+      const bare = { ...world, machines: world.machines.map((m) => ({ ...m, tags: {} })) };
+      const hn = render(bare);
+      await fire(buttonIn(rowOf(hn, a), 'Suppress'));
+      const pn = findAll(rowOf(hn, a), (n) => n.className === 'triage-panel')[0];
+      check('triage/tags', !!buttonIn(pn, 'Fleet-wide') && !buttonIn(pn, 'Machines tagged…'),
+        'a fleet with no tags was offered a tag choice');
+      notes.push('triage/tags: pick, request, suppressed with the tag and live without, 3 callers');
+    } catch (err) {
+      failures.push(`triage/tags: threw ${err.stack}`);
+    }
+    mod.state.me = null;
+    mod.state.showQuiet = false;
+    mod.state.snap = snapshot;
+  }
 }
 
 // Submitting results: one request per file, and each answer reported as

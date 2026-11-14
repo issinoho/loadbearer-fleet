@@ -1945,13 +1945,7 @@ function syncFilterControls() {
   // Tag filters are built from what the fleet actually reports rather than
   // from a fixed list, because tags are whatever the deployment tool passed.
   const host = $('#f-tags');
-  const values = new Map();
-  for (const m of state.snap?.machines || []) {
-    for (const [k, v] of Object.entries(m.tags || {})) {
-      if (!values.has(k)) values.set(k, new Set());
-      values.get(k).add(v);
-    }
-  }
+  const values = tagValuesOf(state.snap?.machines || []);
   const active = new Map((state.filter.tags || '').split(',').filter(Boolean)
     .map((p) => p.split('=')).filter((p) => p.length === 2));
   // A tag being filtered on must stay offered even though every machine in
@@ -2235,7 +2229,7 @@ function triageControls(f) {
   // before the choice that sends it.
   const panel = el('div', { class: 'triage-panel', role: 'group' });
   panel.hidden = true;
-  const open = (label, choices) => {
+  const open = (label, choices, extras = []) => {
     const input = el('input', {
       type: 'text', class: 'triage-note', maxlength: '500',
       placeholder: 'Note (optional)', 'aria-label': `Note for ${which}`,
@@ -2243,6 +2237,7 @@ function triageControls(f) {
     panel.setAttribute('aria-label', `${label} ${which}`);
     panel.replaceChildren(
       input,
+      ...extras,
       ...choices.map(([text, send]) => el('button', {
         type: 'button', class: 'btn', text,
         onclick: () => send(input.value.trim() || undefined),
@@ -2258,6 +2253,38 @@ function triageControls(f) {
     body: { machine_key: f.machine_key, code: f.code, action, until, note },
     done: `${label} ${which}.`,
   });
+  // The second step of "Machines tagged…": a key and a value, from the tags
+  // the machines in view carry rather than typed, starting at a tag this
+  // machine has so the usual rule is one press away. The server does not limit
+  // an admin's rule to their own scope (a tag rule is an admin's, and reaches
+  // past one), so the snapshot — already the caller's view — is the limit.
+  const tagStep = () => {
+    const known = tagValuesOf(state.snap?.machines || []);
+    const keys = [...known.keys()].sort();
+    const own = (state.snap?.machines || []).find((m) => m.key === f.machine_key)?.tags || {};
+    const firstValue = (k) => [...known.get(k)].sort()[0];
+    const keySelect = el('select', { class: 'triage-select', 'aria-label': `Tag to suppress ${codeWords(f.code)} for` },
+      keys.map((k) => el('option', { value: k, text: k })));
+    const valueSelect = el('select', { class: 'triage-select', 'aria-label': 'Value of that tag' });
+    const fill = (k) => {
+      valueSelect.replaceChildren(...[...known.get(k)].sort().map((v) => el('option', { value: v, text: v })));
+      valueSelect.value = own[k] ?? firstValue(k);
+    };
+    keySelect.value = keys.find((k) => own[k] !== undefined) ?? keys[0];
+    fill(keySelect.value);
+    keySelect.addEventListener('change', () => fill(keySelect.value));
+    const field = (text, select) => el('label', { class: 'triage-field' }, [
+      el('span', { class: 'field-label', text }), select,
+    ]);
+    open('Suppress by tag', [
+      ['Suppress for this tag', (note) => sendTriage('/api/suppressions', {
+        body: { code: f.code, tags: { [keySelect.value]: valueSelect.value }, note },
+        done: `Suppressed ${codeWords(f.code)} where ${keySelect.value}=${valueSelect.value}.`,
+      })],
+    ], [field('Tag', keySelect), field('Value', valueSelect)]);
+    keySelect.focus();
+  };
+  const hasTags = (state.snap?.machines || []).some((m) => Object.keys(m.tags || {}).length);
   const actions = [
     el('button', {
       type: 'button', class: 'btn btn-quiet', text: 'Acknowledge',
@@ -2279,6 +2306,7 @@ function triageControls(f) {
           body: { code: f.code, machine_key: f.machine_key, note },
           done: `Suppressed ${which}.`,
         })],
+        ...(hasTags ? [['Machines tagged…', tagStep]] : []),
         ['Fleet-wide', (note) => sendTriage('/api/suppressions', {
           body: { code: f.code, note },
           done: `Suppressed ${codeWords(f.code)} across the fleet.`,
@@ -3625,6 +3653,19 @@ export async function renderComponents(main) {
     cards.push(heatmapCard(h));
   }
   main.append(el('div', { class: 'grid' }, cards));
+}
+
+/** Each tag key the machines carry, with the values it takes: what the filter
+ *  bar and the suppression picker offer, so neither invents a tag. */
+function tagValuesOf(machines) {
+  const values = new Map();
+  for (const m of machines) {
+    for (const [k, v] of Object.entries(m.tags || {})) {
+      if (!values.has(k)) values.set(k, new Set());
+      values.get(k).add(v);
+    }
+  }
+  return values;
 }
 
 /** Tag keys across the machines in view, one table column each. */

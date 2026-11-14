@@ -19,6 +19,14 @@ notes, so each one has to stand on its own.
   `X-Loadbearer-Signature` is unchanged and still sent, so receivers on 0.10 to
   0.12 keep verifying; the README has the new check.
 
+- **Suppress by tag, from the dashboard.** An admin's Suppress panel gains
+  **Machines tagged…** beside *This machine* and *Fleet-wide*: a key and a value
+  chosen from the tags the machines in view carry, starting at the machine the
+  finding is on, sent to the existing `POST /api/suppressions` with `tags`. It is
+  offered only where some machine has a tag. A rule made this way reads
+  *Suppressed where site=glasgow* on every finding it quiets, and *Remove rule*
+  lifts it there. Nothing changes on the server.
+
 ### Fixed
 
 - **Credentials stay out of `{:?}`.** `[[ingest.tokens]]` `token`, `[metrics]`

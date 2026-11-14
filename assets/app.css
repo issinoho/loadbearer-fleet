@@ -467,6 +467,20 @@ table.data td.wrap { white-space: normal; min-width: 16em; }
   flex: 1 1 160px;
   min-width: 0;
 }
+/* The tag step of a suppression: label over select, two to a row where they
+   fit and one to a row where they do not. */
+.triage-field { display: flex; flex-direction: column; gap: 2px; flex: 1 1 140px; min-width: 0; }
+.triage-select {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  min-width: 0;
+  width: 100%;
+}
 
 /* "What changed" lists one kind of change after another inside one card, so
    each heading needs the room a card's own top edge would have given it. */
@@ -699,7 +713,7 @@ td.heat-weak { box-shadow: inset 0 0 0 2px var(--text-primary); font-weight: 600
   }
 
   .btn-square { min-width: 40px; }
-  .field select, .field input, .triage-note { min-height: 40px; }
+  .field select, .field input, .triage-note, .triage-select { min-height: 40px; }
 }
 
 /* ---------- compare ---------- */
