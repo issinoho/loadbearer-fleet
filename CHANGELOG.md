@@ -5,7 +5,20 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
-## Unreleased
+## 0.13.0 - Sat, 14 Nov 2026
+
+**Tighter edges on triage and the webhook.** A scoped admin's suppression
+rules now stay inside their scope, a rule by tag can be made from the
+dashboard, the webhook signs with a timestamp so a captured request cannot be
+replayed, and credentials no longer reach debug output.
+
+**Upgrading:** nothing to change in the configuration, and the index and the
+state file are as they were. Two things to know. An admin whose grant is
+limited to tags can no longer make or remove a fleet-wide rule, or one for
+tags outside their scope; rules already made stay as they are, and an
+unscoped admin can still remove them. A webhook receiver keeps working
+unchanged, and should move to verifying `X-Loadbearer-Signature-V2` and
+rejecting old timestamps when convenient.
 
 ### Added
 
