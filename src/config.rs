@@ -426,9 +426,14 @@ pub struct Notify {
     /// (`localhost` or a loopback address), where nothing crosses a wire.
     #[serde(default)]
     pub webhook_url: Option<String>,
-    /// Signs every request: `X-Loadbearer-Signature: sha256=<hex>`, the
-    /// HMAC-SHA256 of the exact body with this as the key, so the receiver
-    /// can tell a request came from here. Empty sends no signature.
+    /// Signs every request, so the receiver can tell it came from here and
+    /// when. `X-Loadbearer-Signature-V2: sha256=<hex>` is the HMAC-SHA256,
+    /// with this as the key, of `<timestamp>.<body>`: the decimal Unix seconds
+    /// of `X-Loadbearer-Timestamp`, a dot, then the exact body. Verify it and
+    /// reject a timestamp more than a few minutes old, which is what stops a
+    /// captured request being replayed. `X-Loadbearer-Signature` stays, the
+    /// HMAC of the body alone, for receivers that predate V2. Empty sends no
+    /// signature; the timestamp header goes either way.
     #[serde(default)]
     pub secret: String,
     /// Send as soon as a scan finds a new critical finding nobody has
@@ -1541,10 +1546,15 @@ token = ""
 #
 # webhook_url = "https://PUT-THE-URL-OF-YOUR-WEBHOOK-RECEIVER-HERE"
 
-# Optional. Signs every request with X-Loadbearer-Signature: sha256=<hex>,
-# the HMAC-SHA256 of the body with this as the key, so the receiver can tell
-# it came from here. A secret: treat this file as you would any other that
-# holds one. Generate something long and random rather than choosing it.
+# Optional. Signs every request, so the receiver can tell it came from here and
+# when: X-Loadbearer-Signature-V2: sha256=<hex> is the HMAC-SHA256, with this
+# as the key, of "<timestamp>.<body>", where the timestamp is the decimal Unix
+# seconds in X-Loadbearer-Timestamp. Verify it, and reject a timestamp more
+# than a few minutes old, so a captured request cannot be replayed. The older
+# X-Loadbearer-Signature (the HMAC of the body alone) is still sent for
+# receivers that predate this. A secret: treat this file as you would any
+# other that holds one. Generate something long and random rather than
+# choosing it.
 secret = ""
 
 # Send as soon as a scan finds a critical finding that was not critical before

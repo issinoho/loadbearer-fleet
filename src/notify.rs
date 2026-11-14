@@ -66,6 +66,16 @@ use crate::config::{Config, DigestSchedule};
 /// The header a signed request carries: `sha256=<lowercase hex>`.
 pub const SIGNATURE_HEADER: &str = "X-Loadbearer-Signature";
 
+/// When the request was sent, in decimal Unix seconds. On every request, signed
+/// or not.
+pub const TIMESTAMP_HEADER: &str = "X-Loadbearer-Timestamp";
+
+/// `sha256=<lowercase hex>` of the HMAC over `"<timestamp>.<body>"`: the same
+/// key, with the time in what is signed, so a captured request stops verifying
+/// once a receiver rejects old timestamps. `SIGNATURE_HEADER` is unchanged
+/// beside it, for receivers that predate this.
+pub const SIGNATURE_V2_HEADER: &str = "X-Loadbearer-Signature-V2";
+
 /// Events waiting to be sent. A scan raises at most one, and a digest one a
 /// day, so a full queue means the receiver has been failing for a while.
 const QUEUE: usize = 16;
@@ -241,6 +251,21 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 /// The signature header's value for this body.
 pub fn signature(secret: &[u8], body: &[u8]) -> String {
     format!("sha256={}", hex(&hmac_sha256(secret, body)))
+}
+
+/// The V2 signature header's value: the timestamp as the header carries it,
+/// a dot, then the body.
+pub fn signature_v2(secret: &[u8], timestamp: &str, body: &[u8]) -> String {
+    let mut message = Vec::with_capacity(timestamp.len() + 1 + body.len());
+    message.extend_from_slice(timestamp.as_bytes());
+    message.push(b'.');
+    message.extend_from_slice(body);
+    format!("sha256={}", hex(&hmac_sha256(secret, &message)))
+}
+
+/// Now, in Unix seconds. The thing a test replaces on a `Target`.
+fn unix_now() -> i64 {
+    OffsetDateTime::now_utc().unix_timestamp()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -553,6 +578,8 @@ pub struct Target {
     secret: Option<Vec<u8>>,
     client: reqwest::Client,
     backoff: Duration,
+    /// Where the timestamp comes from. A field so a test can fix it.
+    clock: fn() -> i64,
     /// Scheme and host only, for the log. Never the path or the query, which
     /// is where a webhook URL keeps its token.
     label: String,
@@ -593,6 +620,7 @@ impl Target {
                 .then(|| config.notify.secret.as_bytes().to_vec()),
             client,
             backoff: BACKOFF,
+            clock: unix_now,
             label,
         }))
     }
@@ -609,13 +637,23 @@ impl Target {
         let mut attempt = 0;
         let failure = loop {
             attempt += 1;
+            // Read again on every try, not once per event: a retry that
+            // went out with the first try's time, after backoff, would be
+            // that much older when a receiver checks it.
+            let timestamp = (self.clock)().to_string();
             let mut request = self
                 .client
                 .post(self.url.clone())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(TIMESTAMP_HEADER, &timestamp)
                 .body(out.body.clone());
             if let Some(secret) = &self.secret {
-                request = request.header(SIGNATURE_HEADER, signature(secret, &out.body));
+                request = request
+                    .header(SIGNATURE_HEADER, signature(secret, &out.body))
+                    .header(
+                        SIGNATURE_V2_HEADER,
+                        signature_v2(secret, &timestamp, &out.body),
+                    );
             }
             let failure = match request.send().await {
                 Ok(response) if response.status().is_success() => {
@@ -1473,7 +1511,8 @@ mod tests {
     #[tokio::test]
     async fn a_signed_request_verifies_against_its_body() {
         let rx = receiver::start(&[], Duration::ZERO).await;
-        let target = quick(&config_for(&rx.url, "a-shared-secret"));
+        let mut target = quick(&config_for(&rx.url, "a-shared-secret"));
+        target.clock = || 1_700_000_000;
         let out = test_event("https://fleet.example.com", OffsetDateTime::now_utc());
         let status = target.deliver(&out).await.expect("delivered");
         assert_eq!(status, reqwest::StatusCode::NO_CONTENT);
@@ -1484,6 +1523,15 @@ mod tests {
         assert_eq!(
             req.header(SIGNATURE_HEADER),
             Some(signature(b"a-shared-secret", &req.body))
+        );
+        assert_eq!(
+            req.header(TIMESTAMP_HEADER).as_deref(),
+            Some("1700000000"),
+            "the injected clock, as decimal seconds"
+        );
+        assert_eq!(
+            req.header(SIGNATURE_V2_HEADER),
+            Some(signature_v2(b"a-shared-secret", "1700000000", &req.body))
         );
         assert_eq!(
             req.header("content-type").as_deref(),
@@ -1504,7 +1552,74 @@ mod tests {
             .deliver(&test_event("https://f", OffsetDateTime::now_utc()))
             .await
             .expect("delivered");
-        assert_eq!(rx.wait_for(1).await[0].header(SIGNATURE_HEADER), None);
+        let got = rx.wait_for(1).await;
+        assert_eq!(got[0].header(SIGNATURE_HEADER), None);
+        assert_eq!(got[0].header(SIGNATURE_V2_HEADER), None);
+        // The time is not a secret, so it goes whether or not there is one.
+        let stamp = got[0].header(TIMESTAMP_HEADER).expect("a timestamp");
+        assert!(
+            stamp.parse::<i64>().is_ok_and(|t| t > 1_700_000_000),
+            "{stamp}"
+        );
+    }
+
+    /// The V2 value is pinned against an independent computation, so the
+    /// layout (`<timestamp>.<body>`, the dot, the decimal string) cannot drift
+    /// without a receiver's test failing too, and the timestamp is in it.
+    #[test]
+    fn the_v2_signature_covers_the_timestamp_and_the_body() {
+        let (key, body) = (
+            b"Jefe".as_slice(),
+            b"what do ya want for nothing?".as_slice(),
+        );
+        let v2 = signature_v2(key, "1700000000", body);
+        let by_hand = format!(
+            "sha256={}",
+            hex(&hmac_sha256(
+                key,
+                b"1700000000.what do ya want for nothing?"
+            ))
+        );
+        assert_eq!(v2, by_hand);
+        assert_ne!(v2, signature(key, body), "not the unversioned signature");
+        assert_ne!(
+            v2,
+            signature_v2(key, "1700000001", body),
+            "another second, another signature"
+        );
+        assert!(v2.starts_with("sha256=") && v2.len() == "sha256=".len() + 64);
+    }
+
+    /// A retry carries the time it is sent at, and signs with it.
+    #[tokio::test]
+    async fn every_try_is_stamped_and_signed_at_its_own_time() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static TICK: AtomicI64 = AtomicI64::new(1_700_000_000);
+        let rx = receiver::start(&[500], Duration::ZERO).await;
+        let mut target = quick(&config_for(&rx.url, "s"));
+        target.clock = || TICK.fetch_add(60, Ordering::SeqCst);
+        target
+            .deliver(&test_event("https://f", OffsetDateTime::now_utc()))
+            .await
+            .expect("the second try lands");
+        let got = rx.seen();
+        assert_eq!(got.len(), 2);
+        let stamps: Vec<_> = got
+            .iter()
+            .map(|r| r.header(TIMESTAMP_HEADER).expect("stamped"))
+            .collect();
+        assert_eq!(stamps, ["1700000000", "1700000060"]);
+        for (r, stamp) in got.iter().zip(&stamps) {
+            assert_eq!(
+                r.header(SIGNATURE_V2_HEADER),
+                Some(signature_v2(b"s", stamp, &r.body))
+            );
+            assert_eq!(
+                r.header(SIGNATURE_HEADER),
+                Some(signature(b"s", &r.body)),
+                "the unversioned signature does not move"
+            );
+        }
     }
 
     #[tokio::test]

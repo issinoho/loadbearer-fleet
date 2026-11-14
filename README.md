@@ -2266,30 +2266,49 @@ the dashboard as an admin.
 
 ### Telling it came from here
 
-With `secret` set, every request carries
+Every request carries the time it was sent, in decimal Unix seconds:
 
 ```
-X-Loadbearer-Signature: sha256=<64 lowercase hex characters>
+X-Loadbearer-Timestamp: 1763000000
 ```
 
-the HMAC-SHA256 of the **exact bytes of the body**, keyed with the secret. The
-receiver recomputes it over the body as received — before parsing it, since
-re-serialised JSON is not the same bytes — and compares in constant time. In
-Node:
+With `secret` set it also carries
+
+```
+X-Loadbearer-Signature-V2: sha256=<64 lowercase hex characters>
+```
+
+the HMAC-SHA256, keyed with the secret, of the timestamp **exactly as the
+header gives it**, a literal `.`, and the **exact bytes of the body**:
+`<timestamp>.<body>`. The receiver recomputes it over the body as received —
+before parsing it, since re-serialised JSON is not the same bytes — compares in
+constant time, and **rejects a timestamp more than a few minutes from its own
+clock**. The check on the age is what stops a captured request being replayed
+for ever; the signature is what stops the timestamp being changed. In Node:
 
 ```js
 const crypto = require('crypto');
-function fromLoadbearer(rawBody, header, secret) {
-  const want = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+const TOLERANCE_SECONDS = 300;
+function fromLoadbearer(rawBody, headers, secret) {
+  const stamp = headers['x-loadbearer-timestamp'];
+  const header = headers['x-loadbearer-signature-v2'];
+  if (typeof stamp !== 'string' || !/^\d+$/.test(stamp)) return false;
+  if (Math.abs(Date.now() / 1000 - Number(stamp)) > TOLERANCE_SECONDS) return false;
+  const want = 'sha256=' + crypto.createHmac('sha256', secret)
+    .update(stamp + '.').update(rawBody).digest('hex');
   return typeof header === 'string' && header.length === want.length
     && crypto.timingSafeEqual(Buffer.from(header), Buffer.from(want));
 }
 ```
 
-The signature proves who sent a request, not when: it carries no timestamp, so
-a receiver that must refuse a replayed request can check `sent_at` against its
-own clock. Without a secret no signature is sent, and the receiver has only the
-URL's own secrecy to go on.
+A retry is stamped and signed afresh, so each try is checked against the time
+it was sent, not the first try's.
+
+`X-Loadbearer-Signature: sha256=<hex>`, the HMAC-SHA256 of the body alone, is
+still sent beside it, unchanged, because receivers on 0.10 to 0.12 verify it.
+It proves who sent a request but not when, so it cannot refuse a replay; move
+to V2 when you can. Without a secret neither signature is sent (the timestamp
+still is), and the receiver has only the URL's own secrecy to go on.
 
 ### Delivery
 
