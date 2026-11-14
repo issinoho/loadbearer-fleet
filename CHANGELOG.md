@@ -7,6 +7,18 @@ notes, so each one has to stand on its own.
 
 ## Unreleased
 
+### Added
+
+- **A timestamp in the webhook's signature.** Every request now carries
+  `X-Loadbearer-Timestamp` (decimal Unix seconds), and with `notify.secret` set
+  also `X-Loadbearer-Signature-V2: sha256=<hex>`, the HMAC-SHA256 of
+  `<timestamp>.<body>`. A receiver that verifies V2 and rejects a timestamp more
+  than a few minutes old can no longer be replayed with a captured request,
+  which the signature of the body alone allowed for ever. Each try, a retry
+  included, is stamped and signed at the time it is sent.
+  `X-Loadbearer-Signature` is unchanged and still sent, so receivers on 0.10 to
+  0.12 keep verifying; the README has the new check.
+
 ### Fixed
 
 - **Credentials stay out of `{:?}`.** `[[ingest.tokens]]` `token`, `[metrics]`
