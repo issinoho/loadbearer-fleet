@@ -86,6 +86,9 @@ enum Command {
     /// What's in the index right now.
     Status,
     /// Executive summary, cohorts and red flags across the whole index.
+    ///
+    /// Machines that have only ever reported a skipped run have no result, so
+    /// they are counted on one line, not listed; `--json` carries the list.
     Report {
         /// Emit the whole snapshot as JSON — the same shape the web UI will
         /// consume, so what the dashboard shows can be diffed and scripted.
@@ -205,7 +208,10 @@ enum Command {
     /// file from the collection folder is not enough on its own: a scan only
     /// ever adds, so the run stays indexed until something removes it. Its
     /// acknowledgements, snoozes and the suppressions naming it alone go from
-    /// the state file too; rules by tag or across the fleet stay.
+    /// the state file too; rules by tag or across the fleet stay. Its run status
+    /// record goes as well, so a machine that was only ever skipped can be
+    /// forgotten the same way; a status file still in the upload folder is
+    /// listed, since the next scan would read it again.
     Forget {
         /// Hostname, or the machine key shown in the dashboard.
         #[arg(value_name = "MACHINE")]
