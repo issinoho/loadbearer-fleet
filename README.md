@@ -805,9 +805,11 @@ have this" is a question about the machines.
 **Who may.** A viewer sees it. A contributor or admin may acknowledge, snooze
 or undo either on the machines in their scope. Only an admin may create or
 remove a suppression, because a rule by tag or across the fleet reaches past
-any one scope. On the dashboard, an admin suppresses for one machine or the
-whole fleet; a rule by tags is API-only in this release (`POST
-/api/suppressions` with `tags`). Every change is logged with who made it.
+any one scope. On the dashboard, an admin suppresses for one machine, for the
+machines carrying a tag (**Machines tagged…**, with the key and value picked
+from the tags the machines in view carry, starting at this machine's own), or
+for the whole fleet; the same rule by tag is `POST /api/suppressions` with
+`tags`. Every change is logged with who made it.
 
 **How an acknowledgement ends.** Each time the snapshot is rebuilt — after a
 scan, an upload or a change by another process — an acknowledgement or snooze
