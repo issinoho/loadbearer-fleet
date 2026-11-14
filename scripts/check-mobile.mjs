@@ -848,6 +848,76 @@ try {
           `Escape left the panel ${shut.hidden ? 'closed' : 'open'} and focus on ${shut.focus || 'nothing'}`);
         notes.push(`${at}: ${open.width}px wide from ${open.left}px, ${open.controls.length} control(s)`);
       }
+
+      // The Suppress panel's tag step, as an admin (the server signs nobody in,
+      // so the caller is the local administrator): open a live finding's
+      // controls, Suppress, then "Machines tagged…". The panel and both selects
+      // must sit wholly inside the screen, the page must not scroll sideways,
+      // and the selects and the confirm button must be big enough to hit. It
+      // is closed with Cancel, never confirmed: no rule is made, so no later
+      // pass sees a suppressed finding it did not expect. Layout is read until
+      // it stops changing, not after a fixed number of frames.
+      if (view === 'overview') {
+        const at = `${where}/suppress`;
+        const opened = await evaluate(`(() => {
+          const open = [...document.querySelectorAll('main .triage-actions button')]
+            .find((b) => b.textContent === 'Suppress');
+          if (!open) return false;
+          open.click();
+          const panel = open.closest('.triage').querySelector('.triage-panel');
+          const tagged = [...panel.querySelectorAll('button')].find((b) => b.textContent === 'Machines tagged…');
+          if (!tagged) return false;
+          tagged.click();
+          return true;
+        })()`);
+        check(at, opened, 'no live finding offers Suppress, then Machines tagged…');
+        if (opened) {
+          const read = async () => JSON.parse(await evaluate(`(() => {
+            const panel = [...document.querySelectorAll('main .triage-panel')].find((p) => !p.hidden);
+            if (!panel) return JSON.stringify(null);
+            const box = (el) => { const r = el.getBoundingClientRect();
+              return { left: Math.round(r.left), right: Math.round(r.right), height: Math.round(r.height) }; };
+            const confirm = [...panel.querySelectorAll('button')].find((b) => b.textContent === 'Suppress for this tag');
+            const de = document.documentElement;
+            return JSON.stringify({
+              viewport: de.clientWidth,
+              documentWidth: Math.max(de.scrollWidth, document.body.scrollWidth),
+              panel: box(panel),
+              selects: [...panel.querySelectorAll('select')].map(box),
+              confirm: confirm ? box(confirm) : null,
+            });
+          })()`));
+          // Settled: two reads, a frame apart, that agree.
+          let step = await read();
+          for (let i = 0; i < 20; i++) {
+            await evaluate('new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))');
+            const next = await read();
+            const same = JSON.stringify(next) === JSON.stringify(step);
+            step = next;
+            if (same && step?.selects.length === 2 && step.confirm) break;
+            await sleep(100);
+          }
+          check(at, step?.selects.length === 2 && !!step.confirm, 'the tag step has not got two selects and a confirm button');
+          if (step?.selects.length === 2 && step.confirm) {
+            const inside = (b) => b.left >= -1 && b.right <= step.viewport + 1;
+            check(at, inside(step.panel), `the panel spans ${step.panel.left} to ${step.panel.right}px of a ${step.viewport}px screen`);
+            step.selects.forEach((s, i) => check(at, inside(s),
+              `select ${i + 1} spans ${s.left} to ${s.right}px of a ${step.viewport}px screen`));
+            check(at, inside(step.confirm), `the confirm button spans ${step.confirm.left} to ${step.confirm.right}px`);
+            check(at, step.documentWidth <= step.viewport + 1,
+              `the page scrolls sideways with the tag step open: ${step.documentWidth}px in ${step.viewport}px`);
+            if (size.touch) {
+              step.selects.forEach((s, i) => check(at, s.height >= MIN_TAP,
+                `select ${i + 1} is ${s.height}px tall; ${MIN_TAP}px is the floor for touch`));
+              check(at, step.confirm.height >= MIN_TAP,
+                `the confirm button is ${step.confirm.height}px tall; ${MIN_TAP}px is the floor for touch`);
+            }
+            notes.push(`${at}: panel ${step.panel.left} to ${step.panel.right}px, selects ${step.selects.map((s) => s.height).join('/')}px, confirm ${step.confirm.height}px`);
+          }
+          await evaluate(`[...document.querySelectorAll('main .triage-panel')].filter((p) => !p.hidden)
+            .forEach((p) => [...p.querySelectorAll('button')].find((b) => b.textContent === 'Cancel').click())`);
+        }
+      }
     }
   }
 
