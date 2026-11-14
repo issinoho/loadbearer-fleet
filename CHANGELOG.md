@@ -27,6 +27,19 @@ notes, so each one has to stand on its own.
   *Suppressed where site=glasgow* on every finding it quiets, and *Remove rule*
   lifts it there. Nothing changes on the server.
 
+### Changed
+
+- **A scoped admin's suppression rule stays inside their scope.** An admin
+  whose grant is limited to tags could until now suppress a finding for the
+  whole fleet, or for tags outside their scope. They can no longer: a
+  fleet-wide rule is `403`, a rule by tag is `403` unless its tags include every
+  tag of one of their scopes, and a rule for a machine still has to name one in
+  their view. They can remove only a rule wholly inside their scope; a rule
+  they can see that reaches wider is `403` to remove, and the listing says
+  `removable: false` so the dashboard does not offer **Remove rule**. The
+  Suppress panel hides *Fleet-wide* for them and adds their own scope to a tag
+  rule. An unscoped admin is unchanged, and rules already made are not altered.
+
 ### Fixed
 
 - **Credentials stay out of `{:?}`.** `[[ingest.tokens]]` `token`, `[metrics]`

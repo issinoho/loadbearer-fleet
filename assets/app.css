@@ -469,6 +469,7 @@ table.data td.wrap { white-space: normal; min-width: 16em; }
 }
 /* The tag step of a suppression: label over select, two to a row where they
    fit and one to a row where they do not. */
+.triage-scope { flex: 1 1 100%; margin: 0; color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
 .triage-field { display: flex; flex-direction: column; gap: 2px; flex: 1 1 140px; min-width: 0; }
 .triage-select {
   font: inherit;
