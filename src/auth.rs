@@ -157,8 +157,9 @@ impl Principal {
     }
 
     /// Creating and removing suppression rules. Admin only, because a rule
-    /// by tag or across the fleet reaches machines outside any one scope —
-    /// and stops a finding being news everywhere it applies, indefinitely.
+    /// stops a finding being news everywhere it applies, indefinitely. A
+    /// scoped admin is further held to rules inside their own scope; that is
+    /// decided where the rule is made or removed, in `web.rs`.
     pub fn may_suppress(&self) -> bool {
         self.role == Role::Admin
     }

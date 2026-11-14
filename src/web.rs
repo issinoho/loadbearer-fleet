@@ -1411,6 +1411,34 @@ struct SuppressionView {
     rule: Suppression,
     reach: Reach,
     hostname: Option<String>,
+    /// Whether this caller may remove the rule: an unscoped admin may remove
+    /// any; a scoped one only a rule lying wholly inside their scope. Shown
+    /// so the UI offers "Remove rule" only where the server would allow it.
+    removable: bool,
+}
+
+/// Whether a suppression rule lies wholly inside the caller's scope: an
+/// unscoped caller has no scope to be outside of; otherwise a machine rule
+/// must name a machine in their view, a tag rule must pass `scopes_allow` (so
+/// every machine it could match is theirs), and a fleet-wide rule never does.
+fn rule_within_scope(
+    scopes: &[std::collections::BTreeMap<String, String>],
+    view: &Snapshot,
+    s: &Suppression,
+) -> bool {
+    if scopes.is_empty() {
+        return true;
+    }
+    match s.reach() {
+        Reach::Fleet => false,
+        Reach::Machine => view
+            .machines
+            .iter()
+            .any(|m| Some(&m.key) == s.machine_key.as_ref()),
+        Reach::Tags => {
+            analytics::scopes_allow(scopes, s.tags.as_ref().expect("a tag rule has tags"))
+        }
+    }
 }
 
 /// Which suppression rules a caller may see, in a view they may already see.
@@ -1422,7 +1450,8 @@ struct SuppressionView {
 /// machine in their view; a tag rule that picks out one of the machines in
 /// their view, or whose tags are all within one of their scopes — so it is
 /// about their machines whether or not any of them carries the finding yet.
-/// An unscoped caller sees every rule.
+/// An unscoped caller sees every rule. Seeing is not removing: `removable` is
+/// true only for a rule wholly inside the caller's scope (`rule_within_scope`).
 fn suppressions_visible(book: &Book, view: &Snapshot, caller: &Caller) -> Vec<SuppressionView> {
     let scopes = &caller.0.scopes;
     book.suppressions()
@@ -1454,6 +1483,7 @@ fn suppressions_visible(book: &Book, view: &Snapshot, caller: &Caller) -> Vec<Su
                     .find(|m| &m.key == k)
                     .and_then(|m| m.hostname.clone())
             }),
+            removable: rule_within_scope(scopes, view, s),
             rule: s.clone(),
         })
         .collect()
@@ -1479,11 +1509,12 @@ struct SuppressionRequest {
     note: Option<String>,
 }
 
-/// Make a suppression rule. Admin only: a rule by tag or across the fleet
-/// reaches past any one scope, and stops a finding being news wherever it
-/// applies until somebody removes it. A machine rule still has to name a
-/// machine in the caller's own view — a scoped admin is not told about the
-/// others by being allowed to name them.
+/// Make a suppression rule. Admin only: a rule stops a finding being news
+/// wherever it applies until somebody removes it. An unscoped admin may make a
+/// rule by machine, by tag or across the fleet. A scoped admin's rule must stay
+/// inside their scope: a machine rule names a machine in their own view (they
+/// are not told about the others by being allowed to name them), a tag rule
+/// carries every tag of one of their scopes, and a fleet-wide rule is refused.
 async fn post_suppression(
     State(state): State<Arc<AppState>>,
     caller: Caller,
@@ -1547,6 +1578,21 @@ async fn post_suppression(
             "no machine keyed {k:?} in the index"
         )));
     }
+    if !who.scopes.is_empty() {
+        match (&machine_key, &tags) {
+            (None, None) => {
+                return Err(AppError::forbidden(
+                    "a scoped admin's rule must name a machine or tags inside their scope",
+                ));
+            }
+            (None, Some(t)) if !analytics::scopes_allow(&who.scopes, t) => {
+                return Err(AppError::forbidden(
+                    "a scoped admin's tag rule must include the tags of their own scope",
+                ));
+            }
+            _ => {}
+        }
+    }
     let candidate = Suppression {
         id: 0,
         code: code.to_string(),
@@ -1597,12 +1643,15 @@ async fn post_suppression(
         Json(SuppressionView {
             reach: made.reach(),
             hostname,
+            removable: true,
             rule: made,
         }),
     ))
 }
 
-/// Remove a suppression rule. Admin only, like making one.
+/// Remove a suppression rule. Admin only, like making one, and a scoped admin
+/// may remove only a rule wholly inside their scope (`rule_within_scope`): one
+/// they can see but that reaches wider is 403.
 ///
 /// No body, so the `application/json` defence the other writes use has
 /// nothing to hold on to. It does not need it: the session cookie is
@@ -1625,9 +1674,16 @@ async fn delete_suppression(
     }
     let view = visible(&state, &caller, FilterParams::default());
     let seen = suppressions_visible(&state.book(), &view, &caller)
-        .iter()
-        .any(|s| s.rule.id == id);
-    let removed = seen && {
+        .into_iter()
+        .find(|s| s.rule.id == id);
+    if let Some(s) = &seen
+        && !s.removable
+    {
+        return Err(AppError::forbidden(
+            "that rule reaches beyond the caller's scope, so only an unscoped admin may remove it",
+        ));
+    }
+    let removed = seen.is_some() && {
         let store = state.store.lock().expect("store lock");
         let removed = store.delete_suppression(id)?;
         state.publish_book(&store)?;
@@ -5347,6 +5403,201 @@ mod tests {
                 .is_null(),
             "live again the moment its rule is gone"
         );
+    }
+
+    /// A scoped admin's rules stay inside their scope, to make and to remove;
+    /// an unscoped admin's are as they were.
+    #[tokio::test]
+    async fn a_scoped_admins_suppression_rules_stay_inside_their_scope() {
+        let state = state_for(&oidc_config());
+        let lnx = key_of(&state, "FLEET-LNX-01").await;
+        let admin = session(&state, Role::Admin, &[]);
+        let snap = get(&state, "/api/snapshot", Some(&admin)).await.json();
+        let glasgow_key = snap["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["tags"]["site"] == "glasgow")
+            .expect("a glasgow machine")["key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let scoped = session(&state, Role::Admin, &[&[("site", "glasgow")]]);
+        let two_scopes = session(
+            &state,
+            Role::Admin,
+            &[&[("site", "glasgow")], &[("site", "edinburgh")]],
+        );
+
+        // Refused: fleet-wide, a tag rule outside the scope, a tag rule that
+        // reaches past it (a scope's key is missing), a machine not in view.
+        for (body, why) in [
+            (serde_json::json!({ "code": "partial_run" }), "fleet-wide"),
+            (
+                serde_json::json!({ "code": "partial_run", "tags": { "site": "edinburgh" } }),
+                "another site",
+            ),
+            (
+                serde_json::json!({ "code": "partial_run", "tags": { "ring": "pilot" } }),
+                "a tag of no scope of theirs",
+            ),
+        ] {
+            let r = suppress(&state, &scoped, body).await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{why}: {}", r.body);
+            assert!(
+                !r.body.contains("edinburgh") && !r.body.contains("pilot"),
+                "{why}: the refusal names nothing outside the scope: {}",
+                r.body
+            );
+        }
+        assert_eq!(
+            suppress(
+                &state,
+                &scoped,
+                serde_json::json!({ "code": "partial_run", "machine_key": lnx })
+            )
+            .await
+            .status,
+            StatusCode::NOT_FOUND,
+            "a machine outside their view, as before"
+        );
+        assert!(
+            get(&state, "/api/suppressions", Some(&admin))
+                .await
+                .json()
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "nothing was made by the refusals"
+        );
+
+        // Allowed: a machine in view, a tag rule carrying the scope's tags
+        // (with more besides), and with two scopes either one's.
+        let own_machine = suppress(
+            &state,
+            &scoped,
+            serde_json::json!({ "code": "partial_run", "machine_key": glasgow_key }),
+        )
+        .await;
+        assert_eq!(
+            own_machine.status,
+            StatusCode::CREATED,
+            "{}",
+            own_machine.body
+        );
+        assert_eq!(own_machine.json()["removable"], true);
+        let own_tags = suppress(
+            &state,
+            &scoped,
+            serde_json::json!({ "code": "weak_identity", "tags": { "site": "glasgow", "ring": "pilot" } }),
+        )
+        .await;
+        assert_eq!(own_tags.status, StatusCode::CREATED, "{}", own_tags.body);
+        let second_scope = suppress(
+            &state,
+            &two_scopes,
+            serde_json::json!({ "code": "thermal_limited", "tags": { "site": "edinburgh" } }),
+        )
+        .await;
+        assert_eq!(
+            second_scope.status,
+            StatusCode::CREATED,
+            "{}",
+            second_scope.body
+        );
+        assert_eq!(
+            suppress(
+                &state,
+                &two_scopes,
+                serde_json::json!({ "code": "stale", "tags": { "ring": "pilot" } })
+            )
+            .await
+            .status,
+            StatusCode::FORBIDDEN,
+            "two scopes do not make a tag in neither one allowed"
+        );
+
+        // Unscoped: unchanged. Fleet-wide, and a tag rule wider than the
+        // glasgow admin's scope, which the glasgow admin can see.
+        let fleet = suppress(
+            &state,
+            &admin,
+            serde_json::json!({ "code": "unstable_run" }),
+        )
+        .await;
+        assert_eq!(fleet.status, StatusCode::CREATED, "{}", fleet.body);
+        let wide = suppress(
+            &state,
+            &admin,
+            serde_json::json!({ "code": "stale", "tags": { "ring": "pilot" } }),
+        )
+        .await;
+        assert_eq!(wide.status, StatusCode::CREATED, "{}", wide.body);
+        let id = |r: &Reply| r.json()["id"].as_i64().unwrap();
+
+        let listed = get(&state, "/api/suppressions", Some(&scoped)).await.json();
+        let removable = |rule: i64| -> serde_json::Value {
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"] == rule)
+                .unwrap_or_else(|| panic!("rule {rule} is listed"))["removable"]
+                .clone()
+        };
+        assert_eq!(removable(id(&own_machine)), true);
+        assert_eq!(removable(id(&own_tags)), true);
+        assert_eq!(removable(id(&fleet)), false, "shown, not removable");
+        assert_eq!(removable(id(&wide)), false, "shown, not removable");
+        let everyone = get(&state, "/api/suppressions", Some(&admin)).await.json();
+        assert!(
+            everyone
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["removable"] == true),
+            "an unscoped admin may remove every rule"
+        );
+
+        // Removing: 403 for seen-but-wider, 404 for unseen, 204 for inside.
+        let del = |rule: i64| format!("/api/suppressions/{rule}");
+        for rule in [id(&fleet), id(&wide)] {
+            assert_eq!(
+                request(&state, Method::DELETE, &del(rule), Some(&scoped))
+                    .await
+                    .status,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            request(
+                &state,
+                Method::DELETE,
+                &del(id(&second_scope)),
+                Some(&scoped)
+            )
+            .await
+            .status,
+            StatusCode::NOT_FOUND,
+            "a rule they cannot see does not exist for them"
+        );
+        for rule in [id(&own_machine), id(&own_tags)] {
+            assert_eq!(
+                request(&state, Method::DELETE, &del(rule), Some(&scoped))
+                    .await
+                    .status,
+                StatusCode::NO_CONTENT
+            );
+        }
+        for rule in [id(&fleet), id(&wide), id(&second_scope)] {
+            assert_eq!(
+                request(&state, Method::DELETE, &del(rule), Some(&admin))
+                    .await
+                    .status,
+                StatusCode::NO_CONTENT,
+                "an unscoped admin removes any"
+            );
+        }
     }
 
     /// `forget` in a terminal clears a machine's triage in the state file;

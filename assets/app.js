@@ -2201,9 +2201,22 @@ function triageControls(f) {
   const me = state.me || {};
   const t = f.triage;
   const which = `${codeWords(f.code)} on ${f.hostname || f.machine_key}`;
+  // A scoped admin's rules stay inside their scope (the server refuses
+  // otherwise): their own entitlement is in /api/me, so the page offers only
+  // what will be accepted. `scopeOfRule` is the scope a rule is made in: the
+  // only one, or with several the first this machine satisfies.
+  const scopes = me.scopes || [];
+  const scoped = scopes.length > 0;
+  const ownTags = (state.snap?.machines || []).find((m) => m.key === f.machine_key)?.tags || {};
+  const satisfies = (sc, tags) => Object.entries(sc).every(([k, v]) => tags[k] === v);
+  const scopeOfRule = scoped ? scopes.find((sc) => satisfies(sc, ownTags)) : null;
+  // Whether this caller may lift the rule behind a suppressed finding: not a
+  // scoped admin where it is fleet-wide or reaches past their scope.
+  const mayLift = (r) => !scoped || r.reach === 'machine'
+    || (r.reach === 'tags' && scopes.some((sc) => satisfies(sc, r.tags || {})));
   if (t) {
     const undo = t.state === 'suppressed'
-      ? me.may_suppress && el('button', {
+      ? me.may_suppress && mayLift(t) && el('button', {
         type: 'button', class: 'btn btn-quiet', text: 'Remove rule',
         'aria-label': `Remove the rule suppressing ${which}`,
         onclick: () => sendTriage(`/api/suppressions/${t.rule}`, {
@@ -2255,9 +2268,11 @@ function triageControls(f) {
   });
   // The second step of "Machines tagged…": a key and a value, from the tags
   // the machines in view carry rather than typed, starting at a tag this
-  // machine has so the usual rule is one press away. The server does not limit
-  // an admin's rule to their own scope (a tag rule is an admin's, and reaches
-  // past one), so the snapshot — already the caller's view — is the limit.
+  // machine has so the usual rule is one press away. The snapshot is already
+  // the caller's view. A scoped admin's rule must carry the pairs of their
+  // scope (the server refuses it otherwise): those pairs are merged into the
+  // request and said in the step, and a picked key that is one of the scope's
+  // has its value fixed to the scope's.
   const tagStep = () => {
     const known = tagValuesOf(state.snap?.machines || []);
     const keys = [...known.keys()].sort();
@@ -2266,10 +2281,16 @@ function triageControls(f) {
     const keySelect = el('select', { class: 'triage-select', 'aria-label': `Tag to suppress ${codeWords(f.code)} for` },
       keys.map((k) => el('option', { value: k, text: k })));
     const valueSelect = el('select', { class: 'triage-select', 'aria-label': 'Value of that tag' });
+    const pinned = scopeOfRule || {};
     const fill = (k) => {
-      valueSelect.replaceChildren(...[...known.get(k)].sort().map((v) => el('option', { value: v, text: v })));
-      valueSelect.value = own[k] ?? firstValue(k);
+      const fixed = pinned[k] !== undefined;
+      valueSelect.replaceChildren(...(fixed ? [pinned[k]] : [...known.get(k)].sort())
+        .map((v) => el('option', { value: v, text: v })));
+      valueSelect.value = fixed ? pinned[k] : own[k] ?? firstValue(k);
+      valueSelect.disabled = fixed;
     };
+    const tagsFor = () => ({ ...pinned, [keySelect.value]: valueSelect.value });
+    const wordsOf = (tags) => Object.entries(tags).map(([k, v]) => `${k}=${v}`).join(', ');
     keySelect.value = keys.find((k) => own[k] !== undefined) ?? keys[0];
     fill(keySelect.value);
     keySelect.addEventListener('change', () => fill(keySelect.value));
@@ -2278,13 +2299,17 @@ function triageControls(f) {
     ]);
     open('Suppress by tag', [
       ['Suppress for this tag', (note) => sendTriage('/api/suppressions', {
-        body: { code: f.code, tags: { [keySelect.value]: valueSelect.value }, note },
-        done: `Suppressed ${codeWords(f.code)} where ${keySelect.value}=${valueSelect.value}.`,
+        body: { code: f.code, tags: tagsFor(), note },
+        done: `Suppressed ${codeWords(f.code)} where ${wordsOf(tagsFor())}.`,
       })],
-    ], [field('Tag', keySelect), field('Value', valueSelect)]);
+    ], [
+      ...(scoped ? [el('p', { class: 'triage-scope', text: `within ${wordsOf(pinned)}` })] : []),
+      field('Tag', keySelect), field('Value', valueSelect),
+    ]);
     keySelect.focus();
   };
-  const hasTags = (state.snap?.machines || []).some((m) => Object.keys(m.tags || {}).length);
+  const hasTags = (state.snap?.machines || []).some((m) => Object.keys(m.tags || {}).length)
+    && (!scoped || !!scopeOfRule);
   const actions = [
     el('button', {
       type: 'button', class: 'btn btn-quiet', text: 'Acknowledge',
@@ -2307,10 +2332,10 @@ function triageControls(f) {
           done: `Suppressed ${which}.`,
         })],
         ...(hasTags ? [['Machines tagged…', tagStep]] : []),
-        ['Fleet-wide', (note) => sendTriage('/api/suppressions', {
+        ...(scoped ? [] : [['Fleet-wide', (note) => sendTriage('/api/suppressions', {
           body: { code: f.code, note },
           done: `Suppressed ${codeWords(f.code)} across the fleet.`,
-        })],
+        })]]),
       ]),
     }) : null,
   ];

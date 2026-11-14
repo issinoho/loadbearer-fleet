@@ -2116,9 +2116,9 @@ function heatRows(h) {
     const rowOf = (h, m) => findAll(h, (n) => n.className === 'finding' || n.className === 'finding finding-quieted')
       .find((n) => textOf(n).includes(m.hostname || m.key));
     const buttonIn = (root, text) => findAll(root, (n) => n.tagName === 'button' && n.textContent === text)[0];
-    const render = (state_) => {
+    const render = (state_, me = { role: 'admin', may_triage: true, may_suppress: true }) => {
       mod.state.snap = state_;
-      mod.state.me = { role: 'admin', may_triage: true, may_suppress: true };
+      mod.state.me = me;
       const h = host(1200);
       mod.renderOverview(h);
       return h;
@@ -2207,7 +2207,60 @@ function heatRows(h) {
       const pn = findAll(rowOf(hn, a), (n) => n.className === 'triage-panel')[0];
       check('triage/tags', !!buttonIn(pn, 'Fleet-wide') && !buttonIn(pn, 'Machines tagged…'),
         'a fleet with no tags was offered a tag choice');
+
+      // A scoped admin: no Fleet-wide, the scope's pairs in the request and
+      // said in the step, its key's value fixed; with two scopes, the one
+      // this machine satisfies; and no Remove rule on a rule wider than theirs.
+      const ownScope = { site: tagOf(a) };
+      const otherScope = { site: tagOf(b) };
+      const otherKey = Object.keys(a.tags).find((k) => k !== 'site');
+      for (const [label, scopes] of [['one scope', [ownScope]], ['two scopes', [otherScope, ownScope]]]) {
+        const me = { role: 'admin', may_triage: true, may_suppress: true, scopes };
+        const hs = render(world, me);
+        await fire(buttonIn(rowOf(hs, a), 'Suppress'));
+        const ps = findAll(rowOf(hs, a), (n) => n.className === 'triage-panel')[0];
+        check('triage/scoped', !buttonIn(ps, 'Fleet-wide'), `${label}: a scoped admin was offered Fleet-wide`);
+        check('triage/scoped', !!buttonIn(ps, 'This machine'), `${label}: This machine went missing`);
+        await fire(buttonIn(ps, 'Machines tagged…'));
+        check('triage/scoped', textOf(ps).includes(`within site=${tagOf(a)}`), `${label}: the step does not say its scope`);
+        const [ks, vs] = findAll(ps, (n) => n.tagName === 'select');
+        const send = async () => {
+          seen.length = 0;
+          globalThis.fetch = (url, opts) => {
+            seen.push({ url: String(url), body: opts?.body });
+            return Promise.resolve({ ok: true, json: () => Promise.resolve({}), text: () => Promise.resolve('') });
+          };
+          await fire(buttonIn(ps, 'Suppress for this tag'));
+          globalThis.fetch = () => Promise.reject(new Error('no network in the geometry check'));
+          return JSON.parse(seen[0]?.body || '{}').tags;
+        };
+        ks.value = 'site';
+        await fire(ks, 'change');
+        check('triage/scoped', vs.disabled === true && vs.children.length === 1 && vs.value === tagOf(a),
+          `${label}: the scope's own key does not have its value fixed`);
+        check('triage/scoped', JSON.stringify(await send()) === JSON.stringify(ownScope),
+          `${label}: the request does not carry exactly the scope`);
+        if (otherKey) {
+          ks.value = otherKey;
+          await fire(ks, 'change');
+          check('triage/scoped', !vs.disabled, `${label}: a key outside the scope has its value fixed`);
+          const sentTags = await send();
+          check('triage/scoped', sentTags.site === tagOf(a) && sentTags[otherKey] === vs.value
+            && Object.keys(sentTags).length === 2, `${label}: the request lacks the scope's pairs`);
+        }
+      }
+      // A rule wider than the scope can be seen but not lifted; one inside can.
+      const scopedMe = { role: 'admin', may_triage: true, may_suppress: true, scopes: [ownScope] };
+      for (const [reach, tags, lifted] of [
+        ['fleet', undefined, false], ['tags', { ring: 'x' }, false], ['tags', ownScope, true], ['machine', undefined, true],
+      ]) {
+        const q = { ...quiet, reach, tags };
+        const hl = render({ ...world, flags: world.flags.map((f) => (f.machine_key === a.key ? { ...f, triage: q } : f)) }, scopedMe);
+        check('triage/scoped', !!buttonIn(rowOf(hl, a), 'Remove rule') === lifted,
+          `a scoped admin and a ${reach} rule: Remove rule should be ${lifted ? 'offered' : 'hidden'}`);
+      }
       notes.push('triage/tags: pick, request, suppressed with the tag and live without, 3 callers');
+      notes.push('triage/scoped: no Fleet-wide, scope merged and fixed, wider rules not removable');
     } catch (err) {
       failures.push(`triage/tags: threw ${err.stack}`);
     }

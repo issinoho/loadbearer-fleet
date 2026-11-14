@@ -804,12 +804,20 @@ have this" is a question about the machines.
 
 **Who may.** A viewer sees it. A contributor or admin may acknowledge, snooze
 or undo either on the machines in their scope. Only an admin may create or
-remove a suppression, because a rule by tag or across the fleet reaches past
-any one scope. On the dashboard, an admin suppresses for one machine, for the
-machines carrying a tag (**Machines tagged…**, with the key and value picked
-from the tags the machines in view carry, starting at this machine's own), or
-for the whole fleet; the same rule by tag is `POST /api/suppressions` with
-`tags`. Every change is logged with who made it.
+remove a suppression. An unscoped admin may make a rule for one machine, for
+the machines carrying a tag, or for the whole fleet. An admin scoped to a set
+of tags may make a rule only inside their scope: for a machine in their view,
+or by tags that include every tag of one of their scopes (so every machine the
+rule could match is theirs); a fleet-wide rule, or a tag rule reaching beyond
+their scope, is `403`. They may remove only a rule wholly inside their scope;
+one they can see that reaches wider (a fleet-wide rule, say) is shown without
+**Remove rule**, and `DELETE` of it is `403`. On the dashboard, an admin
+suppresses for one machine, for the machines carrying a tag (**Machines
+tagged…**, with the key and value picked from the tags the machines in view
+carry, starting at this machine's own; a scoped admin's own scope is added to
+the rule and said in the panel), or for the whole fleet (not offered to a
+scoped admin); the same rule by tag is `POST /api/suppressions` with `tags`.
+Every change is logged with who made it.
 
 **How an acknowledgement ends.** Each time the snapshot is rebuilt — after a
 scan, an upload or a change by another process — an acknowledgement or snooze
