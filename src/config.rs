@@ -556,7 +556,7 @@ pub struct Ingest {
 /// endpoint and nowhere else, so a credential sitting in a deployment script
 /// cannot be used to enumerate the estate — which is the difference between
 /// leaking a write path and leaking the fleet.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestToken {
     /// What this token is for, in the log and against every run it submits.
@@ -589,6 +589,27 @@ pub struct IngestToken {
     /// not.
     #[serde(default)]
     pub expires: Option<toml::value::Datetime>,
+}
+
+/// Written by hand so the secret never reaches a log line or a panic message
+/// through `{:?}`. The digest stays: it is what the server holds so that it
+/// need not hold the secret, and it is what tells two entries apart.
+impl std::fmt::Debug for IngestToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngestToken")
+            .field("name", &self.name)
+            .field("token", &self.token.as_deref().map(redacted_if_set))
+            .field("token_sha256", &self.token_sha256)
+            .field("tags", &self.tags)
+            .field("limit_per_minute", &self.limit_per_minute)
+            .field("expires", &self.expires)
+            .finish()
+    }
+}
+
+/// What `{:?}` shows of a credential: that there is one, never what it is.
+fn redacted_if_set(secret: &str) -> &'static str {
+    if secret.is_empty() { "" } else { "<redacted>" }
 }
 
 impl IngestToken {
@@ -706,7 +727,7 @@ fn upload_limit_per_minute() -> u32 {
 }
 
 /// Prometheus metrics, off unless asked for.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Metrics {
     #[serde(default)]
@@ -717,6 +738,16 @@ pub struct Metrics {
     /// port is reachable from anywhere but this host.
     #[serde(default)]
     pub token: String,
+}
+
+/// By hand, so the bearer token stays out of `{:?}`.
+impl std::fmt::Debug for Metrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Metrics")
+            .field("enabled", &self.enabled)
+            .field("token", &redacted_if_set(&self.token))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -820,7 +851,7 @@ pub enum AuthMode {
     Oidc,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
     #[serde(default)]
@@ -879,6 +910,23 @@ fn groups_claim() -> String {
 
 fn session_hours() -> u32 {
     8
+}
+
+/// By hand, so a client secret stays out of `{:?}`.
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Auth")
+            .field("mode", &self.mode)
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &redacted_if_set(&self.client_secret))
+            .field("groups_claim", &self.groups_claim)
+            .field("session_hours", &self.session_hours)
+            .field("extra_scopes", &self.extra_scopes)
+            .field("ca_bundle", &self.ca_bundle)
+            .field("grants", &self.grants)
+            .finish()
+    }
 }
 
 impl Default for Auth {
@@ -2278,6 +2326,55 @@ mod tests {
         assert!(!text.contains("hmac-secret"), "{text}");
         assert!(!text.contains("url-token"), "{text}");
         assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    /// Every credential in the file, set at once: none of them may come out of
+    /// `{:?}` on the config, on its own section, or inside a collection.
+    #[test]
+    fn no_credential_reaches_debug_output() {
+        let entry = |name: &str, token: Option<&str>, digest: Option<String>| IngestToken {
+            name: name.into(),
+            token: token.map(str::to_string),
+            token_sha256: digest,
+            tags: BTreeMap::new(),
+            limit_per_minute: None,
+            expires: None,
+        };
+        let mut c = notifying("https://hooks.example.com/x?token=url-token");
+        c.notify.secret = "hmac-secret".into();
+        c.metrics.token = "metrics-bearer".into();
+        c.auth.client_secret = "oidc-client-secret".into();
+        c.ingest.tokens = vec![
+            entry("plain", Some("lbf_plaintext-ingest-secret"), None),
+            entry("digest", None, Some("ab".repeat(32))),
+        ];
+        let shown = [
+            format!("{c:?}"),
+            format!("{c:#?}"),
+            format!("{:?}", c.ingest),
+            format!("{:?}", c.ingest.tokens[0]),
+            format!("{:?}", c.metrics),
+            format!("{:?}", c.auth),
+        ];
+        for text in &shown {
+            for secret in [
+                "hmac-secret",
+                "url-token",
+                "metrics-bearer",
+                "oidc-client-secret",
+                "lbf_plaintext-ingest-secret",
+            ] {
+                // Not the value in the message: CodeQL reads that as a leak.
+                assert!(!text.contains(secret), "a credential reached Debug output");
+            }
+        }
+        assert!(shown[0].contains("<redacted>"));
+        // The name and the digest are what tell entries apart in a log.
+        assert!(shown[2].contains("plain") && shown[2].contains(&"ab".repeat(32)));
+        // Nothing set, nothing claimed: an empty credential prints as empty.
+        let d = format!("{:?}", Config::default());
+        assert!(!d.contains("<redacted>"), "{d}");
+        assert!(d.contains("client_secret: \"\""), "{d}");
     }
 
     #[test]

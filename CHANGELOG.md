@@ -5,6 +5,17 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## Unreleased
+
+### Fixed
+
+- **Credentials stay out of `{:?}`.** `[[ingest.tokens]]` `token`, `[metrics]`
+  `token` and `[auth]` `client_secret` now print as `<redacted>` when set, and
+  as nothing when empty, wherever a configuration or one of those sections is
+  formatted for a log line or a panic message; `notify.secret` already did.
+  The digest `token_sha256` still prints, which is what tells entries apart.
+  The configuration file and what is read from it are as they were.
+
 ## 0.12.0 - Fri, 13 Nov 2026
 
 **What loadbearer's next release collects, read and shown.** A loadbearer
