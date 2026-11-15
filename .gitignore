@@ -4,3 +4,5 @@
 *.db
 *.db-wal
 *.db-shm
+# Sub-agent worktrees and local session settings.
+/.claude/
