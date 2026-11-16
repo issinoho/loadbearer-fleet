@@ -1418,6 +1418,84 @@ mod tests {
         }
     }
 
+    /// BitLocker's two findings are warnings like the one for Secure Boot:
+    /// the critical event cannot carry them and the digest counts them
+    /// without naming the machine.
+    #[test]
+    fn no_payload_carries_the_bitlocker_findings() {
+        use crate::schema::samples;
+        let mut index = Index::open_in_memory().unwrap();
+        for (f, enrich) in [
+            (
+                "win-modern.json",
+                samples::optin_windows_suspended as fn(&mut serde_json::Value),
+            ),
+            ("linux-throttled.json", samples::optin_windows_not_encrypted),
+            ("low-end.json", |_| {}),
+        ] {
+            let mut doc = samples::fixture(f);
+            enrich(&mut doc);
+            index.ingest_text(&doc.to_string(), Path::new(f)).unwrap();
+        }
+        let mut snap = crate::analytics::snapshot(
+            index.conn(),
+            &Tuning::default(),
+            datetime!(2026-09-12 12:00 UTC),
+        )
+        .unwrap();
+        let named: Vec<(String, String)> = snap
+            .flags
+            .iter()
+            .filter(|f| f.code.starts_with("disk_"))
+            .map(|f| {
+                assert_eq!(f.severity, Severity::Warning);
+                (f.machine_key.clone(), f.hostname.clone().expect("a host"))
+            })
+            .collect();
+        assert_eq!(named.len(), 2, "both raised");
+        let other = snap
+            .machines
+            .iter()
+            .find(|m| !named.iter().any(|(k, _)| *k == m.key))
+            .expect("a machine with no BitLocker finding");
+        let critical = flag(&other.key, "H", "drive_failing");
+        snap.flags.push(critical);
+        let mut before = snap.clone();
+        before.flags.clear();
+        let news = new_criticals(&before, &snap).expect("a baseline");
+        assert_eq!(
+            news.iter().map(|f| f.code).collect::<Vec<_>>(),
+            ["drive_failing"]
+        );
+        let digest = digest_event(
+            "https://fleet.example.com",
+            DigestSchedule::Daily,
+            &snap,
+            None,
+            datetime!(2026-11-12 08:00 UTC),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&digest.body).expect("JSON");
+        assert_eq!(v["summary"]["live"]["warning"], snap.summary.warnings);
+        for out in [
+            digest,
+            critical_event(
+                "https://fleet.example.com",
+                &news,
+                datetime!(2026-11-12 08:00 UTC),
+            ),
+        ] {
+            let text = String::from_utf8(out.body).expect("UTF-8");
+            for (key, host) in &named {
+                assert!(!text.contains(host.as_str()), "a host in a payload");
+                assert!(!text.contains(key.as_str()), "a key in a payload");
+            }
+            let lower = text.to_lowercase();
+            for word in ["encrypt", "bitlocker", "protection", "disk_"] {
+                assert!(!lower.contains(word), "{word} in a {:?} payload", out.event);
+            }
+        }
+    }
+
     /// The digest, from a real snapshot: its counts are the summary's, and its
     /// field names are pinned like the critical event's.
     #[test]

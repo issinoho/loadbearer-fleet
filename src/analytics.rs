@@ -275,7 +275,7 @@ impl Flag {
 /// Two tests hold it to `evaluate`: one reads `evaluate`'s own source and
 /// fails on a code missing from here or listed here and never raised, and
 /// `push` asserts every code it is handed is in it.
-pub const RULES: [&str; 22] = [
+pub const RULES: [&str; 24] = [
     "grade_low",
     "cohort_outlier",
     "regressed",
@@ -288,6 +288,8 @@ pub const RULES: [&str; 22] = [
     "firmware_behind_peers",
     "firmware_old",
     "secure_boot_off",
+    "disk_not_encrypted",
+    "disk_protection_off",
     "thermal_limited",
     "on_battery",
     "power_limited",
@@ -2493,6 +2495,52 @@ fn evaluate(
                  that mirrors the firmware's state, and on Linux the SecureBoot EFI variable; \
                  confirm it on the machine with Confirm-SecureBootUEFI or mokutil --sb-state \
                  before acting."
+                    .to_string(),
+            );
+        }
+
+        // Two more drawn from the opt-in posture, both BitLocker's and both
+        // on what the run **read**. `disk_not_encrypted` only for
+        // `not_encrypted`, which an elevated Windows run reports
+        // definitively; never for `none_detected` (Linux, where other kinds
+        // of encryption are not looked for), `partly_encrypted` (it is on
+        // its way, or on its way off), not asked, or asked and unreadable.
+        // `disk_protection_off` only for an encrypted or partly encrypted
+        // volume read with protection off: BitLocker suspended. A value this
+        // build has not heard of raises neither. Like the one above, read
+        // from the run being judged.
+        if m.disk_encryption.as_deref() == Some("not_encrypted") {
+            push(
+                Severity::Warning,
+                FlagKind::Machine,
+                "disk_not_encrypted",
+                "The system drive is not encrypted".to_string(),
+                "BitLocker reports the system volume as not encrypted, so anyone who gets hold \
+                 of the machine or its disk can read what is on it. Sometimes that is \
+                 deliberate: lab and build machines, or a machine that holds nothing worth \
+                 protecting. Suppress it for those, by machine or by tag. The value is what \
+                 the latest run read from Win32_EncryptableVolume on an elevated run, so it is \
+                 BitLocker's own account of the volume; other disk encryption products are not \
+                 looked for. Confirm it on the machine with manage-bde -status C: (or the \
+                 letter of the system drive) before acting."
+                    .to_string(),
+            );
+        }
+
+        if m.protection_is_off() {
+            push(
+                Severity::Warning,
+                FlagKind::Machine,
+                "disk_protection_off",
+                "BitLocker protection is off".to_string(),
+                "The system volume is encrypted, but its latest run read BitLocker protection \
+                 as off: BitLocker is suspended, so the volume's key is available without the \
+                 protector and the encryption is not protecting the data until protection is \
+                 resumed. Sometimes that is deliberate for a while, around a firmware or boot \
+                 update. Suppress it for machines where it is, by machine or by tag. The value \
+                 is ProtectionStatus from Win32_EncryptableVolume, as recorded by loadbearer \
+                 on an elevated run; confirm it on the machine with manage-bde -status C: \
+                 (Protection Status) before acting."
                     .to_string(),
             );
         }
@@ -4949,6 +4997,245 @@ mod tests {
             ),
             (1, 1, 2)
         );
+    }
+
+    /// `disk_not_encrypted` on `not_encrypted` alone, and
+    /// `disk_protection_off` on protection read as off beside an encrypted or
+    /// partly encrypted volume alone. Neither for `none_detected`, not asked,
+    /// asked and unreadable, a partly encrypted volume with protection on,
+    /// or a value this build has not heard of.
+    #[test]
+    fn the_bitlocker_findings_are_raised_only_for_what_was_read() {
+        use crate::schema::samples;
+        let mut e = bitlocker_estate();
+        let at = "2026-09-01T10:00:00Z";
+        e.add_with("PC-NONE", 1000.0, at, samples::optin_linux_none_detected);
+        e.add_with("PC-BIOS", 1000.0, at, samples::optin_legacy_bios);
+        e.add_with("PC-UNREAD", 1000.0, at, samples::optin_unreadable);
+        e.add_with(
+            "PC-STRAY",
+            1000.0,
+            at,
+            samples::optin_blocks_without_collect,
+        );
+        e.add_with("PC-FUTURE", 1000.0, at, samples::optin_future);
+        e.add_with("BL-PARTLY-OFF", 1000.0, at, |d| {
+            samples::optin_windows_partly(d);
+            d["machine"]["security"]["disk_encryption"]["protection"] = json!("off");
+        });
+        e.add_with("BL-NOT-OFF", 1000.0, at, |d| {
+            samples::optin_windows_not_encrypted(d);
+            d["machine"]["security"]["disk_encryption"]["protection"] = json!("off");
+        });
+        e.add_with("BL-UPPER", 1000.0, at, |d| {
+            samples::optin_windows_suspended(d);
+            d["machine"]["security"]["disk_encryption"]["protection"] = json!("OFF");
+        });
+        e.add_with("BL-SEALED", 1000.0, at, |d| {
+            samples::optin_windows_suspended(d);
+            d["machine"]["security"]["disk_encryption"]["system_volume"] = json!("sealed");
+        });
+        e.add_with("BL-NO-PROTECTION", 1000.0, at, |d| {
+            samples::optin_windows_bitlocker(d);
+            d["machine"]["security"]["disk_encryption"]
+                .as_object_mut()
+                .expect("a disk block")
+                .remove("protection");
+        });
+        let s = e.snap();
+        let hosts = |code: &str| -> Vec<String> {
+            let mut h: Vec<String> = flags_for(&s, code)
+                .iter()
+                .filter_map(|f| f.hostname.clone())
+                .collect();
+            h.sort();
+            h
+        };
+        assert_eq!(hosts("disk_not_encrypted"), ["BL-NOT", "BL-NOT-OFF"]);
+        assert_eq!(
+            hosts("disk_protection_off"),
+            ["BL-PARTLY-OFF", "BL-SUSPENDED", "BL-UPPER"]
+        );
+
+        let f = flag_on(&s, "disk_not_encrypted", "BL-NOT").expect("raised");
+        assert_eq!(f.severity, Severity::Warning, "never critical");
+        assert_eq!(f.kind, FlagKind::Machine, "the machine's queue");
+        assert_eq!(f.headline, "The system drive is not encrypted");
+        for w in [
+            "deliberate",
+            "by machine or by tag",
+            "Win32_EncryptableVolume",
+            "manage-bde -status C:",
+        ] {
+            assert!(f.detail.contains(w), "{w} is not in the detail");
+        }
+        let f = flag_on(&s, "disk_protection_off", "BL-SUSPENDED").expect("raised");
+        assert_eq!(f.severity, Severity::Warning, "never critical");
+        assert_eq!(f.kind, FlagKind::Machine, "the machine's queue");
+        assert_eq!(f.headline, "BitLocker protection is off");
+        for w in [
+            "suspended",
+            "without the protector",
+            "ProtectionStatus",
+            "Win32_EncryptableVolume",
+            "manage-bde -status C:",
+            "by machine or by tag",
+        ] {
+            assert!(f.detail.contains(w), "{w} is not in the detail");
+        }
+        assert_eq!(rule("disk_not_encrypted"), Some("disk_not_encrypted"));
+        assert_eq!(rule("disk_protection_off"), Some("disk_protection_off"));
+    }
+
+    /// Neither is a part, a slowdown or an age: no machine's lifecycle verdict
+    /// moves with them, and both are counted as the warnings they are.
+    #[test]
+    fn the_bitlocker_findings_do_not_change_the_lifecycle_verdict() {
+        use crate::schema::samples;
+        let build = |opted: bool| {
+            let mut e = Estate::new();
+            let at = "2026-09-01T10:00:00Z";
+            type Shape = fn(&mut Value);
+            let shapes: [(&str, f64, Shape); 3] = [
+                ("KEEP", 1000.0, |_| {}),
+                ("SLOW", 500.0, |_| {}),
+                ("REPAIR", 1000.0, |d| {
+                    d["machine"]["battery"] = json!({
+                        "charge_pct": 90.0, "state": "charging",
+                        "health_pct": 50.0, "cycle_count": 900
+                    });
+                }),
+            ];
+            for (host, score, shape) in shapes {
+                e.add_with(host, score, at, |d| {
+                    shape(d);
+                    if opted {
+                        samples::optin_windows_not_encrypted(d);
+                    }
+                });
+            }
+            e.add_with("SUSPENDED", 1000.0, at, |d| {
+                if opted {
+                    samples::optin_windows_suspended(d);
+                }
+            });
+            e.snap()
+        };
+        let (with, without) = (build(true), build(false));
+        assert_eq!(flags_for(&with, "disk_not_encrypted").len(), 3);
+        assert_eq!(flags_for(&with, "disk_protection_off").len(), 1);
+        assert!(flags_for(&without, "disk_not_encrypted").is_empty());
+        for (a, b) in with.machines.iter().zip(&without.machines) {
+            assert_eq!(
+                (
+                    a.lifecycle.verdict,
+                    &a.lifecycle.reasons,
+                    a.lifecycle.uncertain
+                ),
+                (
+                    b.lifecycle.verdict,
+                    &b.lifecycle.reasons,
+                    b.lifecycle.uncertain
+                ),
+                "{:?}",
+                a.hostname
+            );
+        }
+        assert_eq!(with.summary.lifecycle, without.summary.lifecycle);
+        assert!(
+            with.machines.iter().all(|m| !m
+                .lifecycle
+                .reasons
+                .iter()
+                .any(|r| r.contains("BitLocker") || r.contains("encrypt"))),
+            "and never a reason"
+        );
+        assert_eq!(with.summary.warnings, without.summary.warnings + 4);
+        assert_eq!(with.summary.critical, without.summary.critical);
+    }
+
+    /// The past is judged by the run that stood then: a week whose run never
+    /// asked has no finding, and "what changed" shows protection being
+    /// suspended and resumed. Triage and suppression by tag work as for any
+    /// finding.
+    #[test]
+    fn the_bitlocker_findings_follow_the_run_judged_and_are_triaged() {
+        use crate::schema::samples;
+        use crate::state::TriageState::Suppressed;
+        let mut e = Estate::new();
+        let then = "2026-08-30T10:00:00Z";
+        let now_ = "2026-09-06T10:00:00Z";
+        e.add_with(
+            "SUSPENDED-NOW",
+            1000.0,
+            then,
+            samples::optin_windows_bitlocker,
+        );
+        e.add_with("SUSPENDED-NOW", 1000.0, now_, |d| {
+            samples::optin_windows_suspended(d);
+            d["tags"] = json!({ "site": "lab" });
+        });
+        e.add_with("RESUMED", 1000.0, then, samples::optin_windows_suspended);
+        e.add_with("RESUMED", 1000.0, now_, samples::optin_windows_bitlocker);
+        e.add("NOW-ASKED", 1000.0, then);
+        e.add_with(
+            "NOW-ASKED",
+            1000.0,
+            now_,
+            samples::optin_windows_not_encrypted,
+        );
+
+        let past = e.snap_as_of(datetime!(2026-09-02 12:00:00 UTC));
+        let hosts = |s: &Snapshot, code: &str| -> Vec<String> {
+            let mut h: Vec<String> = flags_for(s, code)
+                .iter()
+                .filter_map(|f| f.hostname.clone())
+                .collect();
+            h.sort();
+            h
+        };
+        assert_eq!(hosts(&past, "disk_protection_off"), ["RESUMED"]);
+        assert!(hosts(&past, "disk_not_encrypted").is_empty());
+        assert_eq!(hosts(&e.snap(), "disk_protection_off"), ["SUSPENDED-NOW"]);
+        assert_eq!(hosts(&e.snap(), "disk_not_encrypted"), ["NOW-ASKED"]);
+
+        let (snap, t) = e.timeline(4);
+        let c = t.changes(&snap, 1);
+        let of = |list: &[timeline::FindingChange], code: &str| -> Vec<String> {
+            list.iter()
+                .filter(|f| f.code == code)
+                .filter_map(|f| f.hostname.clone())
+                .collect()
+        };
+        assert_eq!(
+            of(&c.new_findings, "disk_protection_off"),
+            ["SUSPENDED-NOW"]
+        );
+        assert_eq!(of(&c.resolved, "disk_protection_off"), ["RESUMED"]);
+        assert_eq!(of(&c.new_findings, "disk_not_encrypted"), ["NOW-ASKED"]);
+
+        let raw = e.snap();
+        let book = book_of(
+            &[],
+            &[suppression(
+                "disk_protection_off",
+                None,
+                Some(&[("site", "lab")]),
+            )],
+        );
+        let view = raw.filtered_with(&Filter::default(), &book, now());
+        let state = |code: &str, h: &str| {
+            flag_on(&view, code, h)
+                .expect("still a finding, whatever its triage")
+                .triage
+                .as_ref()
+                .map(|t| t.state)
+        };
+        assert_eq!(
+            state("disk_protection_off", "SUSPENDED-NOW"),
+            Some(Suppressed)
+        );
+        assert_eq!(state("disk_not_encrypted", "NOW-ASKED"), None);
     }
 
     /// `posture=` matches only machines where the fact was read: neither

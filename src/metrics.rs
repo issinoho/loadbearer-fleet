@@ -677,6 +677,41 @@ mod tests {
         );
     }
 
+    /// BitLocker's findings are counted among the warnings and named
+    /// nowhere in a scrape, as for Secure Boot.
+    #[test]
+    fn the_bitlocker_findings_are_counted_and_nothing_more() {
+        use crate::schema::samples;
+        let mut index = Index::open_in_memory().unwrap();
+        for (f, enrich) in [
+            (
+                "win-modern.json",
+                samples::optin_windows_suspended as fn(&mut serde_json::Value),
+            ),
+            ("linux-throttled.json", samples::optin_windows_not_encrypted),
+        ] {
+            let mut doc = samples::fixture(f);
+            enrich(&mut doc);
+            index.ingest_text(&doc.to_string(), Path::new(f)).unwrap();
+        }
+        let snap = crate::analytics::snapshot(index.conn(), &Tuning::default(), now()).unwrap();
+        let text = render_all(&snap, &runtime(), now()).to_lowercase();
+        for word in ["encrypt", "bitlocker", "protection", "disk_not", "cipher"] {
+            assert!(!text.contains(word), "{word} in the exposition");
+        }
+        assert_eq!(
+            snap.flags
+                .iter()
+                .filter(|f| f.code.starts_with("disk_") && f.code != "disk_nearly_full")
+                .count(),
+            2
+        );
+        assert_eq!(
+            value_of(&text, "loadbearer_fleet_findings{severity=\"warning\"} "),
+            snap.summary.warnings.to_string()
+        );
+    }
+
     #[test]
     fn a_label_value_cannot_break_out_of_its_quotes() {
         assert_eq!(escape(r#"a"b\c"#), r#"a\"b\\c"#);

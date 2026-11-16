@@ -48,15 +48,17 @@ deliberately **not** in `/metrics` (not even as a fleet-wide count), the
 a Security filter if it was printed under one, and shows no machine's posture
 either way.
 
-One finding is drawn from it: `secure_boot_off`, a warning, where a UEFI boot
-was read with Secure Boot off. **A finding makes the fact visible to everyone
+Three findings are drawn from it, all warnings: `secure_boot_off`, where a UEFI
+boot was read with Secure Boot off, `disk_not_encrypted`, where BitLocker
+reported the Windows system volume as not encrypted, and `disk_protection_off`,
+where it reported an encrypted volume with protection suspended. **A finding makes the fact visible to everyone
 who can see the machine**, wherever findings go: the findings queue, the
 machine page, the `flag=` filter, the findings CSV, "What changed", the
 printed report's list of findings, and `report` on the command line. Scope
 still applies, so a viewer scoped to one site sees it only on that site's
 machines. It never reaches a webhook payload: the critical event carries
 only critical findings, and the digest counts it among the warnings without
-naming the machine. In `/metrics` it is one more in
+naming the machine. In `/metrics` each is one more in
 `findings{severity="warning"}`, which has no rule or machine label. Where
 the off is deliberate, a suppression by machine or by tag takes it out of
 the attention counts, but not out of the findings list: a suppressed finding

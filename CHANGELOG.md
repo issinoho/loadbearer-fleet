@@ -36,6 +36,22 @@ counted as unencrypted.
   the dashboard's Security select, beside the existing eight. Each matches only
   machines whose latest run read it; the 400 for any other value names all
   eleven. `disk_encrypted` now also takes in an encrypted BitLocker volume.
+- **`disk_not_encrypted`**, a warning in the machine queue, where the latest
+  run read the Windows system volume as `not_encrypted`. Never for
+  `none_detected` (on Linux other encryption is not looked for), for
+  `partly_encrypted`, for a run that did not ask or asked and was not elevated,
+  or for a value this build does not know.
+- **`disk_protection_off`**, a warning in the machine queue, where the latest
+  run read an encrypted or partly encrypted system volume with BitLocker
+  protection off: suspended, so the volume is encrypted but its key is
+  available without the protector. The detail says the value is
+  `ProtectionStatus` from `Win32_EncryptableVolume` as loadbearer recorded it,
+  and how to confirm it on the machine (`manage-bde -status C:`).
+  Both findings can be deliberate on lab machines or around a firmware update:
+  suppress them by machine or by tag. No threshold, and no part in the
+  lifecycle verdict. Shown wherever findings are, to whoever can see the
+  machine; never in the critical webhook, and the digest counts them among the
+  warnings without naming the machine.
 
 ## 0.13.0 - Sat, 14 Nov 2026
 

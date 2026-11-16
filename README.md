@@ -1071,7 +1071,8 @@ like any other filter, goes through the sign-in scope like any other filter,
 and any other value is refused with a 400. The Search box does not match the
 posture — "off" or "none" as a substring would read as an answer it isn't.
 
-**One finding, `secure_boot_off`, and nothing else.** It is raised when the
+**Three findings, `secure_boot_off`, `disk_not_encrypted` and
+`disk_protection_off`, and nothing else.** The first is raised when the
 latest run read Secure Boot as **off on a UEFI boot**: a warning, in the
 machine queue, which says where the value came from — on Windows the registry
 value `UEFISecureBootEnabled` under
@@ -1091,21 +1092,37 @@ Like every rule it is re-applied to the past, to the run that stood for each
 machine then, so "What changed" shows when Secure Boot was turned off or back
 on, and a week whose run did not ask has no finding.
 
-Only that one, because the other facts are not faults this tool can judge:
+**`disk_not_encrypted`** is raised when the latest run **read** the Windows
+system volume as `not_encrypted`, BitLocker's own definitive answer on an
+elevated run. It is never raised for `none_detected` — on Linux other kinds
+of encryption are not looked for — nor for a volume only `partly_encrypted`,
+nor for a run that did not ask or asked and was not elevated, nor for a value
+this build does not know. **`disk_protection_off`** is raised when the latest
+run read an `encrypted` or `partly_encrypted` system volume with BitLocker
+`protection` `off`: BitLocker is **suspended**, so the volume is encrypted
+but its key is available without the protector. Its detail says the value is
+`ProtectionStatus` from `Win32_EncryptableVolume` as loadbearer recorded it,
+and that `manage-bde -status C:` confirms it on the machine. Both are
+warnings, and both can be deliberate (a lab machine, a suspension around a
+firmware update), so [suppress them](#acknowledge-snooze-suppress) there, by
+machine or by tag. Neither has a threshold or a part in the lifecycle verdict,
+and both are re-applied to the past like every rule.
+
+Only those, because the other facts are not faults this tool can judge:
 `none_detected` is not "unencrypted" — see above for what is not looked for —
 many VMs have no TPM, and an uptime is as of the run, not now. Each of those
 is a question to ask with `posture=`.
 
-**The finding makes the fact visible** wherever findings go, to everyone who
+**The findings make the fact visible** wherever findings go, to everyone who
 can see the machine: the queue, the machine page, the `flag=` filter, the
 findings CSV, "What changed", the printed report's findings and `report` on
-the command line. It goes no further. It is a warning, so the [critical
-notification](#when-a-critical-notification-is-sent) never carries it, and the
-[digest](#the-digest) counts it among the warnings and lists only critical
+the command line. It goes no further. They are warnings, so the [critical
+notification](#when-a-critical-notification-is-sent) never carries them, and the
+[digest](#the-digest) counts them among the warnings and lists only critical
 findings, so it never names the machine. `/metrics` carries none of the facts,
-not even a fleet-wide count — a count of machines without Secure Boot in a
-metrics store less protected than this one is exactly what the CLI's
-PRIVACY.md worries about — and the finding is only one more in
+not even a fleet-wide count — a count of machines without Secure Boot or
+encryption in a metrics store less protected than this one is exactly what the
+CLI's PRIVACY.md worries about — and each finding is only one more in
 `findings{severity="warning"}`, which has no rule or machine label. See
 [SECURITY.md](SECURITY.md) for how sensitive the list is.
 
