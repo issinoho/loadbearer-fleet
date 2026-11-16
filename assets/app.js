@@ -289,8 +289,8 @@ function asked(m, category) {
   return (m.run_collect || []).includes(category);
 }
 
-/** Whether `os` names Windows, the platform where the CLI never reads disk
- *  encryption and where "booted" means the last restart. */
+/** Whether `os` names Windows, where the CLI reads disk encryption only on an
+ *  elevated run and where "booted" means the last restart. */
 function onWindows(m) {
   return /^windows/i.test(m.os || '');
 }
@@ -305,6 +305,44 @@ function span(secs) {
 }
 
 const known = (v) => v !== null && v !== undefined;
+
+/** BitLocker's ciphers as Windows says them; a value this build has not heard
+ *  of is shown as itself. */
+const CIPHER_WORDS = {
+  'xts-aes-128': 'XTS-AES 128',
+  'xts-aes-256': 'XTS-AES 256',
+  'aes-128': 'AES 128',
+  'aes-256': 'AES 256',
+  'aes-128-diffuser': 'AES 128 with diffuser',
+  'aes-256-diffuser': 'AES 256 with diffuser',
+  hardware: 'hardware encryption',
+};
+
+/** The system volume's encryption in words, or null where the run did not
+ *  read it. Linux says what it looked at: the root filesystem on dm-crypt, and
+ *  that "none detected" is not "unencrypted". Windows says what BitLocker
+ *  reported, which for "not encrypted" is definitive. The detail in brackets
+ *  is only what was read: method, cipher, and protection, where `off` on an
+ *  encrypted volume is BitLocker suspended. */
+function diskFact(m) {
+  const v = m.disk_encryption;
+  if (!known(v)) return null;
+  if (v === 'none_detected') return 'no dm-crypt detected under / (other kinds of disk encryption are not looked for)';
+  if (v === 'not_encrypted') return 'system volume not encrypted';
+  const method = known(m.disk_encryption_method)
+    ? (m.disk_encryption_method === 'bitlocker' ? 'BitLocker' : m.disk_encryption_method.toUpperCase()) : null;
+  const detail = [
+    method,
+    known(m.disk_encryption_cipher) ? (CIPHER_WORDS[m.disk_encryption_cipher] || m.disk_encryption_cipher) : null,
+    known(m.disk_protection) ? `protection ${m.disk_protection}${m.disk_protection === 'off' ? ' (suspended)' : ''}` : null,
+  ].filter(Boolean);
+  const brackets = detail.length ? ` (${detail.join(', ')})` : '';
+  if (v === 'encrypted') {
+    return method === 'BitLocker' ? `system volume encrypted${brackets}` : `root filesystem on dm-crypt${brackets}`;
+  }
+  if (v === 'partly_encrypted') return `system volume partly encrypted${brackets}`;
+  return `root filesystem: ${v}`;
+}
 
 /** The Security line, or null where the run did not ask: "UEFI · Secure Boot
  *  on · TPM 2.0 · disk encryption not read on Windows". Each part says exactly
@@ -322,12 +360,7 @@ function securityFact(m) {
         : bios ? 'Secure Boot does not apply' : null,
     m.tpm_present === true ? (known(m.tpm_version) ? `TPM ${m.tpm_version}` : 'TPM present, version not reported')
       : m.tpm_present === false ? 'no TPM exposed to the OS' : null,
-    m.disk_encryption === 'encrypted'
-      ? `root filesystem on dm-crypt${known(m.disk_encryption_method) ? ` (${m.disk_encryption_method.toUpperCase()})` : ''}`
-      : m.disk_encryption === 'none_detected'
-        ? 'no dm-crypt detected under / (other kinds of disk encryption are not looked for)'
-        : known(m.disk_encryption) ? `root filesystem: ${m.disk_encryption}`
-          : onWindows(m) ? 'disk encryption not read on Windows' : null,
+    diskFact(m) || (onWindows(m) ? 'disk encryption not read on Windows' : null),
   ];
   const unread = [
     known(mode) ? null : 'firmware mode',
@@ -393,7 +426,7 @@ function collectHint(m) {
 
 /** The `posture=` filter's values, as the server spells them, and what each
  *  matches: only machines whose latest run read that fact. */
-const POSTURES = [
+export const POSTURES = [
   ['secure_boot_off', 'Secure Boot off'],
   ['secure_boot_on', 'Secure Boot on'],
   ['legacy_bios', 'Legacy BIOS boot (no Secure Boot)'],
@@ -401,7 +434,10 @@ const POSTURES = [
   ['tpm_present', 'TPM present'],
   ['tpm_1.2', 'TPM 1.2'],
   ['disk_none_detected', 'No dm-crypt detected under / (Linux)'],
-  ['disk_encrypted', 'Root on dm-crypt (Linux)'],
+  ['disk_encrypted', 'System volume encrypted'],
+  ['disk_not_encrypted', 'System volume not encrypted (Windows)'],
+  ['disk_partly_encrypted', 'Partly encrypted (Windows)'],
+  ['disk_protection_off', 'BitLocker protection off'],
 ];
 
 /** A posture value in words; one this build does not know is shown as itself. */

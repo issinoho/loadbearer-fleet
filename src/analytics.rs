@@ -651,12 +651,19 @@ pub struct MachineView {
     /// driver. `tpm_version` is `2.0` / `1.2`, `None` where the OS didn't say.
     pub tpm_present: Option<bool>,
     pub tpm_version: Option<String>,
-    /// Linux only, root filesystem only: `encrypted` (dm-crypt, with the
-    /// cryptsetup type in `disk_encryption_method`) or `none_detected` — no
-    /// dm-crypt under `/`, which is **not** "unencrypted". Never set for
-    /// Windows, where the CLI cannot read BitLocker.
+    /// The system volume only. `encrypted` (Linux dm-crypt, or Windows
+    /// BitLocker, with the cryptsetup type or `bitlocker` in
+    /// `disk_encryption_method`); `none_detected` (Linux) — no dm-crypt
+    /// under `/`, which is **not** "unencrypted"; `not_encrypted` and
+    /// `partly_encrypted` (Windows, elevated runs only), the first of which
+    /// is definitive. A Windows run that was not elevated has none.
     pub disk_encryption: Option<String>,
     pub disk_encryption_method: Option<String>,
+    /// BitLocker's cipher (`xts-aes-256`, `hardware`, …); Windows only.
+    pub disk_encryption_cipher: Option<String>,
+    /// `on` or `off`; Windows only. `off` on an encrypted volume is
+    /// BitLocker suspended.
+    pub disk_protection: Option<String>,
     /// Every drive of the latest run, for the rules. Not serialised: the
     /// snapshot ships every machine, and the drilldown, which wants these,
     /// gets them from `detail` instead.
@@ -869,6 +876,20 @@ impl std::str::FromStr for Verdict {
     }
 }
 
+impl MachineView {
+    /// BitLocker protection read as off on a volume that is, or is becoming,
+    /// encrypted: suspended. The same shape the `disk_protection_off` finding
+    /// is raised on. Protection beside `not_encrypted` or a value this build
+    /// has not heard of says nothing about a suspended protector.
+    pub fn protection_is_off(&self) -> bool {
+        self.disk_protection.as_deref() == Some("off")
+            && matches!(
+                self.disk_encryption.as_deref(),
+                Some("encrypted" | "partly_encrypted")
+            )
+    }
+}
+
 /// One security fact a machine's latest run **read**, for `posture=` — the
 /// question "which machines have Secure Boot off" asked of the estate.
 ///
@@ -879,9 +900,10 @@ impl std::str::FromStr for Verdict {
 /// into a list of unprotected machines. A legacy-BIOS boot has no Secure Boot
 /// at all and is its own value rather than either side.
 ///
-/// One value at a time, and deliberately no metrics drawn from it, and one
-/// finding only: `secure_boot_off`, which `evaluate` raises on a UEFI boot
-/// read as off — see the README's "Uptime, elevation and security posture".
+/// One value at a time, and deliberately no metrics drawn from it, and three
+/// findings only: `secure_boot_off`, which `evaluate` raises on a UEFI boot
+/// read as off, and `disk_not_encrypted` and `disk_protection_off` for
+/// BitLocker — see the README's "Uptime, elevation and security posture".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Posture {
     SecureBootOn,
@@ -892,10 +914,13 @@ pub enum Posture {
     Tpm12,
     DiskEncrypted,
     DiskNoneDetected,
+    DiskNotEncrypted,
+    DiskPartlyEncrypted,
+    DiskProtectionOff,
 }
 
 impl Posture {
-    pub const ALL: [Posture; 8] = [
+    pub const ALL: [Posture; 11] = [
         Posture::SecureBootOff,
         Posture::SecureBootOn,
         Posture::LegacyBios,
@@ -904,6 +929,9 @@ impl Posture {
         Posture::Tpm12,
         Posture::DiskNoneDetected,
         Posture::DiskEncrypted,
+        Posture::DiskNotEncrypted,
+        Posture::DiskPartlyEncrypted,
+        Posture::DiskProtectionOff,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -916,6 +944,9 @@ impl Posture {
             Posture::Tpm12 => "tpm_1.2",
             Posture::DiskEncrypted => "disk_encrypted",
             Posture::DiskNoneDetected => "disk_none_detected",
+            Posture::DiskNotEncrypted => "disk_not_encrypted",
+            Posture::DiskPartlyEncrypted => "disk_partly_encrypted",
+            Posture::DiskProtectionOff => "disk_protection_off",
         }
     }
 
@@ -934,6 +965,11 @@ impl Posture {
             }
             Posture::DiskEncrypted => m.disk_encryption.as_deref() == Some("encrypted"),
             Posture::DiskNoneDetected => m.disk_encryption.as_deref() == Some("none_detected"),
+            Posture::DiskNotEncrypted => m.disk_encryption.as_deref() == Some("not_encrypted"),
+            Posture::DiskPartlyEncrypted => {
+                m.disk_encryption.as_deref() == Some("partly_encrypted")
+            }
+            Posture::DiskProtectionOff => m.protection_is_off(),
         }
     }
 }
@@ -1793,7 +1829,8 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
                 disk_low_free_bytes, os_distro, os_version, os_build, os_edition,
                 memory_slots, memory_populated, run_uuid, run_duration_secs, run_collect,
                 run_elevated, booted_at, uptime_secs, firmware_mode, secure_boot,
-                tpm_present, tpm_version, disk_encryption, disk_encryption_method
+                tpm_present, tpm_version, disk_encryption, disk_encryption_method,
+                disk_encryption_cipher, disk_protection
            FROM run WHERE id IN ({chosen}) ORDER BY machine_key"
     ))?;
 
@@ -1922,6 +1959,8 @@ fn load_runs(conn: &Connection, pick: &Pick<'_>) -> Result<Vec<MachineView>> {
             tpm_version: r.get(58)?,
             disk_encryption: r.get(59)?,
             disk_encryption_method: r.get(60)?,
+            disk_encryption_cipher: r.get(61)?,
+            disk_protection: r.get(62)?,
             drives,
             low_confidence_cpu_subtests: low_conf.get(&run_id).copied().unwrap_or(0),
             tags: tags.remove(&run_id).unwrap_or_default(),
@@ -4580,7 +4619,10 @@ mod tests {
         assert_eq!(win.firmware_mode.as_deref(), Some("uefi"));
         assert_eq!((win.secure_boot, win.tpm_present), (Some(true), Some(true)));
         assert_eq!(win.tpm_version.as_deref(), Some("2.0"));
-        assert_eq!(win.disk_encryption, None, "never read on Windows");
+        assert_eq!(
+            win.disk_encryption, None,
+            "not read on an unelevated Windows run"
+        );
 
         let luks = machine(&s, "PC-LUKS");
         assert_eq!(luks.secure_boot, Some(false));
@@ -4983,6 +5025,91 @@ mod tests {
             "tpm_2.0",
         ] {
             assert!(bad.parse::<Posture>().is_err(), "{bad}");
+        }
+    }
+
+    /// An estate of the Windows BitLocker shapes, one machine each, and a
+    /// machine that was asked and could not read it, beside them.
+    fn bitlocker_estate() -> Estate {
+        use crate::schema::samples;
+        let mut e = Estate::new();
+        let at = "2026-09-01T10:00:00Z";
+        e.add_with("BL-ON", 1000.0, at, samples::optin_windows_bitlocker);
+        e.add_with("BL-SUSPENDED", 1000.0, at, samples::optin_windows_suspended);
+        e.add_with("BL-PARTLY", 1000.0, at, samples::optin_windows_partly);
+        e.add_with("BL-NOT", 1000.0, at, samples::optin_windows_not_encrypted);
+        e.add_with("BL-UNELEVATED", 1000.0, at, samples::optin_windows);
+        e.add_with("BL-LUKS", 1000.0, at, samples::optin_linux_luks);
+        e.add("BL-OLD", 1000.0, at);
+        e
+    }
+
+    /// The BitLocker fields reach the view, and `posture=` matches only what
+    /// was read: an unelevated Windows run, an older result and a Linux
+    /// machine are on neither side of the BitLocker questions.
+    #[test]
+    fn bitlocker_fields_and_filters_hold_the_three_states() {
+        let all = bitlocker_estate().snap();
+        let on = machine(&all, "BL-ON");
+        assert_eq!(
+            (
+                on.disk_encryption.as_deref(),
+                on.disk_encryption_method.as_deref(),
+                on.disk_encryption_cipher.as_deref(),
+                on.disk_protection.as_deref()
+            ),
+            (
+                Some("encrypted"),
+                Some("bitlocker"),
+                Some("xts-aes-256"),
+                Some("on")
+            )
+        );
+        for host in ["BL-UNELEVATED", "BL-OLD", "BL-LUKS"] {
+            let m = machine(&all, host);
+            assert_eq!(
+                (&m.disk_encryption_cipher, &m.disk_protection),
+                (&None, &None),
+                "{host}"
+            );
+        }
+        let hosts = |p: Posture| -> Vec<String> {
+            let mut h: Vec<_> = all
+                .filtered(&Filter {
+                    posture: Some(p),
+                    ..Default::default()
+                })
+                .machines
+                .iter()
+                .filter_map(|m| m.hostname.clone())
+                .collect();
+            h.sort();
+            h
+        };
+        assert_eq!(hosts(Posture::DiskNotEncrypted), ["BL-NOT"]);
+        assert_eq!(hosts(Posture::DiskPartlyEncrypted), ["BL-PARTLY"]);
+        assert_eq!(hosts(Posture::DiskProtectionOff), ["BL-SUSPENDED"]);
+        assert_eq!(
+            hosts(Posture::DiskEncrypted),
+            ["BL-LUKS", "BL-ON", "BL-SUSPENDED"]
+        );
+        assert_eq!(Posture::DiskNotEncrypted.to_string(), "disk_not_encrypted");
+        // The 400 names all eleven.
+        let err = "nope".parse::<Posture>().unwrap_err();
+        for p in Posture::ALL {
+            assert!(err.contains(p.as_str()), "{p}");
+        }
+        // A value this build has never heard of matches nothing.
+        let mut v = all.machines[0].clone();
+        v.disk_encryption = Some("sealed".into());
+        v.disk_protection = Some("off".into());
+        for p in [
+            Posture::DiskEncrypted,
+            Posture::DiskNotEncrypted,
+            Posture::DiskPartlyEncrypted,
+            Posture::DiskProtectionOff,
+        ] {
+            assert!(!p.holds(&v), "{p}");
         }
     }
 
