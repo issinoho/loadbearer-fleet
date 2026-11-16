@@ -5,13 +5,18 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
-## Unreleased
+## 0.14.0 - Mon, 16 Nov 2026
 
 **BitLocker, read.** The server side for loadbearer 1.11.0, which reads
 BitLocker on an elevated Windows run made with `--collect security`. Nothing
 changes for older results, which read exactly as they did; a machine that did
 not ask, or asked and was not elevated, still shows nothing and is never
 counted as unencrypted.
+
+**Upgrading:** nothing to change in the configuration. The index gains two
+columns when it is opened, with no format change, and the state file is as
+it was. Upgrade this before loadbearer 1.11.0 reaches the machines, so the
+new values are understood when they arrive.
 
 ### Added
 
