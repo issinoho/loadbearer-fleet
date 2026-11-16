@@ -1625,6 +1625,22 @@ function heatRows(h) {
       + 'mokutil --sb-state before acting.',
     triage: null,
   });
+  // BitLocker's two, as the server words them.
+  const notEncrypted = (m) => ({
+    severity: 'warning', kind: 'machine', code: 'disk_not_encrypted', machine_key: m.key, hostname: m.hostname,
+    headline: 'The system drive is not encrypted',
+    detail: 'BitLocker reports the system volume as not encrypted. Sometimes that is deliberate: suppress it for '
+      + 'those, by machine or by tag. Confirm it on the machine with manage-bde -status C: before acting.',
+    triage: null,
+  });
+  const protectionOff = (m) => ({
+    severity: 'warning', kind: 'machine', code: 'disk_protection_off', machine_key: m.key, hostname: m.hostname,
+    headline: 'BitLocker protection is off',
+    detail: 'The system volume is encrypted, but BitLocker is suspended, so the key is available without '
+      + 'the protector. The value is ProtectionStatus from Win32_EncryptableVolume; confirm it with '
+      + 'manage-bde -status C: before acting.',
+    triage: null,
+  });
   const NEVER = ['unencrypted', 'not encrypted', 'undefined', 'NaN', 'null'];
   const cases = [
     {
@@ -1661,7 +1677,8 @@ function heatRows(h) {
         disk_encryption_cipher: 'xts-aes-256', disk_protection: 'on',
       },
       want: ['TPM 2.0 · system volume encrypted (BitLocker, XTS-AES 256, protection on)'],
-      not: ['suspended', 'dm-crypt', 'root filesystem', 'not read on Windows', 'BITLOCKER'],
+      // Encrypted with protection on raises nothing.
+      not: ['suspended', 'dm-crypt', 'root filesystem', 'not read on Windows', 'BITLOCKER', 'BitLocker protection is off'],
       dts: ['Security'],
     },
     {
@@ -1671,7 +1688,9 @@ function heatRows(h) {
         disk_encryption: 'encrypted', disk_encryption_method: 'bitlocker',
         disk_encryption_cipher: 'aes-128-diffuser', disk_protection: 'off',
       },
-      want: ['system volume encrypted (BitLocker, AES 128 with diffuser, protection off (suspended))'],
+      flags: protectionOff,
+      want: ['system volume encrypted (BitLocker, AES 128 with diffuser, protection off (suspended))',
+        'BitLocker protection is off', 'manage-bde -status C:'],
       not: ['dm-crypt'],
       dts: ['Security'],
     },
@@ -1693,7 +1712,9 @@ function heatRows(h) {
         disk_encryption: 'not_encrypted',
       },
       allow: ['not encrypted'],
-      want: ['UEFI · Secure Boot on · system volume not encrypted'],
+      flags: notEncrypted,
+      want: ['UEFI · Secure Boot on · system volume not encrypted', 'The system drive is not encrypted',
+        'manage-bde -status C:'],
       not: ['dm-crypt', 'not read on Windows', 'disk encryption not reported'],
       dts: ['Security'],
     },
@@ -2560,6 +2581,38 @@ async function renderReportWith(name, { snap, changes, timeline, grouping = null
     check('report/secure-boot-off', times === 1, `the finding is listed ${times} time(s), not once`);
     for (const w of ['Secure Boot off', 'TPM', 'dm-crypt', 'UEFI ·', 'elevat', 'uptime', 'Uptime', '--collect']) {
       check('report/secure-boot-off', !withFinding.text.includes(w), `"${w}" reached the printed report`);
+    }
+  }
+
+  // BitLocker's two findings are listed with the rest, once each, and what
+  // they were drawn from — the volume's state, cipher and protection — is not.
+  const bl = {
+    ...opted,
+    machines: opted.machines.map((m, i) => ({
+      ...m, disk_encryption: i ? 'encrypted' : 'not_encrypted', disk_encryption_method: i ? 'bitlocker' : null,
+      disk_encryption_cipher: i ? 'xts-aes-256' : null, disk_protection: i ? 'off' : null,
+    })),
+  };
+  const [bl0, bl1] = bl.machines;
+  const withBitLocker = await renderReportWith('report/bitlocker', {
+    snap: {
+      ...bl,
+      flags: [...bl.flags,
+        { severity: 'warning', kind: 'machine', code: 'disk_not_encrypted', machine_key: bl0.key, hostname: bl0.hostname,
+          headline: 'The system drive is not encrypted', detail: 'Confirm it with manage-bde -status C:.', triage: null },
+        { severity: 'warning', kind: 'machine', code: 'disk_protection_off', machine_key: bl1.key, hostname: bl1.hostname,
+          headline: 'BitLocker protection is off', detail: 'Confirm it with manage-bde -status C:.', triage: null }],
+    },
+    changes: realChanges(4),
+    timeline: weeksOf(27),
+  });
+  if (withBitLocker) {
+    for (const h of ['The system drive is not encrypted', 'BitLocker protection is off']) {
+      const times = withBitLocker.text.split(h).length - 1;
+      check('report/bitlocker', times === 1, `"${h}" is listed ${times} time(s), not once`);
+    }
+    for (const w of ['XTS', 'AES', 'system volume', 'cipher', 'Security', 'suspended', '--collect']) {
+      check('report/bitlocker', !withBitLocker.text.includes(w), `"${w}" reached the printed report`);
     }
   }
 
