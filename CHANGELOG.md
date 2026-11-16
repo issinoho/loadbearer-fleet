@@ -5,6 +5,14 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## Unreleased
+
+### Changed
+
+- **`report --json`'s help text** says the snapshot is the shape the web UI
+  consumes, not will consume. Documentation only; the reference page in the wiki
+  is regenerated to match.
+
 ## 0.14.0 - Mon, 16 Nov 2026
 
 **BitLocker, read.** The server side for loadbearer 1.11.0, which reads

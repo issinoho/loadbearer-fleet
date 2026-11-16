@@ -90,8 +90,8 @@ enum Command {
     /// Machines that have only ever reported a skipped run have no result, so
     /// they are counted on one line, not listed; `--json` carries the list.
     Report {
-        /// Emit the whole snapshot as JSON — the same shape the web UI will
-        /// consume, so what the dashboard shows can be diffed and scripted.
+        /// Emit the whole snapshot as JSON — the same shape the web UI
+        /// consumes, so what the dashboard shows can be diffed and scripted.
         #[arg(long)]
         json: bool,
         /// Show informational flags too, and the findings somebody has

@@ -24,8 +24,9 @@
 //! than this one is exactly the list loadbearer's PRIVACY.md makes those
 //! facts opt-in to keep from leaking, and a count of it is half the way
 //! there. The Machines tab's `posture=` filter, behind sign-in and scope, is
-//! where that question is asked. The one finding drawn from them,
-//! `secure_boot_off`, is a warning like any other, so it is counted in
+//! where that question is asked. The three findings drawn from them,
+//! `secure_boot_off`, `disk_not_encrypted` and `disk_protection_off`, are
+//! warnings like any other, so each is counted in
 //! `findings{severity="warning"}` and `machines_flagged` beside every other
 //! warning: no family has a rule or machine label, so nothing here tells it
 //! apart from a worn battery.

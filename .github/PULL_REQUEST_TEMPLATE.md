@@ -5,7 +5,7 @@
 ## How was this tested?
 
 <!--
-- The four checks, or just "all pass locally" if nothing unusual.
+- The checks, or just "all pass locally" if nothing unusual.
 - If this touches the analysis: which rule, and what the fixture proves. Tests
   here build their fixtures from real result documents on purpose.
 - If this touches authorization: say so explicitly. Those tests go through the
@@ -25,7 +25,8 @@
 - [ ] `cargo fmt --all --check` is clean
 - [ ] `cargo clippy --all-targets --locked -- -D warnings` is clean
 - [ ] `cargo test --locked` passes
-- [ ] `node scripts/check-ui.mjs` passes, if anything under `assets/` changed
+- [ ] `node scripts/check-ui.mjs` and `node scripts/check-mobile.mjs` pass, if
+      anything under `assets/` changed
 - [ ] Still builds on the MSRV (1.88) if you touched dependencies
 - [ ] Docs updated if this changes user-facing behaviour — and if it changes
       something the README asserts, the README changed too

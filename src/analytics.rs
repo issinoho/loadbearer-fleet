@@ -2468,7 +2468,7 @@ fn evaluate(
             }
         }
 
-        // The one finding drawn from the opt-in posture, and only where the
+        // The first of three findings drawn from the opt-in posture, and only where the
         // run read Secure Boot as off on a UEFI boot. Not asked, asked and
         // unreadable, and a legacy-BIOS boot are all `None` and raise
         // nothing. Neither does "off" beside a firmware mode that is absent

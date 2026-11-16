@@ -5,7 +5,7 @@
 # migration step — the index updates itself on first start.
 #
 #   sudo scripts/upgrade.sh            # the latest release
-#   sudo scripts/upgrade.sh 0.8.0      # a given one
+#   sudo scripts/upgrade.sh 0.14.0     # a given one
 #
 # BIN, CONFIG and SERVICE override where the binary and config live and what
 # the unit is called.

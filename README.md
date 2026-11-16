@@ -51,7 +51,7 @@ which is a separate tool — install it first.
 part raises none of the warnings [described below](#a-note-on-the-windows-binary):
 
 ```powershell
-$LB = "1.5.2"   # or whatever is current on the releases page
+$LB = "1.11.0"   # or whatever is current on the releases page
 $zip = "loadbearer-$LB-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/issinoho/loadbearer/releases/download/v$LB/$zip" -OutFile $zip
 Expand-Archive $zip -DestinationPath . -Force
@@ -377,7 +377,7 @@ begin empty.
 
 A machine that keeps being skipped — on battery, or too busy for `--if-idle` —
 and one whose collector has stopped both look the same from here: stale. A
-loadbearer release after 1.8.1 closes that gap. When a scheduled run is skipped
+loadbearer 1.9.0 or later closes that gap. When a scheduled run is skipped
 for either reason, and only when it has an `--upload` target, it posts a **run
 status record** to the same endpoint, with the same token, as
 `loadbearer.run-status/1`:
@@ -606,7 +606,8 @@ resets when they're reimaged" is something an estate owner should know.
       browser — see [Saved views, and every view as a
       link](#saved-views-and-every-view-as-a-link)
 - [x] Uptime, elevation and security posture where a run asked for them, and
-      one finding drawn from it, Secure Boot read as off — see [Uptime,
+      three findings drawn from it, Secure Boot read as off and BitLocker read
+      as not encrypted or suspended — see [Uptime,
       elevation and security posture, where a run
       asked](#uptime-elevation-and-security-posture-where-a-run-asked)
 
@@ -648,7 +649,7 @@ means an estate owner reads a thermal caveat as a failing asset:
 
 | Queue | Means | Examples |
 | --- | --- | --- |
-| **machine** | a hardware decision — repair, replace, reassign | low grade, cohort outlier, regression, one weak component, worn battery, failing or worn drive, media errors, nearly full disk, firmware behind its peers or simply old, Secure Boot read as off |
+| **machine** | a hardware decision — repair, replace, reassign | low grade, cohort outlier, regression, one weak component, worn battery, failing or worn drive, media errors, nearly full disk, firmware behind its peers or simply old, Secure Boot read as off, BitLocker read as not encrypted or suspended |
 | **measurement** | the number can't be trusted until collection is fixed | thermally limited, run on battery, held back by its power settings, partial run, RAM-backed disk target, unstable CPU timings |
 | **coverage** | about the data we hold, not about the machine | stale result (which says so when the collector has since [tried and been skipped](#a-skipped-run-tells-the-server-so)), attributed by hostname only, no peer group |
 
@@ -957,7 +958,7 @@ documents.
 
 ### The OS release, the memory, and how long a run took
 
-A loadbearer release after 1.8.1 records three more things with each run: the
+loadbearer 1.9.0 and later record three more things with each run: the
 OS release in parts (on Windows the edition, the display version such as
 `24H2` and the build with its update revision; on Linux the distribution, its
 version and, where it sets one, the variant), the memory layout (how many slots,
@@ -985,7 +986,7 @@ module table on open, empty for the runs it already holds, and
 
 ### Uptime, elevation and security posture, where a run asked
 
-A loadbearer release after 1.8.1 can also record three things it **does not
+loadbearer 1.9.0 and later can also record three things they **do not
 collect unless asked**, because each says something about one particular
 machine or its user rather than its hardware: when the machine last booted,
 whether the run was elevated, and its security posture. They are turned on on
@@ -1031,7 +1032,8 @@ What each value means:
     `cipher` (`xts-aes-128`, `xts-aes-256`, `aes-128`, `aes-256`, the two
     `-diffuser` forms, or `hardware`) and its `protection`, `on` or `off`;
     `off` on an encrypted volume means BitLocker is **suspended**. A Windows
-    run that asked for `security` but was not elevated reads nothing here, and
+    run that asked for `security` but was not elevated, or was made by a
+    loadbearer older than 1.11.0, reads nothing here, and
     says **disk encryption not read on Windows**: asked, but not readable, never
     "not encrypted".
   - A value this build has never heard of is shown as it is and matches no
@@ -1136,7 +1138,7 @@ them in from the documents. `forget` takes them with the machine's runs.
 loadbearer-fleet serve \\fileserver\loadbearer
 ```
 
-Scans the folder, then serves seven views on `127.0.0.1:8787`: an executive
+Scans the folder, then serves seven tabs on `127.0.0.1:8787`: an executive
 **overview** (how many machines need attention, what changed since a week, a
 month or a quarter ago, grade distribution, findings by queue, score spread,
 the ranked list of what to look at, and the same figures week by week over
@@ -1146,7 +1148,8 @@ explorer** (each machine against the median of the machines like it), **groups**
 one measure is spread across the estate, and every machine against every
 component), **lifecycle** (what
 each machine calls for — replace, repair, investigate, watch or keep — and
-why), a sortable **machine table**, and a **drilldown** per machine with its
+why), a sortable **machine table**, **compare** (two to four runs head to
+head), and a **drilldown** per machine with its
 score history, its components, its findings in full, its drives, its OS
 release and memory layout, its security posture and uptime where its run
 [asked for them](#uptime-elevation-and-security-posture-where-a-run-asked), every subtest of its latest run, and — where a [threshold
@@ -1480,7 +1483,7 @@ nobody has quieted), `taken_at` (the latest run), `age_days` (days since it),
 `drive_power_on_hours`, `disk_low_mount`, `disk_low_free_pct`,
 `disk_low_free_bytes` (the fullest fixed volume), `overridden_by` (the
 [threshold overrides](#thresholds-and-different-lines-for-some-machines) that
-apply, separated by `; `), then from a loadbearer release after 1.8.1 —
+apply, separated by `; `), then from loadbearer 1.9.0 —
 empty for a run that didn't record them, never zero — `os_distro`,
 `os_version`, `os_build` and `os_edition` (the OS release in parts),
 `memory_slots` and `memory_populated`, `memory_types` (the distinct module
@@ -1706,7 +1709,7 @@ configuration** — it is a token setting, not a scope — and map object IDs:
 ```toml
 [[auth.grants]]
 group = "<object-id-of-your-fleet-admins-group>"
-role = "admin"     # read the dashboard, and trigger a rescan
+role = "admin"     # read the dashboard, trigger a rescan, suppress findings
 
 [[auth.grants]]
 group = "<object-id-of-the-glasgow-desktop-team>"
@@ -1720,8 +1723,8 @@ does:
 | | |
 | --- | --- |
 | `viewer` | Read the dashboard |
-| `contributor` | …and submit results to it |
-| `admin` | …and trigger a rescan |
+| `contributor` | …and submit results to it, and acknowledge or snooze findings |
+| `admin` | …and trigger a rescan, and make or remove suppression rules |
 
 An [ingest token](#when-a-machine-cannot-reach-the-share) is a `contributor`
 that never gets the first row: it may submit and it may not read, because the
@@ -1864,8 +1867,9 @@ a collector.
 ## Upgrading
 
 Stop it, replace the binary, start it. There is no migration step and nothing
-to back up: if a release ever changes the index's internal shape it keeps the
-old one for you rather than dropping it, which is [worth understanding
+to rebuild, though the [state file](#how-it-fits-together) is worth a
+[backup](#backup-restore-and-moving-to-another-server) first: if a release ever
+changes the index's internal shape it keeps the old one for you rather than dropping it, which is [worth understanding
 once](#what-an-index-format-change-does-to-your-history) but needs nothing from
 you at the time.
 
