@@ -83,7 +83,9 @@ It:
   machine inside the caller's scope — one outside it is a 404, as it is
   everywhere else. Suppression rules (`POST` and `DELETE
   /api/suppressions`) are `admin` only, because a rule by tag or across the
-  fleet reaches past any one scope; a scoped caller listing them is shown only
+  fleet reaches past any one scope, and an admin whose grant is scoped may make
+  or remove only a rule wholly inside theirs; a scoped
+  caller listing them is shown only
   rules that say nothing about machines outside their scope. The POSTs require
   `application/json`, as the upload does; the DELETE has no body, and relies on
   the session cookie being `SameSite=Lax` (not sent on a cross-site DELETE)
@@ -129,7 +131,7 @@ It:
   the server is that a machine *tried*. It is refused over 64 KB, and is kept
   as one file per machine whose name is a hash of the machine key, replaced by
   a newer record, written through a temporary file and a rename. Nothing the
-  sender sent is used as a path. Five things are checked
+  sender sent is used as a path. Six things are checked
   before a byte is kept, and the first two — who the caller is, and whether
   they are inside their per-credential rate limit — are answered **before the
   request body is read at all**, so an unauthenticated or over-limit caller
@@ -168,10 +170,13 @@ It:
   fleet**, built unscoped whatever any one user's grant allows. The URL must
   be `https://`; plain `http://` is refused at startup unless the host is
   `localhost` or a loopback address. With `[notify] secret` set, each request
-  carries `X-Loadbearer-Signature: sha256=<hex>`, an HMAC-SHA256 of the exact
-  body keyed with the secret, so the receiver can verify the sender; it
-  carries no timestamp, so replay protection is the receiver's, against
-  `sent_at`. The log names the receiver by scheme and host only, never its
+  carries `X-Loadbearer-Signature-V2: sha256=<hex>`, an HMAC-SHA256, keyed
+  with the secret, of `<timestamp>.<body>` — the timestamp being the Unix
+  seconds every request carries in `X-Loadbearer-Timestamp` — so the receiver
+  can verify the sender and reject a request more than a few minutes old.
+  `X-Loadbearer-Signature`, the HMAC of the body alone, is still sent for
+  receivers that predate that, and cannot refuse a replay. The log names the
+  receiver by scheme and host only, never its
   path or query.
   All of these requests **do not follow redirects** — following one from a
   discovery URL, or from a receiver, would make this an SSRF primitive — and
@@ -192,7 +197,8 @@ secret there, and has to be held in plain text because the server produces
 the signature rather than checking one — and `[notify] webhook_url` is often a
 credential in its own right, since many receivers put their token in the
 URL. Neither is logged or printed, and the config's debug form shows both as
-`<redacted>`. An
+`<redacted>`, as it does `[metrics] token`, an ingest `token` and
+`[auth] client_secret`. An
 ingest token written with `token_sha256` — the form `loadbearer-fleet token
 new` prints — holds only the secret's SHA-256, and the digest is not itself
 accepted, so a copy of the config leaks nothing anyone can submit with. A
