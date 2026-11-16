@@ -4424,7 +4424,10 @@ mod tests {
         assert_eq!(m["secure_boot"], true);
         assert_eq!(m["tpm_present"], true);
         assert_eq!(m["tpm_version"], "2.0");
-        assert_eq!(m["disk_encryption"], null, "never read on Windows");
+        assert_eq!(
+            m["disk_encryption"], null,
+            "not read on an unelevated Windows run"
+        );
 
         let old = get(&state, "/api/machine/FLEET-OLD-01", None).await.json();
         assert_eq!(old["machine"]["run_collect"], serde_json::json!([]));
@@ -4445,7 +4448,7 @@ mod tests {
         let row = |host: &str| rows.iter().find(|r| r["hostname"] == host).expect(host);
         let cells = |host: &str| -> Vec<String> {
             let r = row(host);
-            export::MACHINE_COLUMNS[46..56]
+            export::MACHINE_COLUMNS[46..58]
                 .iter()
                 .map(|c| r[*c].clone())
                 .collect()
@@ -4462,6 +4465,8 @@ mod tests {
                 "true",
                 "2.0",
                 "unknown",
+                "unknown",
+                "unknown",
                 "unknown"
             ]
         );
@@ -4477,7 +4482,9 @@ mod tests {
                 "true",
                 "2.0",
                 "encrypted",
-                "luks2"
+                "luks2",
+                "not_applicable",
+                "not_applicable"
             ]
         );
         // Only `security` asked: the uptime and elevation cells are empty,
@@ -4494,6 +4501,8 @@ mod tests {
                 "false",
                 "not_applicable",
                 "none_detected",
+                "not_applicable",
+                "not_applicable",
                 "not_applicable"
             ]
         );
@@ -4503,6 +4512,83 @@ mod tests {
         );
         // The tags are still where they were.
         assert_eq!(row("FLEET-WIN-01")["tag:site"], "glasgow");
+    }
+
+    /// BitLocker, from a Windows run made with `--collect security` as
+    /// administrator, through the API, the CSV and the `posture=` filter.
+    #[tokio::test]
+    async fn bitlocker_reaches_the_api_the_csv_and_the_filter() {
+        use crate::schema::samples;
+        let state = state_for(&Config::default());
+        {
+            let mut idx = state.index.lock().expect("index");
+            for (name, enrich) in [
+                (
+                    "win-modern.json",
+                    samples::optin_windows_suspended as fn(&mut serde_json::Value),
+                ),
+                ("linux-throttled.json", samples::optin_windows_not_encrypted),
+                ("low-end.json", samples::optin_windows_partly),
+            ] {
+                let mut doc = samples::fixture(name);
+                doc["timestamp"] = serde_json::json!("2026-09-10T09:00:00Z");
+                enrich(&mut doc);
+                idx.ingest_text(&doc.to_string(), &fixtures().join(format!("later-{name}")))
+                    .expect("ingested");
+            }
+        }
+        state.recompute().expect("recomputed");
+
+        let page = get(&state, "/api/machine/SN-WIN-0001", None).await.json();
+        let m = &page["machine"];
+        assert_eq!(m["disk_encryption"], "encrypted");
+        assert_eq!(m["disk_encryption_method"], "bitlocker");
+        assert_eq!(m["disk_encryption_cipher"], "xts-aes-128");
+        assert_eq!(m["disk_protection"], "off");
+
+        let (_, rows) = csv_of(&get(&state, "/api/machines.csv", None).await);
+        let row = |host: &str| rows.iter().find(|r| r["hostname"] == host).expect(host);
+        let cells = |host: &str| -> Vec<String> {
+            [
+                "disk_encryption",
+                "disk_encryption_method",
+                "disk_encryption_cipher",
+                "disk_protection",
+            ]
+            .iter()
+            .map(|c| row(host)[*c].clone())
+            .collect()
+        };
+        assert_eq!(
+            cells("FLEET-WIN-01"),
+            ["encrypted", "bitlocker", "xts-aes-128", "off"]
+        );
+        assert_eq!(
+            cells("FLEET-LNX-01"),
+            [
+                "not_encrypted",
+                "not_applicable",
+                "not_applicable",
+                "not_applicable"
+            ]
+        );
+        // Encryption under way, the cipher not yet said: unknown, not moot.
+        assert_eq!(
+            cells("FLEET-LNX-02"),
+            ["partly_encrypted", "bitlocker", "unknown", "on"]
+        );
+
+        for (posture, machines) in [
+            ("disk_not_encrypted", 1),
+            ("disk_partly_encrypted", 1),
+            ("disk_protection_off", 1),
+            ("disk_encrypted", 1),
+            ("disk_none_detected", 0),
+        ] {
+            let r = get(&state, &format!("/api/snapshot?posture={posture}"), None).await;
+            assert_eq!(r.status, StatusCode::OK, "{posture}");
+            assert_eq!(r.json()["summary"]["machines"], machines, "{posture}");
+        }
     }
 
     /// The opt-in facts go through the caller's own view like everything
@@ -4655,7 +4741,11 @@ mod tests {
             let r = get(&state, uri, Some(&cookie)).await;
             assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {}", r.body);
             assert!(
-                r.body.contains("secure_boot_off") && r.body.contains("disk_none_detected"),
+                r.body.contains("secure_boot_off")
+                    && r.body.contains("disk_none_detected")
+                    && r.body.contains("disk_not_encrypted")
+                    && r.body.contains("disk_partly_encrypted")
+                    && r.body.contains("disk_protection_off"),
                 "{uri} said: {}",
                 r.body
             );

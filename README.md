@@ -1017,15 +1017,25 @@ What each value means:
 - **TPM** — whether the OS exposes one, and its version (`2.0`, `1.2`) where
   it says. "No TPM exposed" covers none fitted, one turned off in firmware, and
   no driver for it — and many VMs have none.
-- **Disk encryption** — **Linux only, and only the root filesystem**: on
-  dm-crypt (`encrypted`, with the cryptsetup type — `luks2` and so on), or
-  `none_detected`, which means exactly "no dm-crypt under `/`". ZFS native
-  encryption, fscrypt, eCryptfs and self-encrypting drives are not looked for,
-  so `none_detected` is **not** "unencrypted", and the page says what was
-  looked for. It is **never present on Windows**, where BitLocker cannot be read
-  within loadbearer's privacy promises: a Windows machine says **disk encryption
-  not read on Windows**, and is never shown, counted or filtered as
-  unencrypted.
+- **Disk encryption** — the system volume only.
+  - **Linux**: the root filesystem on dm-crypt (`encrypted`, with the
+    cryptsetup type — `luks2` and so on), or `none_detected`, which means
+    exactly "no dm-crypt under `/`". ZFS native encryption, fscrypt, eCryptfs
+    and self-encrypting drives are not looked for, so `none_detected` is
+    **not** "unencrypted", and the page says what was looked for.
+  - **Windows**, from loadbearer 1.11.0, on an elevated run made with
+    `--collect security`: BitLocker's own account of the system volume.
+    `encrypted` (method `bitlocker`), `not_encrypted`, which **is**
+    definitive here, or `partly_encrypted` — encryption or decryption in
+    progress or paused. An encrypted or partly encrypted volume also carries its
+    `cipher` (`xts-aes-128`, `xts-aes-256`, `aes-128`, `aes-256`, the two
+    `-diffuser` forms, or `hardware`) and its `protection`, `on` or `off`;
+    `off` on an encrypted volume means BitLocker is **suspended**. A Windows
+    run that asked for `security` but was not elevated reads nothing here, and
+    says **disk encryption not read on Windows**: asked, but not readable, never
+    "not encrypted".
+  - A value this build has never heard of is shown as it is and matches no
+    filter. Results from before 1.11.0 read exactly as they did.
 - **Uptime** — how long the machine had been up and when it booted **as of the
   run**, not now: the page says "up 4h 01m at the time of the run" and never
   counts on from `booted_at`. On Windows with Fast Startup (the default) a shut
@@ -1038,8 +1048,9 @@ What each value means:
   why.
 
 The machine page shows a **Security** line —
-`UEFI · Secure Boot on · TPM 2.0 · disk encryption not read on Windows` — and
-an **Uptime** line, each only where the latest run asked. A machine whose run
+`UEFI · Secure Boot on · TPM 2.0 · system volume encrypted (BitLocker, XTS-AES
+256, protection on)`, or on an unelevated Windows run `… disk encryption not
+read on Windows` — and an **Uptime** line, each only where the latest run asked. A machine whose run
 did not ask shows neither; if another machine *in your own view* does, one
 quiet line under the facts says which `--collect` would add them, so the
 feature can be found.
@@ -1047,11 +1058,15 @@ feature can be found.
 Across the estate, the filter row gains a **Security** select — shown once a
 machine in view has opted in — and the URL a `posture=` parameter:
 `secure_boot_off`, `secure_boot_on`, `legacy_bios`, `tpm_absent`,
-`tpm_present`, `tpm_1.2`, `disk_none_detected` and `disk_encrypted`, one at a
-time. **Each matches only machines where that fact was read**: a machine that
+`tpm_present`, `tpm_1.2`, `disk_none_detected`, `disk_encrypted`,
+`disk_not_encrypted`, `disk_partly_encrypted` and `disk_protection_off`, one at
+a time. **Each matches only machines where that fact was read**: a machine that
 was not asked, or could not say, is on neither side of any of them, a
-legacy-BIOS machine is on neither side of Secure Boot, and Windows is on
-neither side of disk encryption. It narrows every tab, a link and a saved view
+legacy-BIOS machine is on neither side of Secure Boot, and a Windows machine
+whose run was not elevated is on neither side of disk encryption.
+`disk_encrypted` takes in an encrypted system volume on either platform, and
+`disk_protection_off` an encrypted or partly encrypted one whose BitLocker
+protection was read as off. It narrows every tab, a link and a saved view
 like any other filter, goes through the sign-in scope like any other filter,
 and any other value is refused with a 400. The Search box does not match the
 posture — "off" or "none" as a substring would read as an answer it isn't.
@@ -1382,8 +1397,8 @@ The snapshot carries the fleet-wide `thresholds` and the configured
 record it; and `run_collect` (what the latest run asked for with `--collect`,
 sorted — empty for none), `run_elevated`, `booted_at`, `uptime_secs`,
 `firmware_mode`, `secure_boot`, `tpm_present`, `tpm_version`,
-`disk_encryption` and `disk_encryption_method`, each null where it was not
-read, and `last_skip` (`at`, `reason`, `detail`; null unless a [run status
+`disk_encryption`, `disk_encryption_method`, `disk_encryption_cipher` and
+`disk_protection`, each null where it was not read, and `last_skip` (`at`, `reason`, `detail`; null unless a [run status
 record](#a-skipped-run-tells-the-server-so) is newer than the latest run): `run_collect` is what tells "not asked" (category missing) from "asked,
 could not be read" (category listed) — see [Uptime, elevation and security
 posture](#uptime-elevation-and-security-posture-where-a-run-asked). The drilldown
@@ -1412,8 +1427,9 @@ endpoint of its own; `lifecycle=replace|repair|investigate|watch|keep` is a
 filter parameter like the others, and any other value is refused with a 400
 naming the five rather than answered with an empty fleet. `posture=` is the
 same: one of `secure_boot_off`, `secure_boot_on`, `legacy_bios`,
-`tpm_absent`, `tpm_present`, `tpm_1.2`, `disk_none_detected` or
-`disk_encrypted`, matching only machines whose latest run read that fact. Every endpoint, the
+`tpm_absent`, `tpm_present`, `tpm_1.2`, `disk_none_detected`,
+`disk_encrypted`, `disk_not_encrypted`, `disk_partly_encrypted` or
+`disk_protection_off`, matching only machines whose latest run read that fact. Every endpoint, the
 filter parameters they share with the dashboard, and how authorization is
 applied are in
 [HTTP API](https://github.com/issinoho/loadbearer-fleet/wiki/HTTP-API).
@@ -1460,18 +1476,21 @@ per module, `; `-separated, a part empty where the firmware didn't say — so
 (its random run ID), then what a run made with `--collect` records:
 `run_collect` (the categories it asked for, `; `-separated), `run_elevated`,
 `booted_at` and `uptime_secs` (as of the run), `firmware_mode`,
-`secure_boot`, `tpm_present`, `tpm_version`, `disk_encryption` and
-`disk_encryption_method`, then `last_skip_at` and `last_skip_reason` (a [run
+`secure_boot`, `tpm_present`, `tpm_version`, `disk_encryption`,
+`disk_encryption_method`, `disk_encryption_cipher` and `disk_protection`, then
+`last_skip_at` and `last_skip_reason` (a [run
 status record](#a-skipped-run-tells-the-server-so) newer than the latest run,
-empty when there is none). **The ten before them tell the three states apart**: a cell
+empty when there is none). **The twelve before them tell the three states apart**: a cell
 is empty where the run did not ask for its category, `unknown` where it asked
 and the CLI could not read that part, `not_applicable` where the fact cannot
 exist on that machine (`secure_boot` on a `bios` boot, `tpm_version` with no
-TPM, `disk_encryption_method` without dm-crypt), and otherwise the value —
-`true`/`false`, or the word the CLI wrote (`uefi`, `encrypted`,
-`none_detected`, `luks2`, …). `disk_encryption` on Windows is always
-`unknown`, never `none_detected`: the CLI does not read BitLocker.
-`none_detected` means no dm-crypt under `/`, not unencrypted. Because
+TPM, `disk_encryption_method` without an encrypted volume,
+`disk_encryption_cipher` and `disk_protection` on anything but BitLocker), and
+otherwise the value — `true`/`false`, or the word the CLI wrote (`uefi`,
+`encrypted`, `not_encrypted`, `none_detected`, `luks2`, `bitlocker`,
+`xts-aes-256`, `on`, …). `disk_encryption` on a Windows run that was not
+elevated is `unknown`, never `not_encrypted`. `none_detected` means no
+dm-crypt under `/`, not unencrypted; `not_encrypted` is BitLocker's own word. Because
 `unknown` can sit in it, `uptime_secs` is a text column. New columns are added after these and before the tags,
 so a column's position never moves. Then one `tag:<key>` column per tag key
 any machine in the file carries, sorted by key; the prefix means a tag can

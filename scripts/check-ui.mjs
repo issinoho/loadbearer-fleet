@@ -1612,6 +1612,7 @@ function heatRows(h) {
   const NONE = {
     run_collect: [], run_elevated: null, booted_at: null, uptime_secs: null, firmware_mode: null, secure_boot: null,
     tpm_present: null, tpm_version: null, disk_encryption: null, disk_encryption_method: null,
+    disk_encryption_cipher: null, disk_protection: null,
   };
   const ALL = ['elevation', 'security', 'uptime'];
   // The one finding drawn from the posture, as the server words it: on a
@@ -1650,6 +1651,64 @@ function heatRows(h) {
         'booted ', ' · elevated', 'Secure Boot is off', 'mokutil --sb-state'],
       not: ['last restarted', 'not elevated', 'not read on Windows', 'elevation not reported'],
       dts: ['Security', 'Uptime'],
+    },
+    {
+      // Windows as administrator: BitLocker read, in each state it reports.
+      name: 'machine/optin-bitlocker',
+      machine: {
+        ...win, ...NONE, run_collect: ALL, run_elevated: true, firmware_mode: 'uefi', secure_boot: true,
+        tpm_present: true, tpm_version: '2.0', disk_encryption: 'encrypted', disk_encryption_method: 'bitlocker',
+        disk_encryption_cipher: 'xts-aes-256', disk_protection: 'on',
+      },
+      want: ['TPM 2.0 · system volume encrypted (BitLocker, XTS-AES 256, protection on)'],
+      not: ['suspended', 'dm-crypt', 'root filesystem', 'not read on Windows', 'BITLOCKER'],
+      dts: ['Security'],
+    },
+    {
+      name: 'machine/optin-bitlocker-suspended',
+      machine: {
+        ...win, ...NONE, run_collect: ALL, run_elevated: true, firmware_mode: 'uefi', secure_boot: true,
+        disk_encryption: 'encrypted', disk_encryption_method: 'bitlocker',
+        disk_encryption_cipher: 'aes-128-diffuser', disk_protection: 'off',
+      },
+      want: ['system volume encrypted (BitLocker, AES 128 with diffuser, protection off (suspended))'],
+      not: ['dm-crypt'],
+      dts: ['Security'],
+    },
+    {
+      name: 'machine/optin-bitlocker-partly',
+      machine: {
+        ...win, ...NONE, run_collect: ALL, run_elevated: true, firmware_mode: 'uefi', secure_boot: true,
+        disk_encryption: 'partly_encrypted', disk_encryption_method: 'bitlocker', disk_protection: 'on',
+      },
+      want: ['system volume partly encrypted (BitLocker, protection on)'],
+      not: ['dm-crypt', 'suspended'],
+      dts: ['Security'],
+    },
+    {
+      // Definitive on Windows, and the one place this page says it.
+      name: 'machine/optin-bitlocker-not-encrypted',
+      machine: {
+        ...win, ...NONE, run_collect: ALL, run_elevated: true, firmware_mode: 'uefi', secure_boot: true,
+        disk_encryption: 'not_encrypted',
+      },
+      allow: ['not encrypted'],
+      want: ['UEFI · Secure Boot on · system volume not encrypted'],
+      not: ['dm-crypt', 'not read on Windows', 'disk encryption not reported'],
+      dts: ['Security'],
+    },
+    {
+      // Cipher and protection values this build has never heard of are
+      // shown as themselves, and trigger nothing.
+      name: 'machine/optin-bitlocker-future',
+      machine: {
+        ...win, ...NONE, run_collect: ALL, run_elevated: true, firmware_mode: 'uefi', secure_boot: true,
+        disk_encryption: 'encrypted', disk_encryption_method: 'bitlocker',
+        disk_encryption_cipher: 'xts-aes-512', disk_protection: 'maybe',
+      },
+      want: ['system volume encrypted (BitLocker, xts-aes-512, protection maybe)'],
+      not: ['suspended'],
+      dts: ['Security'],
     },
     {
       // Only security asked: no Uptime row, nothing about elevation.
@@ -1751,7 +1810,7 @@ function heatRows(h) {
         const times = text.split(c.flags(c.machine).headline).length - 1;
         check(c.name, times === 1, `its finding is on the page ${times} time(s), not once`);
       }
-      for (const w of [...c.not, ...NEVER]) check(c.name, !text.includes(w), `"${w}" should not be there`);
+      for (const w of [...c.not, ...NEVER.filter((x) => !(c.allow || []).includes(x))]) check(c.name, !text.includes(w), `"${w}" should not be there`);
       for (const d of c.dts || []) check(c.name, dts.includes(d), `no ${d} row`);
       for (const d of c.noDts || []) check(c.name, !dts.includes(d), `a ${d} row for something not asked`);
       const hints = findAll(h, (n) => n.dataset?.hint === 'collect').length;
@@ -1762,6 +1821,17 @@ function heatRows(h) {
     }
   }
   Object.assign(mod.state, before);
+
+  // The Security filter offers every value the server accepts, in plain
+  // words. Whether it is offered at all is the condition syncFilterControls
+  // has always applied to this list.
+  {
+    const wanted = ['secure_boot_off', 'secure_boot_on', 'legacy_bios', 'tpm_absent', 'tpm_present', 'tpm_1.2',
+      'disk_none_detected', 'disk_encrypted', 'disk_not_encrypted', 'disk_partly_encrypted', 'disk_protection_off'];
+    check('posture/options', mod.POSTURES.map(([v]) => v).join() === wanted.join(),
+      `the Security select offers ${mod.POSTURES.map(([v]) => v).join()}`);
+    check('posture/options', mod.POSTURES.every(([, l]) => l && !/_/.test(l)), 'a label is a raw value');
+  }
 
   // A posture filter that matches nothing says what it can and cannot match,
   // rather than that it names something no longer in the fleet.

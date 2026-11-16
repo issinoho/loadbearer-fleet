@@ -5,6 +5,38 @@ All notable changes to loadbearer-fleet are documented in this file.
 The release workflow extracts the section for a tag verbatim as that release's
 notes, so each one has to stand on its own.
 
+## Unreleased
+
+**BitLocker, read.** The server side for loadbearer 1.11.0, which reads
+BitLocker on an elevated Windows run made with `--collect security`. Nothing
+changes for older results, which read exactly as they did; a machine that did
+not ask, or asked and was not elevated, still shows nothing and is never
+counted as unencrypted.
+
+### Added
+
+- **BitLocker in the security posture.** `machine.security.disk_encryption`
+  now also says `not_encrypted` (Windows, definitive) and `partly_encrypted`
+  (encryption or decryption in progress or paused), with method `bitlocker`,
+  and may carry a `cipher` (`xts-aes-256`, `hardware`, …) and a
+  `protection` of `on` or `off` — off on an encrypted volume is BitLocker
+  suspended. The machine page's Security line reads them as
+  `system volume encrypted (BitLocker, XTS-AES 256, protection on)`,
+  `system volume not encrypted` and `system volume partly encrypted (…)`; an
+  unelevated Windows run still says `disk encryption not read on Windows`. The
+  snapshot and the drilldown carry `disk_encryption_cipher` and
+  `disk_protection`, and the machines CSV gains two columns of the same names
+  after `disk_encryption_method`, empty for not asked, `unknown` for asked and
+  unreadable, `not_applicable` where they cannot exist (on Linux, or with
+  nothing encrypted). A value this build does not know is shown as it is and
+  matches no filter. An existing index gains the columns on open with no format
+  change; `scan --reindex` fills them in.
+- **Three more `posture=` values** — `disk_not_encrypted`,
+  `disk_partly_encrypted` and `disk_protection_off` — and the same three in
+  the dashboard's Security select, beside the existing eight. Each matches only
+  machines whose latest run read it; the 400 for any other value names all
+  eleven. `disk_encrypted` now also takes in an encrypted BitLocker volume.
+
 ## 0.13.0 - Sat, 14 Nov 2026
 
 **Tighter edges on triage and the webhook.** A scoped admin's suppression

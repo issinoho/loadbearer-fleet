@@ -171,9 +171,10 @@ pub struct Security {
     pub secure_boot: Option<bool>,
     #[serde(default)]
     pub tpm: Option<Tpm>,
-    /// **Linux only**, and only the root filesystem. Never present on
-    /// Windows, where BitLocker cannot be read within the CLI's privacy
-    /// promises.
+    /// The system volume only: on Linux the root filesystem on dm-crypt, on
+    /// an elevated Windows run (`--collect security`, loadbearer 1.11.0) the
+    /// BitLocker state of the system drive. A Windows run that was not
+    /// elevated has none, as before.
     #[serde(default)]
     pub disk_encryption: Option<DiskEncryption>,
 }
@@ -192,15 +193,28 @@ pub struct Tpm {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DiskEncryption {
-    /// `"encrypted"`: the root filesystem sits on a dm-crypt mapping.
-    /// `"none_detected"`: no dm-crypt under `/` — which is **not**
+    /// `"encrypted"`: the root filesystem sits on a dm-crypt mapping, or the
+    /// Windows system volume is encrypted (BitLocker).
+    /// `"none_detected"` (Linux): no dm-crypt under `/` — which is **not**
     /// "unencrypted": ZFS native encryption, fscrypt, eCryptfs and
     /// self-encrypting drives are not looked for.
+    /// `"not_encrypted"` (Windows): BitLocker says the volume is not, which
+    /// is definitive. `"partly_encrypted"` (Windows): encryption or
+    /// decryption is in progress or paused.
     #[serde(default)]
     pub system_volume: Option<String>,
-    /// With `"encrypted"`, the cryptsetup type: `luks1`, `luks2`, `plain`, …
+    /// With `"encrypted"`, the cryptsetup type — `luks1`, `luks2`, `plain`, … —
+    /// or `"bitlocker"`.
     #[serde(default)]
     pub method: Option<String>,
+    /// BitLocker's cipher: `xts-aes-128`, `xts-aes-256`, `aes-128`, `aes-256`,
+    /// `aes-128-diffuser`, `aes-256-diffuser` or `hardware`. Absent on Linux.
+    #[serde(default)]
+    pub cipher: Option<String>,
+    /// `"on"` or `"off"`. With an encrypted volume, `"off"` is BitLocker
+    /// suspended. Absent on Linux.
+    #[serde(default)]
+    pub protection: Option<String>,
 }
 
 /// `machine.os_detail`: the OS release in parts, beside the free-text `os`
@@ -1074,8 +1088,8 @@ pub(crate) mod samples {
     }
 
     /// Windows, all three asked: up four hours, not elevated, UEFI with Secure
-    /// Boot on and a TPM 2.0 — and no `disk_encryption`, which the CLI never
-    /// writes on Windows.
+    /// Boot on and a TPM 2.0 — and no `disk_encryption`, which the CLI does
+    /// not write for a run that was not elevated.
     pub(crate) fn optin_windows(d: &mut Value) {
         asked(d, &["uptime", "elevation", "security"]);
         d["run"]["elevated"] = json!(false);
@@ -1136,8 +1150,49 @@ pub(crate) mod samples {
         d["machine"]["security"] = json!({
             "firmware_mode": "coreboot", "secure_boot": true, "measured_boot": true,
             "tpm": { "present": true, "version": "3.0", "vendor_hidden": true },
-            "disk_encryption": { "system_volume": "partial", "method": "zfs" }
+            "disk_encryption": {
+                "system_volume": "partial", "method": "zfs",
+                "cipher": "rot13", "protection": "maybe"
+            }
         });
+    }
+
+    /// An elevated Windows run, security asked: BitLocker on, XTS-AES 256,
+    /// protection on.
+    pub(crate) fn optin_windows_bitlocker(d: &mut Value) {
+        asked(d, &["elevation", "security"]);
+        d["run"]["elevated"] = json!(true);
+        d["machine"]["security"] = json!({
+            "firmware_mode": "uefi", "secure_boot": true,
+            "tpm": { "present": true, "version": "2.0" },
+            "disk_encryption": {
+                "system_volume": "encrypted", "method": "bitlocker",
+                "cipher": "xts-aes-256", "protection": "on"
+            }
+        });
+    }
+
+    /// As `optin_windows_bitlocker`, with BitLocker suspended.
+    pub(crate) fn optin_windows_suspended(d: &mut Value) {
+        optin_windows_bitlocker(d);
+        d["machine"]["security"]["disk_encryption"] = json!({
+            "system_volume": "encrypted", "method": "bitlocker",
+            "cipher": "xts-aes-128", "protection": "off"
+        });
+    }
+
+    /// As `optin_windows_bitlocker`, with encryption in progress.
+    pub(crate) fn optin_windows_partly(d: &mut Value) {
+        optin_windows_bitlocker(d);
+        d["machine"]["security"]["disk_encryption"] = json!({
+            "system_volume": "partly_encrypted", "method": "bitlocker", "protection": "on"
+        });
+    }
+
+    /// As `optin_windows_bitlocker`, and BitLocker says the volume is not.
+    pub(crate) fn optin_windows_not_encrypted(d: &mut Value) {
+        optin_windows_bitlocker(d);
+        d["machine"]["security"]["disk_encryption"] = json!({ "system_volume": "not_encrypted" });
     }
 
     /// The blocks without `run.collect`: what no CLI writes, and which the
@@ -1249,7 +1304,7 @@ mod tests {
             (tpm.present, tpm.version.as_deref()),
             (Some(true), Some("2.0"))
         );
-        assert!(sec.disk_encryption.is_none(), "never on Windows");
+        assert!(sec.disk_encryption.is_none(), "not read when unelevated");
 
         let mut v = samples::fixture("linux-throttled.json");
         samples::optin_legacy_bios(&mut v);

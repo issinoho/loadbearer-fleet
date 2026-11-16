@@ -221,7 +221,7 @@ fn tag_cells<'a>(m: Option<&'a MachineView>, keys: &'a [&str]) -> impl Iterator<
 ///
 /// New columns go on the end of the fixed ones, before the tags, so a
 /// spreadsheet or script that reads by position keeps working.
-pub const MACHINE_COLUMNS: [&str; 58] = [
+pub const MACHINE_COLUMNS: [&str; 60] = [
     "hostname",
     "machine_key",
     "key_kind",
@@ -278,6 +278,8 @@ pub const MACHINE_COLUMNS: [&str; 58] = [
     "tpm_version",
     "disk_encryption",
     "disk_encryption_method",
+    "disk_encryption_cipher",
+    "disk_protection",
     "last_skip_at",
     "last_skip_reason",
 ];
@@ -286,8 +288,8 @@ pub const MACHINE_COLUMNS: [&str; 58] = [
 /// told apart in a way a script can read (see the README's CSV columns):
 const NOT_ASKED: &str = "";
 /// The run named the category in `run.collect` and the CLI could not read
-/// this part. On Windows that is always so for `disk_encryption`, which the
-/// CLI never reads there: unknown, never "not encrypted".
+/// this part. On Windows that is so for `disk_encryption` on a run that was
+/// not elevated, which cannot read BitLocker: unknown, never "not encrypted".
 const UNKNOWN: &str = "unknown";
 /// The fact does not exist on this machine: Secure Boot on a legacy-BIOS boot,
 /// a TPM version with no TPM, an encryption method with no dm-crypt.
@@ -307,6 +309,21 @@ fn opted(m: &MachineView, category: &str, value: Option<String>, moot: bool) -> 
     } else {
         UNKNOWN.to_string()
     })
+}
+
+/// The cipher and the protection state are BitLocker's. They cannot exist
+/// where the volume is not encrypted, or is encrypted by something that is
+/// not BitLocker; otherwise, when the run read the volume but not this part,
+/// it is unknown.
+fn bitlocker_part_is_moot(m: &MachineView) -> bool {
+    match m.disk_encryption.as_deref() {
+        Some("none_detected" | "not_encrypted") => true,
+        Some("encrypted" | "partly_encrypted") => m
+            .disk_encryption_method
+            .as_deref()
+            .is_some_and(|d| d != "bitlocker"),
+        _ => false,
+    }
 }
 
 fn yes_no(v: Option<bool>) -> Option<String> {
@@ -455,13 +472,28 @@ pub fn machines(snap: &Snapshot) -> String {
                 m.tpm_present == Some(false),
             ),
             opted(m, "security", m.disk_encryption.clone(), false),
+            // The method, cipher and protection exist only for a volume that is,
+            // or is becoming, encrypted. The cipher and protection are
+            // BitLocker's: a dm-crypt volume has neither.
             opted(
                 m,
                 "security",
                 m.disk_encryption_method.clone(),
                 m.disk_encryption
                     .as_deref()
-                    .is_some_and(|d| d != "encrypted"),
+                    .is_some_and(|d| !matches!(d, "encrypted" | "partly_encrypted")),
+            ),
+            opted(
+                m,
+                "security",
+                m.disk_encryption_cipher.clone(),
+                bitlocker_part_is_moot(m),
+            ),
+            opted(
+                m,
+                "security",
+                m.disk_protection.clone(),
+                bitlocker_part_is_moot(m),
             ),
             // A skipped run newer than the latest result; empty when there is
             // none, which is the usual case, not an unknown.
